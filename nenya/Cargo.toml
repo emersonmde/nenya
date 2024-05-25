@@ -5,4 +5,9 @@ edition = "2021"
 
 [dependencies]
 num-traits = "0.2.19"
+
+[dev-dependencies]
 clap = "4.5.4"
+eframe = "0.27.2"
+egui = "0.27.2"
+egui_plot = "0.27.2"
