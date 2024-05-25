@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-// use pid::Pid;
 use crate::pid_controller::PIDController;
 
 pub mod pid_controller;
@@ -28,7 +27,7 @@ impl RateLimiter {
         update_interval: Duration,
     ) -> RateLimiter {
         RateLimiter {
-            request_rate: target_rate,
+            request_rate: 0.0,
             target_rate,
             min_rate,
             max_rate,
@@ -43,8 +42,9 @@ impl RateLimiter {
     pub fn handle_request(&mut self) -> bool {
         let now = Instant::now();
 
+        // Remove timestamps outside the trailing window
         while let Some(timestamp) = self.accepted_request_timestamps.front() {
-            if timestamp.duration_since(now) > self.update_interval {
+            if now.duration_since(*timestamp) > self.update_interval {
                 self.accepted_request_timestamps.pop_front();
             } else {
                 break;
@@ -52,17 +52,19 @@ impl RateLimiter {
         }
 
         // Calculate current request rate over the moving window
-        let window_duration = now
-            .duration_since(*self.accepted_request_timestamps.front().unwrap_or(&now))
-            .as_millis();
-        self.request_rate = if window_duration > 0 {
-            self.accepted_request_timestamps.len() as f64 / (window_duration as f64 / 1000.0)
+        if let Some(&oldest) = self.accepted_request_timestamps.front() {
+            let window_duration = now.duration_since(oldest).as_secs_f64();
+            self.request_rate = if window_duration > 0.0 {
+                self.accepted_request_timestamps.len() as f64 / window_duration
+            } else {
+                0.0
+            };
         } else {
-            0.0
-        };
+            self.request_rate = 0.0;
+        }
 
         // Update PID controller and target rate periodically
-        if now.duration_since(self.last_updated) >= self.update_interval {
+        if now.duration_since(self.last_updated) > self.update_interval {
             self.last_updated = now;
 
             let output = self.pid_controller.compute_correction(self.request_rate);

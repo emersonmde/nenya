@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 
 use clap::{Arg, Command};
 use eframe::egui;
-use egui_plot::{Corner, Line, Plot, PlotPoints};
+use egui::ViewportBuilder;
+use egui_plot::{Corner, Line, Plot};
 
 use nenya::pid_controller::PIDController;
 use nenya::RateLimiter;
@@ -180,7 +181,11 @@ fn main() {
     let duration_clone: &'static mut Duration = Box::leak(Box::new(duration.clone()));
     eframe::run_native(
         "Rate Limiter Simulation",
-        eframe::NativeOptions::default(),
+        eframe::NativeOptions {
+            viewport: ViewportBuilder::default().with_maximized(true),
+            centered: true,
+            ..Default::default()
+        },
         Box::new(|_cc| {
             Box::new(App::new(
                 rate_limiter,
@@ -205,8 +210,10 @@ struct App {
     generated_tps_data: Vec<[f64; 2]>,
     target_tps_data: Vec<[f64; 2]>,
     throttled_tps_data: Vec<[f64; 2]>,
-    request_times: VecDeque<Instant>,
+    measured_tps_data: Vec<[f64; 2]>,
+    accepted_request_times: VecDeque<Instant>,
     throttled_request_times: VecDeque<Instant>,
+    last_time_point_added: f64,
 }
 
 impl App {
@@ -227,13 +234,14 @@ impl App {
             trailing_tps_data: Vec::new(),
             generated_tps_data: Vec::new(),
             target_tps_data: Vec::new(),
-            throttled_tps_data: Vec::new(), // Add this line
-            request_times: VecDeque::new(),
-            throttled_request_times: VecDeque::new(), // Add this line
+            throttled_tps_data: Vec::new(),
+            measured_tps_data: Vec::new(),
+            accepted_request_times: VecDeque::new(),
+            throttled_request_times: VecDeque::new(),
+            last_time_point_added: 0.0,
         }
     }
 }
-
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let elapsed_seconds = self.start.elapsed().as_secs_f64();
@@ -254,15 +262,15 @@ impl eframe::App for App {
             // Add new indicator at the end of the buffer
             if should_accept_request {
                 self.accepted_requests += 1;
-                self.request_times.push_back(now);
+                self.accepted_request_times.push_back(now);
             } else {
                 self.throttled_request_times.push_back(now);
             }
 
             // Remove old timestamps outside the trailing window
-            while let Some(&time) = self.request_times.front() {
+            while let Some(&time) = self.accepted_request_times.front() {
                 if now.duration_since(time) > self.trailing_window {
-                    self.request_times.pop_front();
+                    self.accepted_request_times.pop_front();
                 } else {
                     break;
                 }
@@ -276,17 +284,24 @@ impl eframe::App for App {
                 }
             }
 
-            let trailing_tps = self.request_times.len() as f64 / self.trailing_window.as_secs_f64();
+            let trailing_tps =
+                self.accepted_request_times.len() as f64 / self.trailing_window.as_secs_f64();
             let throttled_tps =
                 self.throttled_request_times.len() as f64 / self.trailing_window.as_secs_f64();
 
-            self.trailing_tps_data.push([elapsed_seconds, trailing_tps]);
-            self.generated_tps_data
-                .push([elapsed_seconds, generated_tps]);
-            self.target_tps_data
-                .push([elapsed_seconds, self.rate_limiter.target_rate]);
-            self.throttled_tps_data
-                .push([elapsed_seconds, throttled_tps]);
+            if elapsed_seconds - self.last_time_point_added >= 0.03 {
+                self.trailing_tps_data.push([elapsed_seconds, trailing_tps]);
+                self.generated_tps_data
+                    .push([elapsed_seconds, generated_tps]);
+                self.target_tps_data
+                    .push([elapsed_seconds, self.rate_limiter.target_rate]);
+                self.throttled_tps_data
+                    .push([elapsed_seconds, throttled_tps]);
+                self.measured_tps_data
+                    .push([elapsed_seconds, self.rate_limiter.request_rate]);
+
+                self.last_time_point_added = elapsed_seconds;
+            }
 
             // Print metrics to the terminal
             let accepted_tps = self.accepted_requests as f64 / elapsed_seconds;
@@ -304,21 +319,11 @@ impl eframe::App for App {
                 .view_aspect(2.0)
                 .legend(egui_plot::Legend::default().position(Corner::LeftTop))
                 .show(ui, |plot_ui| {
-                    plot_ui.line(
-                        Line::new(PlotPoints::new(self.trailing_tps_data.clone()))
-                            .name("Trailing TPS"),
-                    );
-                    plot_ui.line(
-                        Line::new(PlotPoints::new(self.generated_tps_data.clone()))
-                            .name("Generated TPS"),
-                    );
-                    plot_ui.line(
-                        Line::new(PlotPoints::new(self.target_tps_data.clone())).name("Target TPS"),
-                    );
-                    plot_ui.line(
-                        Line::new(PlotPoints::new(self.throttled_tps_data.clone()))
-                            .name("Throttled TPS"),
-                    );
+                    plot_ui.line(Line::new(self.trailing_tps_data.clone()).name("Trailing TPS"));
+                    plot_ui.line(Line::new(self.generated_tps_data.clone()).name("Generated TPS"));
+                    plot_ui.line(Line::new(self.target_tps_data.clone()).name("Target TPS"));
+                    plot_ui.line(Line::new(self.throttled_tps_data.clone()).name("Throttled TPS"));
+                    plot_ui.line(Line::new(self.measured_tps_data.clone()).name("Measured TPS"));
                 });
         });
     }
