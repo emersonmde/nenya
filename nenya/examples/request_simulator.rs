@@ -110,6 +110,13 @@ fn main() {
                 .help("Error limit for the PID controller"),
         )
         .arg(
+            Arg::new("error_bias")
+                .long("error_bias")
+                .value_parser(clap::value_parser!(f64))
+                .default_value("1.5")
+                .help("Bias factor for the integral term"),
+        )
+        .arg(
             Arg::new("output_limit")
                 .long("output_limit")
                 .value_parser(clap::value_parser!(f64))
@@ -150,8 +157,17 @@ fn main() {
     let output_limit = *matches.get_one::<f64>("output_limit").unwrap();
     let update_interval =
         Duration::from_millis(*matches.get_one::<u64>("update_interval").unwrap());
+    let error_bias = *matches.get_one::<f64>("error_bias").unwrap();
 
-    let pid_controller = PIDController::new(target_tps, kp, ki, kd, error_limit, output_limit);
+    let pid_controller = PIDController::new(
+        target_tps,
+        kp,
+        ki,
+        kd,
+        error_limit,
+        error_bias,
+        output_limit,
+    );
     let mut rate_limiter = RateLimiter::new(
         target_tps,
         min_tps,
