@@ -241,7 +241,7 @@ fn generate_requests(
             rate_limiter,
             generated_tps,
         );
-        print!("\n");
+        println!();
 
         // Restore cursor position
         print!("\x1B8");
