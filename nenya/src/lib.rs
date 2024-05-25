@@ -7,14 +7,16 @@ pub mod pid_controller;
 
 #[derive(Debug)]
 pub struct RateLimiter {
-    pub request_rate: f64,
-    pub target_rate: f64,
-    pub min_rate: f64,
-    pub max_rate: f64,
-    pub pid_controller: PIDController<f64>,
+    request_rate: f64,
+    accepted_request_rate: f64,
+    target_rate: f64,
+    min_rate: f64,
+    max_rate: f64,
+    pid_controller: PIDController<f64>,
     last_updated: Instant,
-    pub previous_output: f64,
+    previous_output: f64,
     update_interval: Duration,
+    request_timestamps: VecDeque<Instant>,
     accepted_request_timestamps: VecDeque<Instant>,
 }
 
@@ -28,6 +30,7 @@ impl RateLimiter {
     ) -> RateLimiter {
         RateLimiter {
             request_rate: 0.0,
+            accepted_request_rate: 0.0,
             target_rate,
             min_rate,
             max_rate,
@@ -35,33 +38,15 @@ impl RateLimiter {
             last_updated: Instant::now(),
             previous_output: 0.0,
             update_interval,
+            request_timestamps: VecDeque::new(),
             accepted_request_timestamps: VecDeque::new(),
         }
     }
 
     pub fn handle_request(&mut self) -> bool {
         let now = Instant::now();
-
-        // Remove timestamps outside the trailing window
-        while let Some(timestamp) = self.accepted_request_timestamps.front() {
-            if now.duration_since(*timestamp) > self.update_interval {
-                self.accepted_request_timestamps.pop_front();
-            } else {
-                break;
-            }
-        }
-
-        // Calculate current request rate over the moving window
-        if let Some(&oldest) = self.accepted_request_timestamps.front() {
-            let window_duration = now.duration_since(oldest).as_secs_f64();
-            self.request_rate = if window_duration > 0.0 {
-                self.accepted_request_timestamps.len() as f64 / window_duration
-            } else {
-                0.0
-            };
-        } else {
-            self.request_rate = 0.0;
-        }
+        self.trim_request_window(now);
+        self.calculate_request_rate(now);
 
         // Update PID controller and target rate periodically
         if now.duration_since(self.last_updated) > self.update_interval {
@@ -75,11 +60,69 @@ impl RateLimiter {
         }
 
         // Make a throttling decision based on the target rate
-        let should_handle_request = self.request_rate <= self.target_rate;
+        let should_handle_request = self.accepted_request_rate <= self.target_rate;
         if should_handle_request {
             self.accepted_request_timestamps.push_back(now);
         }
+        self.request_timestamps.push_back(now);
 
         should_handle_request
+    }
+
+    fn calculate_request_rate(&mut self, now: Instant) {
+        if let Some(&oldest) = self.accepted_request_timestamps.front() {
+            let window_duration = now.duration_since(oldest).as_secs_f64();
+            self.accepted_request_rate = if window_duration > 0.0 {
+                self.accepted_request_timestamps.len() as f64 / window_duration
+            } else {
+                0.0
+            };
+        } else {
+            self.accepted_request_rate = 0.0;
+        }
+
+        if let Some(&oldest) = self.request_timestamps.front() {
+            let window_duration = now.duration_since(oldest).as_secs_f64();
+            self.request_rate = if window_duration > 0.0 {
+                self.request_timestamps.len() as f64 / window_duration
+            } else {
+                0.0
+            };
+        } else {
+            self.request_rate = 0.0;
+        }
+    }
+
+    fn trim_request_window(&mut self, now: Instant) {
+        while let Some(timestamp) = self.accepted_request_timestamps.front() {
+            if now.duration_since(*timestamp) > self.update_interval {
+                self.accepted_request_timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+        while let Some(timestamp) = self.request_timestamps.front() {
+            if now.duration_since(*timestamp) > self.update_interval {
+                self.request_timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn setpoint(&self) -> f64 {
+        self.pid_controller.setpoint()
+    }
+
+    pub fn target_rate(&self) -> f64 {
+        self.target_rate
+    }
+
+    pub fn request_rate(&self) -> f64 {
+        self.request_rate
+    }
+
+    pub fn accepted_request_rate(&self) -> f64 {
+        self.accepted_request_rate
     }
 }

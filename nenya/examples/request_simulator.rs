@@ -283,13 +283,8 @@ fn print_metrics(
     println!("\rAccepted TPS: {:.2}", accepted_tps);
     println!("\rTrailing Accepted TPS: {:.2}", trailing_tps);
     println!("\rGenerated TPS: {:.2}", generated_tps);
-    println!("\rTarget TPS: {:.2}", rate_limiter.target_rate);
-    println!("\rMeasured TPS: {:.2}", rate_limiter.request_rate);
-    println!(
-        "\rAccumulated Error: {:.2}",
-        rate_limiter.pid_controller.accumulated_error
-    );
-    println!("\rPrevious Output: {:.3}", rate_limiter.previous_output);
+    println!("\rTarget TPS: {:.2}", rate_limiter.target_rate());
+    println!("\rMeasured TPS: {:.2}", rate_limiter.request_rate());
 }
 
 pub struct RequestGenerator {

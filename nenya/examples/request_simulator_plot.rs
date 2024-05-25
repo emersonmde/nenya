@@ -177,8 +177,8 @@ fn main() {
 
     let generator = RequestGenerator::new(base_tps, amplitudes, frequencies);
 
-    let trailing_window_clone: &'static mut Duration = Box::leak(Box::new(trailing_window.clone()));
-    let duration_clone: &'static mut Duration = Box::leak(Box::new(duration.clone()));
+    let trailing_window_clone: &'static mut Duration = Box::leak(Box::new(trailing_window));
+    let duration_clone: &'static mut Duration = Box::leak(Box::new(duration));
     eframe::run_native(
         "Rate Limiter Simulation",
         eframe::NativeOptions {
@@ -206,6 +206,7 @@ struct App {
     start: Instant,
     accepted_requests: usize,
     total_requests: usize,
+    setpoint_data: Vec<[f64; 2]>,
     trailing_tps_data: Vec<[f64; 2]>,
     generated_tps_data: Vec<[f64; 2]>,
     target_tps_data: Vec<[f64; 2]>,
@@ -231,6 +232,7 @@ impl App {
             start: Instant::now(),
             accepted_requests: 0,
             total_requests: 0,
+            setpoint_data: Vec::new(),
             trailing_tps_data: Vec::new(),
             generated_tps_data: Vec::new(),
             target_tps_data: Vec::new(),
@@ -290,15 +292,17 @@ impl eframe::App for App {
                 self.throttled_request_times.len() as f64 / self.trailing_window.as_secs_f64();
 
             if elapsed_seconds - self.last_time_point_added >= 0.03 {
+                self.setpoint_data
+                    .push([elapsed_seconds, self.rate_limiter.setpoint()]);
                 self.trailing_tps_data.push([elapsed_seconds, trailing_tps]);
                 self.generated_tps_data
                     .push([elapsed_seconds, generated_tps]);
                 self.target_tps_data
-                    .push([elapsed_seconds, self.rate_limiter.target_rate]);
+                    .push([elapsed_seconds, self.rate_limiter.target_rate()]);
                 self.throttled_tps_data
                     .push([elapsed_seconds, throttled_tps]);
                 self.measured_tps_data
-                    .push([elapsed_seconds, self.rate_limiter.request_rate]);
+                    .push([elapsed_seconds, self.rate_limiter.request_rate()]);
 
                 self.last_time_point_added = elapsed_seconds;
             }
@@ -308,7 +312,7 @@ impl eframe::App for App {
             let total_tps = self.total_requests as f64 / elapsed_seconds;
             println!(
                 "Elapsed: {:.2}s | Total TPS: {:.2} | Accepted TPS: {:.2} | Trailing TPS: {:.2} | Generated TPS: {:.2} | Target TPS: {:.2} | Throttled TPS: {:.2}",
-                elapsed_seconds, total_tps, accepted_tps, trailing_tps, generated_tps, self.rate_limiter.target_rate, throttled_tps
+                elapsed_seconds, total_tps, accepted_tps, trailing_tps, generated_tps, self.rate_limiter.target_rate(), throttled_tps
             );
 
             ctx.request_repaint_after(Duration::from_millis(inter_request_delay));
@@ -319,11 +323,18 @@ impl eframe::App for App {
                 .view_aspect(2.0)
                 .legend(egui_plot::Legend::default().position(Corner::LeftTop))
                 .show(ui, |plot_ui| {
-                    plot_ui.line(Line::new(self.trailing_tps_data.clone()).name("Trailing TPS"));
+                    plot_ui.line(Line::new(self.setpoint_data.clone()).name("Setpoint"));
                     plot_ui.line(Line::new(self.generated_tps_data.clone()).name("Generated TPS"));
-                    plot_ui.line(Line::new(self.target_tps_data.clone()).name("Target TPS"));
-                    plot_ui.line(Line::new(self.throttled_tps_data.clone()).name("Throttled TPS"));
-                    plot_ui.line(Line::new(self.measured_tps_data.clone()).name("Measured TPS"));
+                    plot_ui.line(
+                        Line::new(self.trailing_tps_data.clone()).name("Trailing Accepted TPS"),
+                    );
+                    plot_ui.line(
+                        Line::new(self.throttled_tps_data.clone()).name("Trailing Throttled TPS"),
+                    );
+                    plot_ui.line(
+                        Line::new(self.target_tps_data.clone()).name("Rate Limit Target TPS"),
+                    );
+                    // plot_ui.line(Line::new(self.measured_tps_data.clone()).name("Measured TPS"));
                 });
         });
     }
