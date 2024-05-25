@@ -9,5 +9,5 @@ members = [
 edition = "2021"
 authors = ["Matthew Emerson <emersonmde@protonmail.com>"]
 license = "MIT"
-license-file = "LICENSE"
 repository = "https://github.com/emersonmde/nenya"
+readme = "README.md"

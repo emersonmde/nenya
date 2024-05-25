@@ -2,5 +2,12 @@
 name = "nenya-sentinel"
 version = "0.0.1"
 edition = "2021"
+description = "A standalone rate limiting service using PID control."
+#categories = ["algorithms", "web-programming"]
+#keywords = ["rate", "limit", "limiting", "throttling", "throttle"]
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
 
 [dependencies]

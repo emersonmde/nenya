@@ -2,6 +2,13 @@
 name = "nenya"
 version = "0.0.1"
 edition = "2021"
+description = "A Rust crate for adaptive rate limiting and PID control."
+categories = ["algorithms", "web-programming"]
+keywords = ["rate", "limit", "limiting", "throttling", "throttle"]
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
 
 [dependencies]
 num-traits = "0.2.19"
