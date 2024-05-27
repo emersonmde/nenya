@@ -158,6 +158,7 @@
 <a href="#156" id="156">156</a>
 <a href="#157" id="157">157</a>
 <a href="#158" id="158">158</a>
+<a href="#159" id="159">159</a>
 </pre></div><pre class="rust"><code><span class="attr">#[derive(Debug)]
 </span><span class="kw">pub struct </span>PIDController&lt;T&gt; {
     setpoint: T,
@@ -198,12 +199,13 @@
         <span class="kw">let </span>error = <span class="self">self</span>.setpoint - signal.into();
         <span class="kw">let </span>p = <span class="self">self</span>.kp * error;
 
-        <span class="comment">// Bias error direction
-        </span><span class="kw">if </span>error.is_positive() {
-            <span class="self">self</span>.accumulated_error = <span class="self">self</span>.accumulated_error + error * <span class="self">self</span>.error_bias.abs();
+        <span class="comment">// Apply error bias
+        </span><span class="kw">let </span>biased_error = <span class="kw">if </span>error.is_positive() {
+            error * (num_traits::one::&lt;T&gt;() + <span class="self">self</span>.error_bias)
         } <span class="kw">else </span>{
-            <span class="self">self</span>.accumulated_error = <span class="self">self</span>.accumulated_error + error / <span class="self">self</span>.error_bias.abs();
-        }
+            error * (num_traits::one::&lt;T&gt;() - <span class="self">self</span>.error_bias)
+        };
+        <span class="self">self</span>.accumulated_error = <span class="self">self</span>.accumulated_error + biased_error;
 
         <span class="comment">// Clamp accumulated_error to prevent integral windup
         </span><span class="self">self</span>.accumulated_error = num_traits::clamp(
@@ -248,14 +250,14 @@
 
     <span class="attr">#[test]
     </span><span class="kw">fn </span>test_pid_new() {
-        <span class="kw">let </span>pid = PIDController::new(<span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">10.0</span>, <span class="number">1.0</span>, <span class="number">100.0</span>);
+        <span class="kw">let </span>pid = PIDController::new(<span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">10.0</span>, <span class="number">0.0</span>, <span class="number">100.0</span>);
         <span class="macro">assert_eq!</span>(pid.setpoint(), <span class="number">1.0</span>);
         <span class="macro">assert_eq!</span>(pid.accumulated_error(), <span class="number">0.0</span>);
     }
 
     <span class="attr">#[test]
     </span><span class="kw">fn </span>test_pid_correction_positive_error() {
-        <span class="kw">let </span><span class="kw-2">mut </span>pid = PIDController::new(<span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">10.0</span>, <span class="number">1.0</span>, <span class="number">100.0</span>);
+        <span class="kw">let </span><span class="kw-2">mut </span>pid = PIDController::new(<span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">10.0</span>, <span class="number">0.0</span>, <span class="number">100.0</span>);
         <span class="kw">let </span>correction = pid.compute_correction(<span class="number">0.0</span>);
         <span class="macro">assert!</span>(
             correction &gt; <span class="number">0.0</span>,
@@ -265,7 +267,7 @@
 
     <span class="attr">#[test]
     </span><span class="kw">fn </span>test_pid_correction_negative_error() {
-        <span class="kw">let </span><span class="kw-2">mut </span>pid = PIDController::new(<span class="number">0.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">10.0</span>, <span class="number">1.0</span>, <span class="number">100.0</span>);
+        <span class="kw">let </span><span class="kw-2">mut </span>pid = PIDController::new(<span class="number">0.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">10.0</span>, <span class="number">0.0</span>, <span class="number">100.0</span>);
         <span class="kw">let </span>correction = pid.compute_correction(<span class="number">1.0</span>);
         <span class="macro">assert!</span>(
             correction &lt; <span class="number">0.0</span>,
@@ -275,7 +277,7 @@
 
     <span class="attr">#[test]
     </span><span class="kw">fn </span>test_pid_integral_windup() {
-        <span class="kw">let </span><span class="kw-2">mut </span>pid = PIDController::new(<span class="number">0.0</span>, <span class="number">0.0</span>, <span class="number">1.0</span>, <span class="number">0.0</span>, <span class="number">10.0</span>, <span class="number">1.0</span>, <span class="number">100.0</span>);
+        <span class="kw">let </span><span class="kw-2">mut </span>pid = PIDController::new(<span class="number">0.0</span>, <span class="number">0.0</span>, <span class="number">1.0</span>, <span class="number">0.0</span>, <span class="number">10.0</span>, <span class="number">0.0</span>, <span class="number">100.0</span>);
         <span class="kw">for _ in </span><span class="number">0</span>..<span class="number">20 </span>{
             pid.compute_correction(<span class="number">1.0</span>);
         }
@@ -288,7 +290,7 @@
 
     <span class="attr">#[test]
     </span><span class="kw">fn </span>test_pid_output_clamping() {
-        <span class="kw">let </span><span class="kw-2">mut </span>pid = PIDController::new(<span class="number">0.0</span>, <span class="number">100.0</span>, <span class="number">0.0</span>, <span class="number">0.0</span>, <span class="number">10.0</span>, <span class="number">1.0</span>, <span class="number">50.0</span>);
+        <span class="kw">let </span><span class="kw-2">mut </span>pid = PIDController::new(<span class="number">0.0</span>, <span class="number">100.0</span>, <span class="number">0.0</span>, <span class="number">0.0</span>, <span class="number">10.0</span>, <span class="number">0.0</span>, <span class="number">50.0</span>);
         <span class="kw">let </span>correction = pid.compute_correction(<span class="number">1.0</span>);
         <span class="macro">assert_eq!</span>(
             correction, -<span class="number">50.0</span>,
@@ -298,7 +300,7 @@
 
     <span class="attr">#[test]
     </span><span class="kw">fn </span>test_pid_anti_windup_feedback() {
-        <span class="kw">let </span><span class="kw-2">mut </span>pid = PIDController::new(<span class="number">0.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">0.0</span>, <span class="number">10.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>);
+        <span class="kw">let </span><span class="kw-2">mut </span>pid = PIDController::new(<span class="number">0.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">0.0</span>, <span class="number">10.0</span>, <span class="number">0.0</span>, <span class="number">1.0</span>);
         pid.compute_correction(<span class="number">10.0</span>); <span class="comment">// Large error
         </span><span class="macro">assert!</span>(
             pid.accumulated_error() &lt; <span class="number">10.0</span>,
@@ -308,7 +310,7 @@
 
     <span class="attr">#[test]
     </span><span class="kw">fn </span>test_pid_no_correction_needed() {
-        <span class="kw">let </span><span class="kw-2">mut </span>pid = PIDController::new(<span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">10.0</span>, <span class="number">1.0</span>, <span class="number">100.0</span>);
+        <span class="kw">let </span><span class="kw-2">mut </span>pid = PIDController::new(<span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">1.0</span>, <span class="number">10.0</span>, <span class="number">0.0</span>, <span class="number">100.0</span>);
         <span class="kw">let </span>correction = pid.compute_correction(<span class="number">1.0</span>);
         <span class="macro">assert_eq!</span>(
             correction, <span class="number">0.0</span>,
