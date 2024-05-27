@@ -81,3 +81,78 @@ impl<T: num_traits::Signed + PartialOrd + Copy> PIDController<T> {
         self.setpoint
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::PIDController;
+
+    #[test]
+    fn test_pid_new() {
+        let pid = PIDController::new(1.0, 1.0, 1.0, 1.0, 10.0, 1.0, 100.0);
+        assert_eq!(pid.setpoint(), 1.0);
+        assert_eq!(pid.accumulated_error(), 0.0);
+    }
+
+    #[test]
+    fn test_pid_correction_positive_error() {
+        let mut pid = PIDController::new(1.0, 1.0, 1.0, 1.0, 10.0, 1.0, 100.0);
+        let correction = pid.compute_correction(0.0);
+        assert!(
+            correction > 0.0,
+            "Correction should be positive when signal is below setpoint"
+        );
+    }
+
+    #[test]
+    fn test_pid_correction_negative_error() {
+        let mut pid = PIDController::new(0.0, 1.0, 1.0, 1.0, 10.0, 1.0, 100.0);
+        let correction = pid.compute_correction(1.0);
+        assert!(
+            correction < 0.0,
+            "Correction should be negative when signal is above setpoint"
+        );
+    }
+
+    #[test]
+    fn test_pid_integral_windup() {
+        let mut pid = PIDController::new(0.0, 0.0, 1.0, 0.0, 10.0, 1.0, 100.0);
+        for _ in 0..20 {
+            pid.compute_correction(1.0);
+        }
+        assert_eq!(
+            pid.accumulated_error(),
+            -10.0,
+            "Accumulated error should be clamped to error_limit"
+        );
+    }
+
+    #[test]
+    fn test_pid_output_clamping() {
+        let mut pid = PIDController::new(0.0, 100.0, 0.0, 0.0, 10.0, 1.0, 50.0);
+        let correction = pid.compute_correction(1.0);
+        assert_eq!(
+            correction, -50.0,
+            "Correction should be clamped to output_limit"
+        );
+    }
+
+    #[test]
+    fn test_pid_anti_windup_feedback() {
+        let mut pid = PIDController::new(0.0, 1.0, 1.0, 0.0, 10.0, 1.0, 1.0);
+        pid.compute_correction(10.0); // Large error
+        assert!(
+            pid.accumulated_error() < 10.0,
+            "Accumulated error should be reduced by anti-windup feedback"
+        );
+    }
+
+    #[test]
+    fn test_pid_no_correction_needed() {
+        let mut pid = PIDController::new(1.0, 1.0, 1.0, 1.0, 10.0, 1.0, 100.0);
+        let correction = pid.compute_correction(1.0);
+        assert_eq!(
+            correction, 0.0,
+            "Correction should be zero when signal equals setpoint"
+        );
+    }
+}
