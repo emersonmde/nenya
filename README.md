@@ -90,17 +90,21 @@ $P(t) = K_p \cdot e(t)$
 
 The error is adjusted by a bias $B$ depending on its sign:
 
-$$\text{biased\_error}(t) =
+```math
+\text{biased\_error}(t) =
 \begin{cases}
 e(t) \cdot |B| & \text{if } e(t) > 0 \\
 e(t) / |B| & \text{if } e(t) \leq 0
-\end{cases}$$
+\end{cases}
+```
 
 ### 4. Integral Term (I)
 
 The accumulated error $E(t)$ is clamped to prevent integral windup:
 
-$E(t) = \text{clamp}\left( E(t-1) + \text{biased\_error}(t), -L, L \right)$
+```math
+E(t) = \text{clamp}\left( E(t-1) + \text{biased\_error}(t), -L, L \right)
+```
 
 where $L$ is the error limit.
 
