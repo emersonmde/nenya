@@ -60,11 +60,9 @@ cargo run --example request_simulator -- \
 In technical documentation, the idiomatic way to present this PID controller would involve a combination of mathematical
 notation and clear, structured descriptions of each step. Here’s how you can structure the documentation:
 
----
-
 ## PID Controller
 
-The rate limiter achieves an adapative rate limit using a Proportional–integral–derivative controller which determines
+The rate limiter achieves an adapative rate limit using a proportional–integral–derivative controller which determines
 the target rate limit based on the request rate. This implementation includes with error bias,
 accumulated error clamping, anti-windup feedback, and output clamping.
 
@@ -86,13 +84,13 @@ P(t) = K_p \cdot e(t)
 
 ### 3. Error Bias
 
-The error is adjusted by a bias $B$ depending on its sign:
+The error is adjusted by a bias $B$ to react more to positive or negative errors:
 
 ```math
 \text{biased\_error}(t) =
 \begin{cases}
-e(t) \cdot |B| & \text{if } e(t) > 0 \\
-e(t) / |B| & \text{if } e(t) \leq 0
+e(t) \cdot (1 + B) & \text{if } e(t) > 0 \\
+e(t) \cdot (1 - B) & \text{if } e(t) \leq 0
 \end{cases}
 ```
 
@@ -174,7 +172,8 @@ R(t) = R(t-1) + u_{\text{clamped}}(t)
 
 1. **Error Calculation**: The error is calculated by subtracting the request rate from the setpoint.
 2. **Proportional Term**: The proportional term is the product of the proportional gain and the error.
-3. **Error Bias**: The error is adjusted by a bias factor depending on whether it is positive or negative.
+3. **Error Bias**:  The error is adjusted by a bias factor, reacting more to positive errors if $B > 0$ and
+   more to negative errors if $B < 0$.
 4. **Integral Term**: The integral term is the accumulated error over time, clamped to prevent windup.
 5. **Derivative Term**: The derivative term is the rate of change of the error.
 6. **Raw Correction**: The raw correction is the sum of the P, I, and D terms.
