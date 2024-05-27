@@ -68,12 +68,6 @@ The rate limiter achieves an adapative rate limit using a Proportional–integra
 the target rate limit based on the request rate. This implementation includes with error bias,
 accumulated error clamping, anti-windup feedback, and output clamping.
 
-Certainly! Here's the updated documentation reflecting the rate-limiting context:
-
----
-
-## PID Controller with Error Bias, Accumulated Error Clamping, Anti-Windup Feedback, Output Clamping, and Request Limit Adjustment
-
 ### 1. Error Calculation
 
 The error $e(t)$ is calculated as the difference between the setpoint $S$ and the request rate $r(t)$:
