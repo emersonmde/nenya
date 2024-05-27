@@ -18,6 +18,8 @@ pub struct RateLimiter {
     update_interval: Duration,
     request_timestamps: VecDeque<Instant>,
     accepted_request_timestamps: VecDeque<Instant>,
+    external_request_rate: f64,
+    external_accepted_request_rate: f64,
 }
 
 impl RateLimiter {
@@ -40,6 +42,8 @@ impl RateLimiter {
             update_interval,
             request_timestamps: VecDeque::new(),
             accepted_request_timestamps: VecDeque::new(),
+            external_request_rate: 0.0,
+            external_accepted_request_rate: 0.0,
         }
     }
 
@@ -80,6 +84,7 @@ impl RateLimiter {
         } else {
             self.accepted_request_rate = 0.0;
         }
+        self.accepted_request_rate += self.external_accepted_request_rate;
 
         if let Some(&oldest) = self.request_timestamps.front() {
             let window_duration = now.duration_since(oldest).as_secs_f64();
@@ -91,6 +96,7 @@ impl RateLimiter {
         } else {
             self.request_rate = 0.0;
         }
+        self.request_rate += self.external_request_rate;
     }
 
     fn trim_request_window(&mut self, now: Instant) {
@@ -124,5 +130,24 @@ impl RateLimiter {
 
     pub fn accepted_request_rate(&self) -> f64 {
         self.accepted_request_rate
+    }
+
+    pub fn external_request_rate(&self) -> f64 {
+        self.external_request_rate
+    }
+
+    pub fn set_external_request_rate(&mut self, external_request_rate: impl Into<f64>) {
+        self.external_request_rate = external_request_rate.into()
+    }
+
+    pub fn external_accepted_request_rate(&self) -> f64 {
+        self.external_accepted_request_rate
+    }
+
+    pub fn set_external_accepted_request_rate(
+        &mut self,
+        external_accepted_request_rate: impl Into<f64>,
+    ) {
+        self.external_accepted_request_rate = external_accepted_request_rate.into()
     }
 }

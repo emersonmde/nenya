@@ -308,12 +308,12 @@ impl eframe::App for App {
             }
 
             // Print metrics to the terminal
-            let accepted_tps = self.accepted_requests as f64 / elapsed_seconds;
-            let total_tps = self.total_requests as f64 / elapsed_seconds;
-            println!(
-                "Elapsed: {:.2}s | Total TPS: {:.2} | Accepted TPS: {:.2} | Trailing TPS: {:.2} | Generated TPS: {:.2} | Target TPS: {:.2} | Throttled TPS: {:.2}",
-                elapsed_seconds, total_tps, accepted_tps, trailing_tps, generated_tps, self.rate_limiter.target_rate(), throttled_tps
-            );
+            // let accepted_tps = self.accepted_requests as f64 / elapsed_seconds;
+            // let total_tps = self.total_requests as f64 / elapsed_seconds;
+            // println!(
+            //     "Elapsed: {:.2}s | Total TPS: {:.2} | Accepted TPS: {:.2} | Trailing TPS: {:.2} | Generated TPS: {:.2} | Target TPS: {:.2} | Throttled TPS: {:.2}",
+            //     elapsed_seconds, total_tps, accepted_tps, trailing_tps, generated_tps, self.rate_limiter.target_rate(), throttled_tps
+            // );
 
             ctx.request_repaint_after(Duration::from_millis(inter_request_delay));
         }
