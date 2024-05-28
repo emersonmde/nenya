@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package sentinel;
+
+service Sentinel {
+  rpc ExchangeMetrics(Metrics) returns (Metrics);
+  rpc ShouldThrottle(ShouldThrottleRequest) returns (ShouldThrottleResponse);
+}
+
+message Metrics {
+  string source = 1;
+  map<string, MetricData> segments = 2;
+}
+
+message MetricData {
+  float request_rate = 1;
+  float accepted_request_rate = 2;
+}
+
+message ShouldThrottleRequest {
+  optional string segment = 1;
+}
+
+message ShouldThrottleResponse {
+  bool should_throttle = 1;
+}
