@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"fn":["main"]};
+window.SIDEBAR_ITEMS = {"fn":["main"],"mod":["sentinel"],"struct":["SentinelService"],"type":["LockedMetricMap","MetricMap"]};

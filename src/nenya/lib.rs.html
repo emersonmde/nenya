@@ -202,7 +202,7 @@
         }
     }
 
-    <span class="kw">pub fn </span>handle_request(<span class="kw-2">&amp;mut </span><span class="self">self</span>) -&gt; bool {
+    <span class="kw">pub fn </span>should_throttle(<span class="kw-2">&amp;mut </span><span class="self">self</span>) -&gt; bool {
         <span class="kw">let </span>now = Instant::now();
         <span class="self">self</span>.trim_request_window(now);
         <span class="self">self</span>.calculate_request_rate(now);
