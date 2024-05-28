@@ -90,6 +90,17 @@
 <a href="#88" id="88">88</a>
 <a href="#89" id="89">89</a>
 <a href="#90" id="90">90</a>
+<a href="#91" id="91">91</a>
+<a href="#92" id="92">92</a>
+<a href="#93" id="93">93</a>
+<a href="#94" id="94">94</a>
+<a href="#95" id="95">95</a>
+<a href="#96" id="96">96</a>
+<a href="#97" id="97">97</a>
+<a href="#98" id="98">98</a>
+<a href="#99" id="99">99</a>
+<a href="#100" id="100">100</a>
+<a href="#101" id="101">101</a>
 </pre></div><pre class="rust"><code><span class="kw">use </span>std::collections::HashMap;
 <span class="kw">use </span>std::sync::Arc;
 
@@ -111,8 +122,18 @@
 
 <span class="attr">#[derive(Debug, Default)]
 </span><span class="kw">pub struct </span>SentinelService {
-    segments: Arc&lt;RwLock&lt;HashMap&lt;String, RateLimiter&gt;&gt;&gt;,
+    segments: Arc&lt;RwLock&lt;HashMap&lt;String, RateLimiter&lt;f32&gt;&gt;&gt;&gt;,
     node_metrics: Arc&lt;RwLock&lt;HashMap&lt;String, LockedMetricMap&gt;&gt;&gt;,
+    hostname: String,
+}
+
+<span class="kw">impl </span>SentinelService {
+    <span class="kw">pub fn </span>new(hostname: String) -&gt; <span class="self">Self </span>{
+        SentinelService {
+            hostname,
+            ..SentinelService::default()
+        }
+    }
 }
 
 <span class="attr">#[tonic::async_trait]
@@ -141,13 +162,12 @@
         <span class="kw">let </span>segments = <span class="self">self</span>.segments.read().<span class="kw">await</span>;
         <span class="kw">let </span>metric_segments: HashMap&lt;String, MetricData&gt; = segments
             .iter()
-            .map(|(k, v)| {
+            .map(|(segment_id, segment_rate_limiter)| {
                 (
-                    k.clone(),
+                    segment_id.clone(),
                     MetricData {
-                        <span class="comment">// TODO: Switch RateLimiter to f32
-                        </span>request_rate: v.request_rate() <span class="kw">as </span>f32,
-                        accepted_request_rate: v.accepted_request_rate() <span class="kw">as </span>f32,
+                        request_rate: segment_rate_limiter.request_rate(),
+                        accepted_request_rate: segment_rate_limiter.accepted_request_rate(),
                     },
                 )
             })
@@ -155,8 +175,7 @@
 
         <span class="kw">return </span><span class="prelude-val">Ok</span>(Response::new(Metrics {
             segments: metric_segments,
-            <span class="comment">// TODO: use local IP
-            </span>source: <span class="string">"foo"</span>.to_string(),
+            source: <span class="self">self</span>.hostname.clone(),
         }));
     }
 
@@ -171,7 +190,10 @@
 <span class="attr">#[tokio::main]
 </span><span class="kw">async fn </span>main() -&gt; <span class="prelude-ty">Result</span>&lt;(), Box&lt;<span class="kw">dyn </span>std::error::Error&gt;&gt; {
     <span class="kw">let </span>addr = <span class="string">"[::1]:8080"</span>.parse()<span class="question-mark">?</span>;
-    <span class="kw">let </span>sentinel = SentinelService::default();
+    <span class="kw">let </span>hostname: String = hostname::get()<span class="question-mark">?
+        </span>.into_string()
+        .expect(<span class="string">"Unable to get hostname"</span>);
+    <span class="kw">let </span>sentinel = SentinelService::new(hostname);
 
     Server::builder()
         .add_service(SentinelServer::new(sentinel))

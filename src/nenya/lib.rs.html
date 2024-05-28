@@ -153,7 +153,12 @@
 <a href="#151" id="151">151</a>
 <a href="#152" id="152">152</a>
 <a href="#153" id="153">153</a>
-</pre></div><pre class="rust"><code><span class="kw">use </span>std::collections::VecDeque;
+<a href="#154" id="154">154</a>
+<a href="#155" id="155">155</a>
+<a href="#156" id="156">156</a>
+<a href="#157" id="157">157</a>
+</pre></div><pre class="rust"><code><span class="kw">use </span>num_traits::{FromPrimitive, Signed, Zero};
+<span class="kw">use </span>std::collections::VecDeque;
 <span class="kw">use </span>std::time::{Duration, Instant};
 
 <span class="kw">use </span><span class="kw">crate</span>::pid_controller::PIDController;
@@ -161,44 +166,44 @@
 <span class="kw">pub mod </span>pid_controller;
 
 <span class="attr">#[derive(Debug)]
-</span><span class="kw">pub struct </span>RateLimiter {
-    request_rate: f64,
-    accepted_request_rate: f64,
-    target_rate: f64,
-    min_rate: f64,
-    max_rate: f64,
-    pid_controller: PIDController&lt;f64&gt;,
+</span><span class="kw">pub struct </span>RateLimiter&lt;T&gt; {
+    request_rate: T,
+    accepted_request_rate: T,
+    target_rate: T,
+    min_rate: T,
+    max_rate: T,
+    pid_controller: PIDController&lt;T&gt;,
     last_updated: Instant,
-    previous_output: f64,
+    previous_output: T,
     update_interval: Duration,
     request_timestamps: VecDeque&lt;Instant&gt;,
     accepted_request_timestamps: VecDeque&lt;Instant&gt;,
-    external_request_rate: f64,
-    external_accepted_request_rate: f64,
+    external_request_rate: T,
+    external_accepted_request_rate: T,
 }
 
-<span class="kw">impl </span>RateLimiter {
+<span class="kw">impl</span>&lt;T: Signed + PartialOrd + Zero + Copy + FromPrimitive&gt; RateLimiter&lt;T&gt; {
     <span class="kw">pub fn </span>new(
-        target_rate: f64,
-        min_rate: f64,
-        max_rate: f64,
-        pid_controller: PIDController&lt;f64&gt;,
+        target_rate: T,
+        min_rate: T,
+        max_rate: T,
+        pid_controller: PIDController&lt;T&gt;,
         update_interval: Duration,
-    ) -&gt; RateLimiter {
+    ) -&gt; RateLimiter&lt;T&gt; {
         RateLimiter {
-            request_rate: <span class="number">0.0</span>,
-            accepted_request_rate: <span class="number">0.0</span>,
+            request_rate: T::zero(),
+            accepted_request_rate: T::zero(),
             target_rate,
             min_rate,
             max_rate,
             pid_controller,
             last_updated: Instant::now(),
-            previous_output: <span class="number">0.0</span>,
+            previous_output: T::zero(),
             update_interval,
             request_timestamps: VecDeque::new(),
             accepted_request_timestamps: VecDeque::new(),
-            external_request_rate: <span class="number">0.0</span>,
-            external_accepted_request_rate: <span class="number">0.0</span>,
+            external_request_rate: T::zero(),
+            external_accepted_request_rate: T::zero(),
         }
     }
 
@@ -230,28 +235,31 @@
 
     <span class="kw">fn </span>calculate_request_rate(<span class="kw-2">&amp;mut </span><span class="self">self</span>, now: Instant) {
         <span class="kw">if let </span><span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span>oldest) = <span class="self">self</span>.accepted_request_timestamps.front() {
-            <span class="kw">let </span>window_duration = now.duration_since(oldest).as_secs_f64();
-            <span class="self">self</span>.accepted_request_rate = <span class="kw">if </span>window_duration &gt; <span class="number">0.0 </span>{
-                <span class="self">self</span>.accepted_request_timestamps.len() <span class="kw">as </span>f64 / window_duration
+            <span class="kw">let </span>window_duration = now.duration_since(oldest).as_secs();
+            <span class="self">self</span>.accepted_request_rate = <span class="kw">if </span>T::from_u64(window_duration).unwrap() &gt; T::zero() {
+                T::from_usize(<span class="self">self</span>.accepted_request_timestamps.len()).unwrap()
+                    / T::from_u64(window_duration).unwrap()
             } <span class="kw">else </span>{
-                <span class="number">0.0
-            </span>};
+                T::zero()
+            };
         } <span class="kw">else </span>{
-            <span class="self">self</span>.accepted_request_rate = <span class="number">0.0</span>;
+            <span class="self">self</span>.accepted_request_rate = T::zero();
         }
-        <span class="self">self</span>.accepted_request_rate += <span class="self">self</span>.external_accepted_request_rate;
+        <span class="self">self</span>.accepted_request_rate =
+            <span class="self">self</span>.external_accepted_request_rate + <span class="self">self</span>.external_accepted_request_rate;
 
         <span class="kw">if let </span><span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span>oldest) = <span class="self">self</span>.request_timestamps.front() {
-            <span class="kw">let </span>window_duration = now.duration_since(oldest).as_secs_f64();
-            <span class="self">self</span>.request_rate = <span class="kw">if </span>window_duration &gt; <span class="number">0.0 </span>{
-                <span class="self">self</span>.request_timestamps.len() <span class="kw">as </span>f64 / window_duration
+            <span class="kw">let </span>window_duration = now.duration_since(oldest).as_secs();
+            <span class="self">self</span>.request_rate = <span class="kw">if </span>T::from_u64(window_duration).unwrap() &gt; T::zero() {
+                T::from_usize(<span class="self">self</span>.request_timestamps.len()).unwrap()
+                    / T::from_u64(window_duration).unwrap()
             } <span class="kw">else </span>{
-                <span class="number">0.0
-            </span>};
+                T::zero()
+            };
         } <span class="kw">else </span>{
-            <span class="self">self</span>.request_rate = <span class="number">0.0</span>;
+            <span class="self">self</span>.request_rate = T::zero();
         }
-        <span class="self">self</span>.request_rate += <span class="self">self</span>.external_request_rate;
+        <span class="self">self</span>.request_rate = <span class="self">self</span>.request_rate + <span class="self">self</span>.external_request_rate;
     }
 
     <span class="kw">fn </span>trim_request_window(<span class="kw-2">&amp;mut </span><span class="self">self</span>, now: Instant) {
@@ -271,37 +279,37 @@
         }
     }
 
-    <span class="kw">pub fn </span>setpoint(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; f64 {
+    <span class="kw">pub fn </span>setpoint(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; T {
         <span class="self">self</span>.pid_controller.setpoint()
     }
 
-    <span class="kw">pub fn </span>target_rate(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; f64 {
+    <span class="kw">pub fn </span>target_rate(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; T {
         <span class="self">self</span>.target_rate
     }
 
-    <span class="kw">pub fn </span>request_rate(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; f64 {
+    <span class="kw">pub fn </span>request_rate(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; T {
         <span class="self">self</span>.request_rate
     }
 
-    <span class="kw">pub fn </span>accepted_request_rate(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; f64 {
+    <span class="kw">pub fn </span>accepted_request_rate(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; T {
         <span class="self">self</span>.accepted_request_rate
     }
 
-    <span class="kw">pub fn </span>external_request_rate(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; f64 {
+    <span class="kw">pub fn </span>external_request_rate(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; T {
         <span class="self">self</span>.external_request_rate
     }
 
-    <span class="kw">pub fn </span>set_external_request_rate(<span class="kw-2">&amp;mut </span><span class="self">self</span>, external_request_rate: <span class="kw">impl </span>Into&lt;f64&gt;) {
+    <span class="kw">pub fn </span>set_external_request_rate(<span class="kw-2">&amp;mut </span><span class="self">self</span>, external_request_rate: <span class="kw">impl </span>Into&lt;T&gt;) {
         <span class="self">self</span>.external_request_rate = external_request_rate.into()
     }
 
-    <span class="kw">pub fn </span>external_accepted_request_rate(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; f64 {
+    <span class="kw">pub fn </span>external_accepted_request_rate(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; T {
         <span class="self">self</span>.external_accepted_request_rate
     }
 
     <span class="kw">pub fn </span>set_external_accepted_request_rate(
         <span class="kw-2">&amp;mut </span><span class="self">self</span>,
-        external_accepted_request_rate: <span class="kw">impl </span>Into&lt;f64&gt;,
+        external_accepted_request_rate: <span class="kw">impl </span>Into&lt;T&gt;,
     ) {
         <span class="self">self</span>.external_accepted_request_rate = external_accepted_request_rate.into()
     }
