@@ -64,12 +64,33 @@ see:
 cargo run --example request_simulator_plot -- --help
 ```
 
-## PID Controller
+## Adaptive Rate Limiting
 
 The rate limiter achieves an adaptive rate limit using a
 Proportional–Integral–Derivative (PID) controller which determines the target
 rate limit based on the request rate. This implementation includes with error
 bias, accumulated error clamping, anti-windup feedback, and output clamping.
+
+### Overview
+
+1. **Error Calculation**: The error is calculated by subtracting the request
+   rate from the setpoint.
+2. **Proportional Term**: The proportional term is the product of the
+   proportional gain and the error.
+3. **Error Bias**:  The error is adjusted by a bias factor, reacting more to
+   positive errors if $B > 0$ and more to negative errors if $B < 0$.
+4. **Integral Term**: The integral term is the accumulated error over time,
+   clamped to prevent windup.
+5. **Derivative Term**: The derivative term is the rate of change of the error.
+6. **Raw Correction**: The raw correction is the sum of the P, I, and D terms.
+7. **Output Clamping**: The output is clamped to a specified limit to prevent
+   excessive corrections.
+8. **Anti-Windup Feedback**: If clamping occurs, the accumulated error is
+   adjusted to prevent windup.
+9. **Final Output**: The clamped correction is the final output of the PID
+   controller.
+10. **Request Limit Adjustment**: The clamped correction is added to the
+    current request limit to derive the new request limit.
 
 ### 1. Error Calculation
 
@@ -176,29 +197,6 @@ request limit $R(t)$:
 ```math
 R(t) = R(t-1) + u_{\text{clamped}}(t)
 ```
-
----
-
-### Explanation
-
-1. **Error Calculation**: The error is calculated by subtracting the request
-   rate from the setpoint.
-2. **Proportional Term**: The proportional term is the product of the
-   proportional gain and the error.
-3. **Error Bias**:  The error is adjusted by a bias factor, reacting more to
-   positive errors if $B > 0$ and more to negative errors if $B < 0$.
-4. **Integral Term**: The integral term is the accumulated error over time,
-   clamped to prevent windup.
-5. **Derivative Term**: The derivative term is the rate of change of the error.
-6. **Raw Correction**: The raw correction is the sum of the P, I, and D terms.
-7. **Output Clamping**: The output is clamped to a specified limit to prevent
-   excessive corrections.
-8. **Anti-Windup Feedback**: If clamping occurs, the accumulated error is
-   adjusted to prevent windup.
-9. **Final Output**: The clamped correction is the final output of the PID
-   controller.
-10. **Request Limit Adjustment**: The clamped correction is added to the
-    current request limit to derive the new request limit.
 
 ## License
 
