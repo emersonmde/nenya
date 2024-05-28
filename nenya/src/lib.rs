@@ -47,7 +47,7 @@ impl RateLimiter {
         }
     }
 
-    pub fn handle_request(&mut self) -> bool {
+    pub fn should_throttle(&mut self) -> bool {
         let now = Instant::now();
         self.trim_request_window(now);
         self.calculate_request_rate(now);

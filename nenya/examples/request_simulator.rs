@@ -212,7 +212,7 @@ fn generate_requests(
             1000
         };
 
-        let should_accept_request = rate_limiter.handle_request();
+        let should_accept_request = rate_limiter.should_throttle();
         total_requests += 1;
         let now = Instant::now();
 

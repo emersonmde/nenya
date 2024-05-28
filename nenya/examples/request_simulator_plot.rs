@@ -257,7 +257,7 @@ impl eframe::App for App {
                 1000
             };
 
-            let should_accept_request = self.rate_limiter.handle_request();
+            let should_accept_request = self.rate_limiter.should_throttle();
             self.total_requests += 1;
             let now = Instant::now();
 
