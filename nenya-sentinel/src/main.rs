@@ -19,8 +19,18 @@ type LockedMetricMap = Arc<RwLock<MetricMap>>;
 
 #[derive(Debug, Default)]
 pub struct SentinelService {
-    segments: Arc<RwLock<HashMap<String, RateLimiter>>>,
+    segments: Arc<RwLock<HashMap<String, RateLimiter<f32>>>>,
     node_metrics: Arc<RwLock<HashMap<String, LockedMetricMap>>>,
+    hostname: String,
+}
+
+impl SentinelService {
+    pub fn new(hostname: String) -> Self {
+        SentinelService {
+            hostname,
+            ..SentinelService::default()
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -49,13 +59,12 @@ impl Sentinel for SentinelService {
         let segments = self.segments.read().await;
         let metric_segments: HashMap<String, MetricData> = segments
             .iter()
-            .map(|(k, v)| {
+            .map(|(segment_id, segment_rate_limiter)| {
                 (
-                    k.clone(),
+                    segment_id.clone(),
                     MetricData {
-                        // TODO: Switch RateLimiter to f32
-                        request_rate: v.request_rate() as f32,
-                        accepted_request_rate: v.accepted_request_rate() as f32,
+                        request_rate: segment_rate_limiter.request_rate(),
+                        accepted_request_rate: segment_rate_limiter.accepted_request_rate(),
                     },
                 )
             })
@@ -63,8 +72,7 @@ impl Sentinel for SentinelService {
 
         return Ok(Response::new(Metrics {
             segments: metric_segments,
-            // TODO: use local IP
-            source: "foo".to_string(),
+            source: self.hostname.clone(),
         }));
     }
 
@@ -79,7 +87,10 @@ impl Sentinel for SentinelService {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:8080".parse()?;
-    let sentinel = SentinelService::default();
+    let hostname: String = hostname::get()?
+        .into_string()
+        .expect("Unable to get hostname");
+    let sentinel = SentinelService::new(hostname);
 
     Server::builder()
         .add_service(SentinelServer::new(sentinel))

@@ -133,7 +133,7 @@ fn main() {
         .get_matches();
 
     let base_tps = *matches.get_one::<f64>("base_tps").unwrap();
-    let target_tps = *matches.get_one::<f64>("target_tps").unwrap();
+    let target_tps = *matches.get_one::<f32>("target_tps").unwrap();
     let trailing_window = Duration::from_secs(*matches.get_one::<u64>("trailing_window").unwrap());
     let duration = Duration::from_secs(*matches.get_one::<u64>("duration").unwrap());
 
@@ -148,16 +148,16 @@ fn main() {
         .copied()
         .collect();
 
-    let min_tps = *matches.get_one::<f64>("min_tps").unwrap();
-    let max_tps = *matches.get_one::<f64>("max_tps").unwrap();
-    let kp = *matches.get_one::<f64>("kp").unwrap();
-    let ki = *matches.get_one::<f64>("ki").unwrap();
-    let kd = *matches.get_one::<f64>("kd").unwrap();
-    let error_limit = *matches.get_one::<f64>("error_limit").unwrap();
-    let output_limit = *matches.get_one::<f64>("output_limit").unwrap();
+    let min_tps = *matches.get_one::<f32>("min_tps").unwrap();
+    let max_tps = *matches.get_one::<f32>("max_tps").unwrap();
+    let kp = *matches.get_one::<f32>("kp").unwrap();
+    let ki = *matches.get_one::<f32>("ki").unwrap();
+    let kd = *matches.get_one::<f32>("kd").unwrap();
+    let error_limit = *matches.get_one::<f32>("error_limit").unwrap();
+    let output_limit = *matches.get_one::<f32>("output_limit").unwrap();
     let update_interval =
         Duration::from_millis(*matches.get_one::<u64>("update_interval").unwrap());
-    let error_bias = *matches.get_one::<f64>("error_bias").unwrap();
+    let error_bias = *matches.get_one::<f32>("error_bias").unwrap();
 
     let pid_controller = PIDController::new(
         target_tps,
@@ -181,7 +181,7 @@ fn main() {
 }
 
 fn generate_requests(
-    rate_limiter: &mut RateLimiter,
+    rate_limiter: &mut RateLimiter<f32>,
     generator: &RequestGenerator,
     trailing_window: Duration,
     duration: Duration,
@@ -276,7 +276,7 @@ fn print_metrics(
     total_tps: &f64,
     accepted_tps: &f64,
     trailing_tps: &f64,
-    rate_limiter: &RateLimiter,
+    rate_limiter: &RateLimiter<f32>,
     generated_tps: f64,
 ) {
     println!("\rTotal TPS: {:.2}", total_tps);

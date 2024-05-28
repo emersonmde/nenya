@@ -16,7 +16,7 @@ fn main() {
             Arg::new("base_tps")
                 .short('b')
                 .long("base_tps")
-                .value_parser(clap::value_parser!(f64))
+                .value_parser(clap::value_parser!(f32))
                 .default_value("50.0")
                 .help("Base TPS for the request generator"),
         )
@@ -24,7 +24,7 @@ fn main() {
             Arg::new("min_tps")
                 .short('m')
                 .long("min_tps")
-                .value_parser(clap::value_parser!(f64))
+                .value_parser(clap::value_parser!(f32))
                 .default_value("1.0")
                 .help("Lower bound of TPS for the rate limiter"),
         )
@@ -32,7 +32,7 @@ fn main() {
             Arg::new("max_tps")
                 .short('x')
                 .long("max_tps")
-                .value_parser(clap::value_parser!(f64))
+                .value_parser(clap::value_parser!(f32))
                 .default_value("60.0")
                 .help("Upper bound of TPS for the rate limiter"),
         )
@@ -40,7 +40,7 @@ fn main() {
             Arg::new("target_tps")
                 .short('t')
                 .long("target_tps")
-                .value_parser(clap::value_parser!(f64))
+                .value_parser(clap::value_parser!(f32))
                 .default_value("40.0")
                 .help("Target TPS for the rate limiter"),
         )
@@ -64,7 +64,7 @@ fn main() {
             Arg::new("amplitudes")
                 .short('a')
                 .long("amplitudes")
-                .value_parser(clap::value_parser!(f64))
+                .value_parser(clap::value_parser!(f32))
                 .num_args(1..)
                 .use_value_delimiter(true)
                 .default_value("20.0,10.0")
@@ -74,7 +74,7 @@ fn main() {
             Arg::new("frequencies")
                 .short('f')
                 .long("frequencies")
-                .value_parser(clap::value_parser!(f64))
+                .value_parser(clap::value_parser!(f32))
                 .num_args(1..)
                 .use_value_delimiter(true)
                 .default_value("0.1,0.5")
@@ -83,42 +83,42 @@ fn main() {
         .arg(
             Arg::new("kp")
                 .long("kp")
-                .value_parser(clap::value_parser!(f64))
+                .value_parser(clap::value_parser!(f32))
                 .default_value("0.5")
                 .help("Proportional gain for the PID controller"),
         )
         .arg(
             Arg::new("ki")
                 .long("ki")
-                .value_parser(clap::value_parser!(f64))
+                .value_parser(clap::value_parser!(f32))
                 .default_value("0.1")
                 .help("Integral gain for the PID controller"),
         )
         .arg(
             Arg::new("kd")
                 .long("kd")
-                .value_parser(clap::value_parser!(f64))
+                .value_parser(clap::value_parser!(f32))
                 .default_value("0.05")
                 .help("Derivative gain for the PID controller"),
         )
         .arg(
             Arg::new("error_limit")
                 .long("error_limit")
-                .value_parser(clap::value_parser!(f64))
+                .value_parser(clap::value_parser!(f32))
                 .default_value("100.0")
                 .help("Error limit for the PID controller"),
         )
         .arg(
             Arg::new("error_bias")
                 .long("error_bias")
-                .value_parser(clap::value_parser!(f64))
+                .value_parser(clap::value_parser!(f32))
                 .default_value("1.5")
                 .help("Bias factor for the integral term"),
         )
         .arg(
             Arg::new("output_limit")
                 .long("output_limit")
-                .value_parser(clap::value_parser!(f64))
+                .value_parser(clap::value_parser!(f32))
                 .default_value("5.0")
                 .help("Output limit for the PID controller"),
         )
@@ -132,7 +132,7 @@ fn main() {
         .get_matches();
 
     let base_tps = *matches.get_one::<f64>("base_tps").unwrap();
-    let target_tps = *matches.get_one::<f64>("target_tps").unwrap();
+    let target_tps = *matches.get_one::<f32>("target_tps").unwrap();
     let trailing_window = Duration::from_secs(*matches.get_one::<u64>("trailing_window").unwrap());
     let duration = Duration::from_secs(*matches.get_one::<u64>("duration").unwrap());
 
@@ -147,16 +147,16 @@ fn main() {
         .copied()
         .collect();
 
-    let min_tps = *matches.get_one::<f64>("min_tps").unwrap();
-    let max_tps = *matches.get_one::<f64>("max_tps").unwrap();
-    let kp = *matches.get_one::<f64>("kp").unwrap();
-    let ki = *matches.get_one::<f64>("ki").unwrap();
-    let kd = *matches.get_one::<f64>("kd").unwrap();
-    let error_limit = *matches.get_one::<f64>("error_limit").unwrap();
-    let output_limit = *matches.get_one::<f64>("output_limit").unwrap();
+    let min_tps = *matches.get_one::<f32>("min_tps").unwrap();
+    let max_tps = *matches.get_one::<f32>("max_tps").unwrap();
+    let kp = *matches.get_one::<f32>("kp").unwrap();
+    let ki = *matches.get_one::<f32>("ki").unwrap();
+    let kd = *matches.get_one::<f32>("kd").unwrap();
+    let error_limit = *matches.get_one::<f32>("error_limit").unwrap();
+    let output_limit = *matches.get_one::<f32>("output_limit").unwrap();
     let update_interval =
         Duration::from_millis(*matches.get_one::<u64>("update_interval").unwrap());
-    let error_bias = *matches.get_one::<f64>("error_bias").unwrap();
+    let error_bias = *matches.get_one::<f32>("error_bias").unwrap();
 
     let pid_controller = PIDController::new(
         target_tps,
@@ -199,7 +199,7 @@ fn main() {
 }
 
 struct App {
-    rate_limiter: RateLimiter,
+    rate_limiter: RateLimiter<f32>,
     generator: RequestGenerator,
     trailing_window: Duration,
     duration: Duration,
@@ -219,7 +219,7 @@ struct App {
 
 impl App {
     fn new(
-        rate_limiter: RateLimiter,
+        rate_limiter: RateLimiter<f32>,
         generator: RequestGenerator,
         trailing_window: Duration,
         duration: Duration,
@@ -293,23 +293,23 @@ impl eframe::App for App {
 
             if elapsed_seconds - self.last_time_point_added >= 0.03 {
                 self.setpoint_data
-                    .push([elapsed_seconds, self.rate_limiter.setpoint()]);
+                    .push([elapsed_seconds, self.rate_limiter.setpoint() as f64]);
                 self.trailing_tps_data.push([elapsed_seconds, trailing_tps]);
                 self.generated_tps_data
                     .push([elapsed_seconds, generated_tps]);
                 self.target_tps_data
-                    .push([elapsed_seconds, self.rate_limiter.target_rate()]);
+                    .push([elapsed_seconds, self.rate_limiter.target_rate() as f64]);
                 self.throttled_tps_data
                     .push([elapsed_seconds, throttled_tps]);
                 self.measured_tps_data
-                    .push([elapsed_seconds, self.rate_limiter.request_rate()]);
+                    .push([elapsed_seconds, self.rate_limiter.request_rate() as f64]);
 
                 self.last_time_point_added = elapsed_seconds;
             }
 
             // Print metrics to the terminal
-            // let accepted_tps = self.accepted_requests as f64 / elapsed_seconds;
-            // let total_tps = self.total_requests as f64 / elapsed_seconds;
+            // let accepted_tps = self.accepted_requests as f32 / elapsed_seconds;
+            // let total_tps = self.total_requests as f32 / elapsed_seconds;
             // println!(
             //     "Elapsed: {:.2}s | Total TPS: {:.2} | Accepted TPS: {:.2} | Trailing TPS: {:.2} | Generated TPS: {:.2} | Target TPS: {:.2} | Throttled TPS: {:.2}",
             //     elapsed_seconds, total_tps, accepted_tps, trailing_tps, generated_tps, self.rate_limiter.target_rate(), throttled_tps

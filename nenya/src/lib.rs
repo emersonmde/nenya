@@ -1,3 +1,4 @@
+use num_traits::{FromPrimitive, Signed, Zero};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -6,44 +7,44 @@ use crate::pid_controller::PIDController;
 pub mod pid_controller;
 
 #[derive(Debug)]
-pub struct RateLimiter {
-    request_rate: f64,
-    accepted_request_rate: f64,
-    target_rate: f64,
-    min_rate: f64,
-    max_rate: f64,
-    pid_controller: PIDController<f64>,
+pub struct RateLimiter<T> {
+    request_rate: T,
+    accepted_request_rate: T,
+    target_rate: T,
+    min_rate: T,
+    max_rate: T,
+    pid_controller: PIDController<T>,
     last_updated: Instant,
-    previous_output: f64,
+    previous_output: T,
     update_interval: Duration,
     request_timestamps: VecDeque<Instant>,
     accepted_request_timestamps: VecDeque<Instant>,
-    external_request_rate: f64,
-    external_accepted_request_rate: f64,
+    external_request_rate: T,
+    external_accepted_request_rate: T,
 }
 
-impl RateLimiter {
+impl<T: Signed + PartialOrd + Zero + Copy + FromPrimitive> RateLimiter<T> {
     pub fn new(
-        target_rate: f64,
-        min_rate: f64,
-        max_rate: f64,
-        pid_controller: PIDController<f64>,
+        target_rate: T,
+        min_rate: T,
+        max_rate: T,
+        pid_controller: PIDController<T>,
         update_interval: Duration,
-    ) -> RateLimiter {
+    ) -> RateLimiter<T> {
         RateLimiter {
-            request_rate: 0.0,
-            accepted_request_rate: 0.0,
+            request_rate: T::zero(),
+            accepted_request_rate: T::zero(),
             target_rate,
             min_rate,
             max_rate,
             pid_controller,
             last_updated: Instant::now(),
-            previous_output: 0.0,
+            previous_output: T::zero(),
             update_interval,
             request_timestamps: VecDeque::new(),
             accepted_request_timestamps: VecDeque::new(),
-            external_request_rate: 0.0,
-            external_accepted_request_rate: 0.0,
+            external_request_rate: T::zero(),
+            external_accepted_request_rate: T::zero(),
         }
     }
 
@@ -75,28 +76,31 @@ impl RateLimiter {
 
     fn calculate_request_rate(&mut self, now: Instant) {
         if let Some(&oldest) = self.accepted_request_timestamps.front() {
-            let window_duration = now.duration_since(oldest).as_secs_f64();
-            self.accepted_request_rate = if window_duration > 0.0 {
-                self.accepted_request_timestamps.len() as f64 / window_duration
+            let window_duration = now.duration_since(oldest).as_secs();
+            self.accepted_request_rate = if T::from_u64(window_duration).unwrap() > T::zero() {
+                T::from_usize(self.accepted_request_timestamps.len()).unwrap()
+                    / T::from_u64(window_duration).unwrap()
             } else {
-                0.0
+                T::zero()
             };
         } else {
-            self.accepted_request_rate = 0.0;
+            self.accepted_request_rate = T::zero();
         }
-        self.accepted_request_rate += self.external_accepted_request_rate;
+        self.accepted_request_rate =
+            self.external_accepted_request_rate + self.external_accepted_request_rate;
 
         if let Some(&oldest) = self.request_timestamps.front() {
-            let window_duration = now.duration_since(oldest).as_secs_f64();
-            self.request_rate = if window_duration > 0.0 {
-                self.request_timestamps.len() as f64 / window_duration
+            let window_duration = now.duration_since(oldest).as_secs();
+            self.request_rate = if T::from_u64(window_duration).unwrap() > T::zero() {
+                T::from_usize(self.request_timestamps.len()).unwrap()
+                    / T::from_u64(window_duration).unwrap()
             } else {
-                0.0
+                T::zero()
             };
         } else {
-            self.request_rate = 0.0;
+            self.request_rate = T::zero();
         }
-        self.request_rate += self.external_request_rate;
+        self.request_rate = self.request_rate + self.external_request_rate;
     }
 
     fn trim_request_window(&mut self, now: Instant) {
@@ -116,37 +120,37 @@ impl RateLimiter {
         }
     }
 
-    pub fn setpoint(&self) -> f64 {
+    pub fn setpoint(&self) -> T {
         self.pid_controller.setpoint()
     }
 
-    pub fn target_rate(&self) -> f64 {
+    pub fn target_rate(&self) -> T {
         self.target_rate
     }
 
-    pub fn request_rate(&self) -> f64 {
+    pub fn request_rate(&self) -> T {
         self.request_rate
     }
 
-    pub fn accepted_request_rate(&self) -> f64 {
+    pub fn accepted_request_rate(&self) -> T {
         self.accepted_request_rate
     }
 
-    pub fn external_request_rate(&self) -> f64 {
+    pub fn external_request_rate(&self) -> T {
         self.external_request_rate
     }
 
-    pub fn set_external_request_rate(&mut self, external_request_rate: impl Into<f64>) {
+    pub fn set_external_request_rate(&mut self, external_request_rate: impl Into<T>) {
         self.external_request_rate = external_request_rate.into()
     }
 
-    pub fn external_accepted_request_rate(&self) -> f64 {
+    pub fn external_accepted_request_rate(&self) -> T {
         self.external_accepted_request_rate
     }
 
     pub fn set_external_accepted_request_rate(
         &mut self,
-        external_accepted_request_rate: impl Into<f64>,
+        external_accepted_request_rate: impl Into<T>,
     ) {
         self.external_accepted_request_rate = external_accepted_request_rate.into()
     }
