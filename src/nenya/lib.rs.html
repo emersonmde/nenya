@@ -235,10 +235,10 @@
 
     <span class="kw">fn </span>calculate_request_rate(<span class="kw-2">&amp;mut </span><span class="self">self</span>, now: Instant) {
         <span class="kw">if let </span><span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span>oldest) = <span class="self">self</span>.accepted_request_timestamps.front() {
-            <span class="kw">let </span>window_duration = now.duration_since(oldest).as_secs();
-            <span class="self">self</span>.accepted_request_rate = <span class="kw">if </span>T::from_u64(window_duration).unwrap() &gt; T::zero() {
+            <span class="kw">let </span>window_duration = now.duration_since(oldest).as_secs_f32();
+            <span class="self">self</span>.accepted_request_rate = <span class="kw">if </span>T::from_f32(window_duration).unwrap() &gt; T::zero() {
                 T::from_usize(<span class="self">self</span>.accepted_request_timestamps.len()).unwrap()
-                    / T::from_u64(window_duration).unwrap()
+                    / T::from_f32(window_duration).unwrap()
             } <span class="kw">else </span>{
                 T::zero()
             };
@@ -246,13 +246,13 @@
             <span class="self">self</span>.accepted_request_rate = T::zero();
         }
         <span class="self">self</span>.accepted_request_rate =
-            <span class="self">self</span>.external_accepted_request_rate + <span class="self">self</span>.external_accepted_request_rate;
+            <span class="self">self</span>.accepted_request_rate + <span class="self">self</span>.external_accepted_request_rate;
 
         <span class="kw">if let </span><span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span>oldest) = <span class="self">self</span>.request_timestamps.front() {
-            <span class="kw">let </span>window_duration = now.duration_since(oldest).as_secs();
-            <span class="self">self</span>.request_rate = <span class="kw">if </span>T::from_u64(window_duration).unwrap() &gt; T::zero() {
+            <span class="kw">let </span>window_duration = now.duration_since(oldest).as_secs_f32();
+            <span class="self">self</span>.request_rate = <span class="kw">if </span>T::from_f32(window_duration).unwrap() &gt; T::zero() {
                 T::from_usize(<span class="self">self</span>.request_timestamps.len()).unwrap()
-                    / T::from_u64(window_duration).unwrap()
+                    / T::from_f32(window_duration).unwrap()
             } <span class="kw">else </span>{
                 T::zero()
             };
