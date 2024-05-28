@@ -14,42 +14,6 @@ pub mod sentinel {
     tonic::include_proto!("sentinel");
 }
 
-// #[derive(Debug, Default)]
-// pub struct NodeMetadata {
-//     lock_map: Arc<RwLock<HashMap<String, usize>>>,
-//     locks: Arc<RwLock<Vec<Arc<RwLock<MetricData>>>>>
-// }
-//
-// impl NodeMetadata {
-//     pub fn new() -> Self {
-//         NodeMetadata {
-//             lock_map: Arc::new(RwLock::new(HashMap::new())),
-//             locks: Arc::new(RwLock::new(Vec::new())),
-//         }
-//     }
-//
-//     pub fn new_with_data(node_metrics: HashMap<String, MetricData>) -> Self {
-//         let mut lock_map: HashMap<String, usize> = HashMap::new();
-//         let mut locks: Vec<Arc<RwLock<MetricData>>> = Vec::new();
-//         for (i, (key, value)) in node_metrics.iter().enumerate() {
-//             lock_map.insert(key.clone(), i);
-//             locks.push(Arc::new(RwLock::new(value.clone())))
-//         }
-//
-//         NodeMetadata {
-//             lock_map: Arc::new(RwLock::new(lock_map)),
-//             locks: Arc::new(RwLock::new(locks))
-//         }
-//     }
-//
-//     pub async fn update_metrics(&mut self, node: &String, metrics: MetricData) {
-//         let lock_map_guard = self.lock_map.read().await;
-//         let lock_index = lock_map_guard.get(node).expect("Unknown node");
-//         let lock = self.locks.read().await.get(*lock_index).expect("Node lock not found");
-//         lock.write()
-//     }
-// }
-
 type MetricMap = HashMap<String, MetricData>;
 type LockedMetricMap = Arc<RwLock<MetricMap>>;
 
