@@ -68,7 +68,7 @@ cargo run --example request_simulator_plot -- --help
 
 The rate limiter achieves an adaptive rate limit using a
 Proportional–Integral–Derivative (PID) controller which determines the target
-rate limit based on the request rate. This implementation includes with error
+rate limit based on the request rate. This implementation includes error
 bias, accumulated error clamping, anti-windup feedback, and output clamping.
 
 ### Overview
