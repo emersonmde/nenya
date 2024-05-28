@@ -1,5 +1,5 @@
 name: Rust Build
-on: [push, pull_request]
+on: [ push, pull_request ]
 env:
   CARGO_TERM_COLOR: always
 permissions:
@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: arduino/setup-protoc@v3
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
@@ -30,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: arduino/setup-protoc@v3
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -50,7 +52,7 @@ jobs:
   generate-and-deploy-docs:
     name: Generate and Deploy Docs
     runs-on: ubuntu-latest
-    needs: [test, fmt, clippy, cargo-audit]
+    needs: [ test, fmt, clippy, cargo-audit ]
     steps:
       - uses: actions/checkout@v4
         with:
