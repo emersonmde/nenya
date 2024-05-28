@@ -76,10 +76,10 @@ impl<T: Signed + PartialOrd + Zero + Copy + FromPrimitive> RateLimiter<T> {
 
     fn calculate_request_rate(&mut self, now: Instant) {
         if let Some(&oldest) = self.accepted_request_timestamps.front() {
-            let window_duration = now.duration_since(oldest).as_secs();
-            self.accepted_request_rate = if T::from_u64(window_duration).unwrap() > T::zero() {
+            let window_duration = now.duration_since(oldest).as_secs_f32();
+            self.accepted_request_rate = if T::from_f32(window_duration).unwrap() > T::zero() {
                 T::from_usize(self.accepted_request_timestamps.len()).unwrap()
-                    / T::from_u64(window_duration).unwrap()
+                    / T::from_f32(window_duration).unwrap()
             } else {
                 T::zero()
             };
@@ -87,13 +87,13 @@ impl<T: Signed + PartialOrd + Zero + Copy + FromPrimitive> RateLimiter<T> {
             self.accepted_request_rate = T::zero();
         }
         self.accepted_request_rate =
-            self.external_accepted_request_rate + self.external_accepted_request_rate;
+            self.accepted_request_rate + self.external_accepted_request_rate;
 
         if let Some(&oldest) = self.request_timestamps.front() {
-            let window_duration = now.duration_since(oldest).as_secs();
-            self.request_rate = if T::from_u64(window_duration).unwrap() > T::zero() {
+            let window_duration = now.duration_since(oldest).as_secs_f32();
+            self.request_rate = if T::from_f32(window_duration).unwrap() > T::zero() {
                 T::from_usize(self.request_timestamps.len()).unwrap()
-                    / T::from_u64(window_duration).unwrap()
+                    / T::from_f32(window_duration).unwrap()
             } else {
                 T::zero()
             };

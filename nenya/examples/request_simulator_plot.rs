@@ -16,7 +16,7 @@ fn main() {
             Arg::new("base_tps")
                 .short('b')
                 .long("base_tps")
-                .value_parser(clap::value_parser!(f32))
+                .value_parser(clap::value_parser!(f64))
                 .default_value("50.0")
                 .help("Base TPS for the request generator"),
         )
@@ -64,7 +64,7 @@ fn main() {
             Arg::new("amplitudes")
                 .short('a')
                 .long("amplitudes")
-                .value_parser(clap::value_parser!(f32))
+                .value_parser(clap::value_parser!(f64))
                 .num_args(1..)
                 .use_value_delimiter(true)
                 .default_value("20.0,10.0")
@@ -74,7 +74,7 @@ fn main() {
             Arg::new("frequencies")
                 .short('f')
                 .long("frequencies")
-                .value_parser(clap::value_parser!(f32))
+                .value_parser(clap::value_parser!(f64))
                 .num_args(1..)
                 .use_value_delimiter(true)
                 .default_value("0.1,0.5")
@@ -211,7 +211,8 @@ struct App {
     generated_tps_data: Vec<[f64; 2]>,
     target_tps_data: Vec<[f64; 2]>,
     throttled_tps_data: Vec<[f64; 2]>,
-    measured_tps_data: Vec<[f64; 2]>,
+    // measured_tps_data: Vec<[f64; 2]>,
+    // measured_accepted_tps_data: Vec<[f64; 2]>,
     accepted_request_times: VecDeque<Instant>,
     throttled_request_times: VecDeque<Instant>,
     last_time_point_added: f64,
@@ -237,7 +238,8 @@ impl App {
             generated_tps_data: Vec::new(),
             target_tps_data: Vec::new(),
             throttled_tps_data: Vec::new(),
-            measured_tps_data: Vec::new(),
+            // measured_tps_data: Vec::new(),
+            // measured_accepted_tps_data: Vec::new(),
             accepted_request_times: VecDeque::new(),
             throttled_request_times: VecDeque::new(),
             last_time_point_added: 0.0,
@@ -291,7 +293,7 @@ impl eframe::App for App {
             let throttled_tps =
                 self.throttled_request_times.len() as f64 / self.trailing_window.as_secs_f64();
 
-            if elapsed_seconds - self.last_time_point_added >= 0.03 {
+            if elapsed_seconds - self.last_time_point_added >= 0.033 {
                 self.setpoint_data
                     .push([elapsed_seconds, self.rate_limiter.setpoint() as f64]);
                 self.trailing_tps_data.push([elapsed_seconds, trailing_tps]);
@@ -301,8 +303,12 @@ impl eframe::App for App {
                     .push([elapsed_seconds, self.rate_limiter.target_rate() as f64]);
                 self.throttled_tps_data
                     .push([elapsed_seconds, throttled_tps]);
-                self.measured_tps_data
-                    .push([elapsed_seconds, self.rate_limiter.request_rate() as f64]);
+                // self.measured_tps_data
+                //     .push([elapsed_seconds, self.rate_limiter.request_rate() as f64]);
+                // self.measured_accepted_tps_data.push([
+                //     elapsed_seconds,
+                //     self.rate_limiter.accepted_request_rate() as f64,
+                // ]);
 
                 self.last_time_point_added = elapsed_seconds;
             }
@@ -335,6 +341,10 @@ impl eframe::App for App {
                         Line::new(self.target_tps_data.clone()).name("Rate Limit Target TPS"),
                     );
                     // plot_ui.line(Line::new(self.measured_tps_data.clone()).name("Measured TPS"));
+                    // plot_ui.line(
+                    //     Line::new(self.measured_accepted_tps_data.clone())
+                    //         .name("Measured Accepted TPS"),
+                    // );
                 });
         });
     }
