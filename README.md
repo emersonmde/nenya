@@ -1,6 +1,6 @@
 # Nenya
 
-**Nenya** is a work-in-progress adaptive rate limiter using a Proportional-Integral-Derivative (PID) controller. This
+**Nenya** is an adaptive rate limiter using a Proportional-Integral-Derivative (PID) controller. This
 project contains two major components:
 
 - **Nenya**: A Rust crate for adaptive rate limiting.
