@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"mod":["pid_controller"],"struct":["RateLimiter"]};
+window.SIDEBAR_ITEMS = {"mod":["pid_controller"],"struct":["RateLimiter","RateLimiterBuilder"]};

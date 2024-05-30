@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"struct":["PIDController"]};
+window.SIDEBAR_ITEMS = {"struct":["PIDController","PIDControllerBuilder"]};
