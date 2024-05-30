@@ -103,13 +103,6 @@ fn main() {
                 .help("Derivative gain for the PID controller"),
         )
         .arg(
-            Arg::new("error_limit")
-                .long("error_limit")
-                .value_parser(clap::value_parser!(f64))
-                .default_value("100.0")
-                .help("Error limit for the PID controller"),
-        )
-        .arg(
             Arg::new("error_bias")
                 .long("error_bias")
                 .value_parser(clap::value_parser!(f64))
@@ -117,10 +110,15 @@ fn main() {
                 .help("Bias factor for the integral term"),
         )
         .arg(
+            Arg::new("error_limit")
+                .long("error_limit")
+                .value_parser(clap::value_parser!(f64))
+                .help("Error limit for the PID controller"),
+        )
+        .arg(
             Arg::new("output_limit")
                 .long("output_limit")
                 .value_parser(clap::value_parser!(f64))
-                .default_value("5.0")
                 .help("Output limit for the PID controller"),
         )
         .arg(
@@ -153,19 +151,19 @@ fn main() {
     let kp = *matches.get_one::<f32>("kp").unwrap();
     let ki = *matches.get_one::<f32>("ki").unwrap();
     let kd = *matches.get_one::<f32>("kd").unwrap();
-    let error_limit = *matches.get_one::<f32>("error_limit").unwrap();
-    let output_limit = *matches.get_one::<f32>("output_limit").unwrap();
+    let error_bias = *matches.get_one::<f32>("error_bias").unwrap();
+    let error_limit = matches.get_one::<f32>("error_limit").copied();
+    let output_limit = matches.get_one::<f32>("output_limit").copied();
     let update_interval =
         Duration::from_millis(*matches.get_one::<u64>("update_interval").unwrap());
-    let error_bias = *matches.get_one::<f32>("error_bias").unwrap();
 
     let pid_controller = PIDController::new(
         target_tps,
         kp,
         ki,
         kd,
-        error_limit,
         error_bias,
+        error_limit,
         output_limit,
     );
     let mut rate_limiter = RateLimiter::new(

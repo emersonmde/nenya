@@ -1,6 +1,6 @@
 [package]
 name = "nenya"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 description = "A Rust crate for adaptive rate limiting and PID control."
 categories = ["algorithms", "web-programming"]
@@ -12,6 +12,7 @@ readme.workspace = true
 
 [dependencies]
 num-traits = "0.2.19"
+log = "0.4.21"
 
 [dev-dependencies]
 clap = "4.5.4"

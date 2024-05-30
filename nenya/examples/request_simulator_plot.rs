@@ -6,7 +6,7 @@ use eframe::egui;
 use egui::ViewportBuilder;
 use egui_plot::{Corner, Line, Plot};
 
-use nenya::pid_controller::PIDController;
+use nenya::pid_controller::PIDControllerBuilder;
 use nenya::RateLimiter;
 
 fn main() {
@@ -102,13 +102,6 @@ fn main() {
                 .help("Derivative gain for the PID controller"),
         )
         .arg(
-            Arg::new("error_limit")
-                .long("error_limit")
-                .value_parser(clap::value_parser!(f32))
-                .default_value("100.0")
-                .help("Error limit for the PID controller"),
-        )
-        .arg(
             Arg::new("error_bias")
                 .long("error_bias")
                 .value_parser(clap::value_parser!(f32))
@@ -116,10 +109,15 @@ fn main() {
                 .help("Bias factor for the integral term"),
         )
         .arg(
+            Arg::new("error_limit")
+                .long("error_limit")
+                .value_parser(clap::value_parser!(f32))
+                .help("Error limit for the PID controller"),
+        )
+        .arg(
             Arg::new("output_limit")
                 .long("output_limit")
                 .value_parser(clap::value_parser!(f32))
-                .default_value("5.0")
                 .help("Output limit for the PID controller"),
         )
         .arg(
@@ -152,21 +150,27 @@ fn main() {
     let kp = *matches.get_one::<f32>("kp").unwrap();
     let ki = *matches.get_one::<f32>("ki").unwrap();
     let kd = *matches.get_one::<f32>("kd").unwrap();
-    let error_limit = *matches.get_one::<f32>("error_limit").unwrap();
-    let output_limit = *matches.get_one::<f32>("output_limit").unwrap();
+    let error_bias = *matches.get_one::<f32>("error_bias").unwrap();
+    let error_limit = matches.get_one::<f32>("error_limit").copied();
+    let output_limit = matches.get_one::<f32>("output_limit").copied();
     let update_interval =
         Duration::from_millis(*matches.get_one::<u64>("update_interval").unwrap());
-    let error_bias = *matches.get_one::<f32>("error_bias").unwrap();
 
-    let pid_controller = PIDController::new(
-        target_tps,
-        kp,
-        ki,
-        kd,
-        error_limit,
-        error_bias,
-        output_limit,
-    );
+    let mut builder = PIDControllerBuilder::new(target_tps)
+        .kp(kp)
+        .ki(ki)
+        .kd(kd)
+        .error_bias(error_bias);
+
+    if let Some(error_limit) = error_limit {
+        builder = builder.error_limit(error_limit);
+    }
+
+    if let Some(output_limit) = output_limit {
+        builder = builder.output_limit(output_limit);
+    }
+
+    let pid_controller = builder.build();
     let rate_limiter = RateLimiter::new(
         target_tps,
         min_tps,
@@ -259,16 +263,16 @@ impl eframe::App for App {
                 1000
             };
 
-            let should_accept_request = self.rate_limiter.should_throttle();
+            let should_throttle_request = self.rate_limiter.should_throttle();
             self.total_requests += 1;
             let now = Instant::now();
 
             // Add new indicator at the end of the buffer
-            if should_accept_request {
+            if should_throttle_request {
+                self.throttled_request_times.push_back(now);
+            } else {
                 self.accepted_requests += 1;
                 self.accepted_request_times.push_back(now);
-            } else {
-                self.throttled_request_times.push_back(now);
             }
 
             // Remove old timestamps outside the trailing window

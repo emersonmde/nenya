@@ -32,9 +32,76 @@ easy integration as a sidecar in microservice architectures.
 
 ## Getting Started
 
-### Running Examples
+To get started with Nenya, add it to your Cargo.toml:
 
-Nenya includes a simulation example for testing and tuning. You can
+```toml
+[dependencies]
+nenya = "0.0.2"
+```
+
+### Examples
+
+A basic rate limiter with a static set point:
+
+```rust
+use nenya::RateLimiterBuilder;
+use nenya::pid_controller::PIDControllerBuilder;
+use std::time::Duration;
+
+fn main() {
+    // Create a rate limiter
+    let mut rate_limiter = RateLimiterBuilder::new(10.0)
+        .update_interval(Duration::from_secs(1))
+        .build();
+
+    // Simulate request processing and check if throttling is necessary
+    for _ in 0..20 {
+        if rate_limiter.should_throttle() {
+            println!("Request throttled");
+        } else {
+            println!("Request accepted");
+        }
+    }
+}
+```
+
+A dynamic rate limiter using a PID Controller:
+
+```rust
+use nenya::RateLimiterBuilder;
+use nenya::pid_controller::PIDControllerBuilder;
+use std::time::Duration;
+
+fn main() {
+    // Create a PID controller with specific parameters
+    let pid_controller = PIDControllerBuilder::new(10.0)
+        .kp(1.0)
+        .ki(0.1)
+        .kd(0.01)
+        .build();
+
+    // Create a rate limiter using the PID Controller
+    let mut rate_limiter = RateLimiterBuilder::new(10.0)
+        .min_rate(5.0)
+        .max_rate(15.0)
+        .pid_controller(pid_controller)
+        .update_interval(Duration::from_secs(1))
+        .build();
+
+    // Simulate request processing and check if throttling is necessary
+    for _ in 0..20 {
+        if rate_limiter.should_throttle() {
+            println!("Request throttled");
+        } else {
+            println!("Request accepted");
+        }
+    }
+}
+```
+
+### Request Simulator
+
+Nenya includes a request simulation example for testing and tuning. You can
 run the simulation with:
 
 ```sh

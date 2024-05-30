@@ -2183,12 +2183,13 @@ dependencies = [
 
 [[package]]
 name = "nenya"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "clap",
  "eframe",
  "egui",
  "egui_plot",
+ "log",
  "num-traits",
 ]
 
