@@ -1,3 +1,8 @@
+[![Rust Build](https://github.com/emersonmde/nenya/actions/workflows/rust.yml/badge.svg)](https://github.com/emersonmde/nenya/actions/workflows/rust.yml)
+[![Docs](https://img.shields.io/docsrs/nenya/latest)](https://docs.rs/nenya)
+[![crates](https://img.shields.io/crates/v/nenya.svg)](https://crates.io/crates/nenya)
+[![License](https://img.shields.io/crates/l/nenya.svg)](LICENSE)
+
 # Nenya
 
 **Nenya** is an adaptive rate limiter using a Proportional-Integral-Derivative (PID) controller. This
