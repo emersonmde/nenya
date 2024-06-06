@@ -20,7 +20,7 @@
 /// ```
 use num_traits::{Float, Signed};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PIDController<T> {
     setpoint: T,
     kp: T,

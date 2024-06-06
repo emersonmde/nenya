@@ -24,3 +24,9 @@ message ShouldThrottleRequest {
 message ShouldThrottleResponse {
   bool should_throttle = 1;
 }
+
+message SegmentConfig {
+  float target_tps = 1;
+  optional float min_tps = 2;
+  optional float max_tps = 3;
+}
