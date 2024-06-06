@@ -340,7 +340,7 @@
 /// ```
 </span><span class="kw">use </span>num_traits::{Float, Signed};
 
-<span class="attr">#[derive(Debug)]
+<span class="attr">#[derive(Debug, Clone)]
 </span><span class="kw">pub struct </span>PIDController&lt;T&gt; {
     setpoint: T,
     kp: T,
