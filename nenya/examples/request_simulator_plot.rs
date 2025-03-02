@@ -191,12 +191,12 @@ fn main() {
             ..Default::default()
         },
         Box::new(|_cc| {
-            Box::new(App::new(
+            Ok(Box::new(App::new(
                 rate_limiter,
                 generator,
                 *trailing_window_clone,
                 *duration_clone,
-            ))
+            )))
         }),
     )
     .unwrap();
