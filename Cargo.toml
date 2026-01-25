@@ -1,13 +1,48 @@
-[workspace]
-resolver = "2"
-members = [
-    "nenya",
-    "nenya-sentinel",
-]
-
-[workspace.package]
+[package]
+name = "nenya"
+version = "0.1.0"
 edition = "2021"
+description = "Adaptive rate limiting using PID control - library and distributed sidecar"
 authors = ["Matthew Emerson <emersonmde@protonmail.com>"]
 license = "MIT"
 repository = "https://github.com/emersonmde/nenya"
 readme = "README.md"
+categories = ["algorithms", "web-programming"]
+keywords = ["rate", "limit", "limiting", "throttling", "throttle"]
+
+[dependencies]
+# Library dependencies (always included)
+num-traits = "0.2.19"
+log = "0.4.21"
+
+# Server/binary dependencies (optional - only when building binary)
+axum = { version = "0.7", optional = true }
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "net", "time", "sync"], optional = true }
+serde = { version = "1.0", optional = true }
+serde_json = { version = "1.0", optional = true }
+toml = { version = "0.8", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
+
+[dev-dependencies]
+clap = "4.5.4"
+eframe = "0.28.1"
+egui = "0.28.1"
+egui_plot = "0.28.1"
+
+[features]
+default = []
+# Feature for building the server/binary
+server = [
+    "dep:axum",
+    "dep:tokio",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:toml",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+]
+
+[[bin]]
+name = "nenya"
+required-features = ["server"]

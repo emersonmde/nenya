@@ -40,7 +40,7 @@
 //! ```
 
 #[cfg(doctest)]
-#[doc = include_str!("../../README.md")]
+#[doc = include_str!("../README.md")]
 struct _README;
 
 use num_traits::{Float, FromPrimitive, Signed};
@@ -49,7 +49,21 @@ use std::time::{Duration, Instant};
 
 use crate::pid_controller::PIDController;
 
+// ===== Public Library API =====
 pub mod pid_controller;
+
+// ===== Server modules (binary only, not part of public API) =====
+#[cfg(feature = "server")]
+pub(crate) mod api;
+
+#[cfg(feature = "server")]
+pub(crate) mod config;
+
+#[cfg(feature = "server")]
+pub(crate) mod gossip;
+
+#[cfg(feature = "server")]
+pub(crate) mod discovery;
 
 /// Sliding window rate limiter with an integrated PID controller for dynamic target rate adjustment.
 #[derive(Debug)]

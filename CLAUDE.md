@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Nenya is a distributed adaptive rate limiter using PID (Proportional-Integral-Derivative) control and gossip-based coordination.
 
-**Components**:
-- **nenya**: Core Rust library providing adaptive rate limiting with PID control (no distributed features)
-- **nenya-sentinel**: Standalone binary/sidecar that adds distributed coordination via gossip protocol
+**Single crate with dual purpose**:
+- **Library**: Lightweight rate limiting with PID control (`cargo add nenya`)
+- **Binary**: Distributed rate limiting sidecar (`cargo install nenya`)
 
 **Vision**: A "one-click" sidecar for microservices that provides distributed rate limiting with minimal configuration. Applications simply call a local HTTP endpoint to make throttling decisions.
 
@@ -30,21 +30,17 @@ Nenya is a distributed adaptive rate limiter using PID (Proportional-Integral-De
 ### Building and Testing
 
 ```bash
-# Build the entire workspace
-cargo build
+# Build library only (lightweight, no server deps)
+cargo build --lib
 
-# Build a specific crate
-cargo build -p nenya
-cargo build -p nenya-sentinel
+# Build binary with server features
+cargo build --features server
 
-# Run all tests
+# Run all tests (library + doctests)
 cargo test --verbose
 
-# Run tests for a specific crate
-cargo test -p nenya
-
 # Run a specific test
-cargo test -p nenya test_name
+cargo test test_name
 
 # Run integration tests only
 cargo test --test '*'
@@ -52,6 +48,13 @@ cargo test --test '*'
 
 ### Code Quality
 
+**Pre-commit checks** (run automatically if hooks enabled):
+```bash
+# Run all checks manually
+./.git-hooks/pre-commit
+```
+
+Individual commands:
 ```bash
 # Format code
 cargo fmt
@@ -64,6 +67,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 # Security audit
 cargo audit
+```
+
+**Setup hooks** (one-time, recommended):
+```bash
+git config core.hooksPath .git-hooks
 ```
 
 ### Examples
@@ -92,67 +100,38 @@ cargo doc --no-deps --open
 
 ## Codebase Structure
 
-### nenya/ (Core Library)
+**Single-crate layout** (library + binary):
 
-**Current implementation** (no changes needed for distributed features):
+```
+src/
+├── lib.rs              # Library entry point (public API)
+├── pid_controller.rs   # Library: PID control algorithm
+├── main.rs             # Binary entry point
+├── api/                # Binary: HTTP API (feature-gated)
+├── config/             # Binary: Configuration (feature-gated)
+├── gossip/             # Binary: Gossip protocol (feature-gated)
+└── discovery/          # Binary: Peer discovery (feature-gated)
+```
 
+**Library code** (always included):
 - `src/lib.rs` - RateLimiter with sliding window + PID integration
   - Generic over `T: Float + Signed + FromPrimitive`
   - Builder pattern: `RateLimiterBuilder`
   - External rate injection: `set_external_request_rate()`, `set_external_accepted_request_rate()`
-
 - `src/pid_controller.rs` - PID control algorithm
-  - Error bias for asymmetric response
-  - Integral windup prevention
-  - Anti-windup feedback
+  - Error bias, integral windup prevention, anti-windup feedback
   - Builder pattern: `PIDControllerBuilder`
 
+**Binary code** (only when `server` feature enabled):
+- `src/main.rs` - Entry point with `compile_error!` guard
+- `src/api/` - HTTP API handlers (placeholder)
+- `src/config/` - Configuration loading (placeholder)
+- `src/gossip/` - Gossip protocol integration (placeholder)
+- `src/discovery/` - Peer discovery implementations (placeholder)
+
+**Other**:
 - `examples/` - Request simulator for testing and tuning
-
-**Key patterns**:
-- Sliding window: `VecDeque<Instant>` for request timestamps, trimmed by `update_interval`
-- PID loop: Error → P/I/D terms → Clamping → Anti-windup → Correction
-- External rate injection enables distributed coordination (used by nenya-sentinel)
-
-### nenya-sentinel/ (Distributed Binary)
-
-**Current state**: Basic gRPC skeleton (to be replaced with HTTP)
-
-**Planned structure** (see roadmap Phase 0):
-```
-nenya-sentinel/
-├── src/
-│   ├── main.rs              # Entry point, setup, graceful shutdown
-│   ├── api/                 # HTTP API handlers
-│   │   ├── mod.rs
-│   │   ├── throttle.rs      # POST /should_throttle
-│   │   ├── health.rs        # GET /health
-│   │   └── metrics.rs       # GET /metrics
-│   ├── manager/             # Rate limit manager
-│   │   ├── mod.rs
-│   │   └── pattern.rs       # Scope pattern matching
-│   ├── gossip/              # Gossip protocol integration
-│   │   ├── mod.rs
-│   │   └── state.rs         # Cluster state aggregation
-│   ├── discovery/           # Peer discovery
-│   │   ├── mod.rs
-│   │   ├── static.rs
-│   │   ├── docker_swarm.rs
-│   │   └── kubernetes.rs
-│   ├── config/              # Configuration loading
-│   │   └── mod.rs
-│   └── observability/       # Metrics & tracing
-│       └── mod.rs
-├── tests/
-│   └── integration/
-│       ├── cluster.rs       # Multi-node tests
-│       └── helpers.rs       # Test harness
-└── Cargo.toml
-```
-
-### Workspace
-
-- `Cargo.toml` (root) - Workspace definition with shared metadata
+- `nenya-sentinel/` - Deprecation stub (v0.0.2)
 - `.github/workflows/rust.yml` - CI/CD pipeline (test, fmt, clippy, audit)
 
 ## Key Implementation Details
@@ -275,27 +254,26 @@ See `docs/roadmap.md` for complete details on each milestone.
 
 ## Dependencies
 
-### nenya
+**Library** (always included):
 - `num-traits` - Generic numeric operations
-- `log` - Logging (simple, library-friendly)
+- `log` - Logging
 
-### nenya-sentinel (planned)
+**Binary** (`server` feature, optional):
 - `axum` - HTTP framework
-- `tokio` - Async runtime
+- `tokio` - Async runtime (specific features, not "full")
 - `serde`, `serde_json` - JSON serialization
-- `chitchat` - Gossip protocol (Scuttlebutt)
-- `tracing`, `tracing-subscriber` - Observability
-- `metrics`, `metrics-exporter-prometheus` - Metrics
 - `toml` - Configuration parsing
-- Platform-specific:
-  - `bollard` - Docker API client (for Swarm discovery)
-  - `kube` - Kubernetes API client (for K8s discovery)
+- `tracing`, `tracing-subscriber` - Observability
+- (Future) `chitchat` - Gossip protocol
+- (Future) `bollard`, `kube` - Platform-specific discovery
 
 ## Important Constraints
 
-**No backwards compatibility required**: Project is 0.x, no users yet, breaking changes are fine
+**No backwards compatibility required**: Project is 0.x, no external users yet, breaking changes are fine
 
-**No gRPC**: HTTP/JSON for simplicity and universal language support
+**No gRPC**: Removed in Milestone 0, using HTTP/JSON for simplicity
+
+**Single-crate model**: Library + binary in one package with optional `server` feature
 
 **Security model**: Cluster secret required, gossip authenticated, discovery is unauthenticated (just finds candidates)
 

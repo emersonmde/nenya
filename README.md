@@ -5,44 +5,42 @@
 
 # Nenya
 
-**Nenya** is an adaptive rate limiter using a Proportional-Integral-Derivative (PID) controller. This
-project contains two major components:
+**Nenya** is an adaptive rate limiter using a Proportional-Integral-Derivative (PID) controller.
 
-- **Nenya**: A Rust crate for adaptive rate limiting.
-- **Nenya-Sentinel**: A standalone rate limiter gRPC service that is intended to run as a sidecar
-  for existing services.
+**Two ways to use it:**
+- **As a library**: Embedded rate limiting in your Rust application
+- **As a binary**: Distributed rate limiting sidecar for microservices (work in progress)
 
-## Overview
+## Features
 
-### Nenya
+- **Adaptive PID Control**: Dynamically adjusts rate limits based on traffic patterns
+- **Configurable Sliding Window**: Accurate TPS measurement with configurable windows
+- **Generic Implementation**: Works with any numeric type (f32, f64, etc.)
+- **Distributed Coordination**: Share rate limits across multiple instances (coming soon)
 
-Nenya is a Rust crate that offers adaptive rate limiting functionality using a PID
-controller. The crate aims to provide a dynamic and efficient way to manage
-request rates, making it suitable for high-throughput services.
+## Installation
 
-#### Features
+### As a Library
 
-- **PID Controller**: Utilizes a highly configurable Proportional-Integral-Derivative
-  (PID) controller to dynamically adjust the rate limits based on current traffic
-  patterns
-- **Configurable Sliding Window**: Uses a configurable sliding window to
-  determine Transactions Per Second (TPS), ensuring accurate rate limiting decisions
-- **Configuration**: Allows fine-tuning of PID parameters (`kp`, `ki`, `kd`),
-  error limits, output limits, and update intervals
-
-### Nenya-Sentinel (Work In Progress)
-
-Nenya-Sentinel is a standalone rate limiting service that will support gRPC for
-easy integration as a sidecar in microservice architectures.
-
-## Getting Started
-
-To get started with Nenya, add it to your Cargo.toml:
+Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-nenya = "0.0.2"
+nenya = "0.1"
 ```
+
+### As a Binary (Sidecar)
+
+```bash
+cargo install nenya
+```
+
+Then run:
+```bash
+nenya
+```
+
+**Note:** The distributed sidecar is under active development. See [docs/roadmap.md](docs/roadmap.md) for progress.
 
 ### Examples
 
@@ -134,6 +132,28 @@ see:
 
 ```sh
 cargo run --example request_simulator_plot -- --help
+```
+
+## Development
+
+### Setup
+
+Enable pre-commit hooks (runs tests, clippy, fmt, and audit before each commit):
+```bash
+git config core.hooksPath .git-hooks
+```
+
+### Running Checks
+
+```bash
+# Run all pre-commit checks manually
+./.git-hooks/pre-commit
+
+# Or run individual checks
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt -- --check
+cargo audit
 ```
 
 ## Adaptive Rate Limiting

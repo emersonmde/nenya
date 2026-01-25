@@ -1,21 +1,12 @@
 [package]
 name = "nenya-sentinel"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
-description = "A standalone rate limiting service using PID control."
-#categories = ["algorithms", "web-programming"]
-#keywords = ["rate", "limit", "limiting", "throttling", "throttle"]
-authors.workspace = true
-license.workspace = true
-repository.workspace = true
-readme.workspace = true
-
-[build-dependencies]
-tonic-build = "0.11.0"
+description = "DEPRECATED: This crate has been merged into nenya. Please use 'cargo install nenya' instead."
+authors = ["Matthew Emerson <emersonmde@protonmail.com>"]
+license = "MIT"
+repository = "https://github.com/emersonmde/nenya"
+readme = "README.md"
 
 [dependencies]
-prost = "0.12.6"
-tokio = { version = "1.37.0", features = ["macros", "rt-multi-thread", "rt"] }
-tonic = "0.11.0"
-nenya = { path = "../nenya" }
-hostname = "0.4.0"
+# No dependencies - this is just a deprecation notice
