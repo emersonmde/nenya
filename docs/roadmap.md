@@ -64,9 +64,22 @@ See the tasks below for what needs to be completed.
 
 **Verification**:
 ```bash
+# Compilation
 cargo build -p nenya-sentinel  # Should compile
 cargo test -p nenya-sentinel   # Should pass (no tests yet, but shouldn't error)
+
+# Library benchmarks (establish performance baseline)
+cargo bench --bench rate_limiter_bench
+cargo bench --bench pid_controller_bench
+
+# Save baseline before binary work
+cargo bench -- --save-baseline milestone-0
 ```
+
+**Performance Baseline** (library only, from benchmarks):
+- Hot path decision: ~40ns (target: <1μs) ✅
+- PID computation: ~1-2ns (target: <100ns) ✅
+- Throughput: 25M decisions/sec single-threaded
 
 **Commit Message**: `Milestone 0: Prepare HTTP stack for nenya-sentinel`
 
@@ -182,23 +195,89 @@ cargo test -p nenya-sentinel   # Should pass (no tests yet, but shouldn't error)
 
 **Deliverable**: Working single-node rate limiter with HTTP API, scope auto-creation, and observability
 
-**Verification**:
+**Testing Requirements**:
+
+1. **Unit Tests** (existing + new):
+   ```bash
+   cargo test --lib                    # Library tests (170 existing)
+   cargo test -p nenya-sentinel        # Binary tests (new)
+   ```
+
+2. **Integration Tests** (new):
+   ```bash
+   cargo test --test '*'               # HTTP API tests
+   ```
+   - Test POST /should_throttle with various scopes
+   - Test pattern matching (exact, wildcard, default)
+   - Test config loading (TOML, env vars)
+   - Test auto-creation of new scopes
+   - Test health and metrics endpoints
+
+3. **HTTP Micro-Benchmarks** (new):
+   Create `nenya-sentinel/benches/http_api_bench.rs`:
+   ```rust
+   // Benchmark: End-to-end HTTP request latency (without network)
+   // - JSON deserialize
+   // - Manager lookup
+   // - Rate limiter decision
+   // - JSON serialize
+   // - HTTP response
+   //
+   // Target: <1ms p99 (leaves ~960μs budget for HTTP/JSON overhead)
+   ```
+
+   Run benchmarks:
+   ```bash
+   cargo bench -p nenya-sentinel --bench http_api_bench
+
+   # Compare against baseline
+   cargo bench -p nenya-sentinel -- --baseline milestone-0
+   ```
+
+   **Expected Results**:
+   - Handler latency: <500μs p99
+   - Total budget: Library (40ns) + Handler (<500μs) + Network (~500μs) = <1ms
+
+4. **Manual Smoke Test**:
+   ```bash
+   # Start sentinel
+   cargo run -p nenya-sentinel
+
+   # In another terminal, test the API
+   curl -X POST http://localhost:8080/should_throttle \
+     -d '{"scope":"test"}' \
+     -H "Content-Type: application/json"
+   # Should return: {"should_throttle":false,"current_rate":0.0,"target_rate":10.0,"accepted_rate":0.0}
+
+   curl http://localhost:8080/health
+   # Should return: {"healthy":true,"scopes":1,"peers":1}
+
+   curl http://localhost:8080/metrics
+   # Should return Prometheus metrics
+   ```
+
+**Performance Targets (Milestone 1)**:
+- Library decision: ~40ns (established)
+- HTTP handler latency: <500μs p99
+- JSON serialization: <100μs
+- End-to-end: <1ms p99 (excluding network)
+
+**Verification Checklist**:
 ```bash
-# All tests pass
-cargo test
+# 1. All tests pass
+cargo test --all
 
-# Start sentinel
-cargo run -p nenya-sentinel
+# 2. Benchmarks meet targets
+cargo bench --all
 
-# In another terminal, test the API
-curl -X POST http://localhost:8080/should_throttle -d '{"scope":"test"}' -H "Content-Type: application/json"
-# Should return: {"should_throttle":false,"current_rate":0.0,"target_rate":10.0,"accepted_rate":0.0}
+# 3. No clippy warnings
+cargo clippy --all-targets --all-features -- -D warnings
 
-curl http://localhost:8080/health
-# Should return: {"healthy":true,"scopes":1,"peers":1}
+# 4. Code formatted
+cargo fmt --check
 
-curl http://localhost:8080/metrics
-# Should return Prometheus metrics
+# 5. Manual API test (smoke test)
+# Start server and run curl commands above
 ```
 
 **Commit Message**: `Milestone 1: Single-node HTTP rate limiter with scope auto-creation`
@@ -309,6 +388,102 @@ curl http://localhost:8090/health
 
 # Kill all background jobs
 jobs -p | xargs kill
+```
+
+**Testing Requirements**:
+
+1. **Unit & Integration Tests**:
+   ```bash
+   cargo test --all  # Include new gossip tests
+   ```
+   - Test gossip state serialization/deserialization
+   - Test external rate aggregation
+   - Test cluster membership events
+   - Test rate synchronization between nodes
+
+2. **Multi-Node Integration Test** (new):
+   Create `tests/distributed_coordination.rs`:
+   ```rust
+   // Test: 3-node cluster coordinating on shared scope
+   // - Start 3 nodes programmatically
+   // - Send 150 TPS across all nodes (50 each)
+   // - Target: 100 TPS cluster-wide
+   // - Verify: Total accepted ~100 TPS across cluster
+   // - Verify: Gossip propagates rates within 1s
+   ```
+
+3. **Load Tests** (new - basic):
+   Create `load-tests/constant_load.rs`:
+   ```bash
+   # Install wrk2 (constant RPS load generator)
+   # macOS: brew install wrk2
+   # Linux: https://github.com/giltene/wrk2
+
+   # Test: Single node handling constant load
+   wrk2 -t2 -c10 -d30s -R1000 \
+     --latency \
+     -s load-tests/throttle.lua \
+     http://localhost:8080/should_throttle
+
+   # Expected results:
+   # - Latency p50: <1ms
+   # - Latency p99: <5ms
+   # - Latency p99.9: <10ms
+   # - Success rate: 100%
+   ```
+
+   Create `load-tests/throttle.lua`:
+   ```lua
+   wrk.method = "POST"
+   wrk.headers["Content-Type"] = "application/json"
+   wrk.body = '{"scope":"load-test"}'
+   ```
+
+4. **Gossip Overhead Benchmark** (new):
+   Create `nenya-sentinel/benches/gossip_bench.rs`:
+   ```rust
+   // Benchmark: Gossip state update impact on decision latency
+   // - Measure without gossip (baseline)
+   // - Measure with 2 peers gossiping
+   // - Measure with 10 peers gossiping
+   //
+   // Target: Gossip overhead <100μs per decision
+   ```
+
+5. **Network Partition Test** (manual):
+   ```bash
+   # Start 3 nodes
+   # Use iptables/pfctl to block gossip between nodes
+   # Verify: Nodes continue accepting with stale data
+   # Restore network
+   # Verify: Nodes re-sync within 2-3 gossip rounds
+   ```
+
+**Performance Targets (Milestone 2)**:
+- Single-node latency: <1ms p99 (no regression from M1)
+- Gossip overhead: <100μs per decision
+- Rate convergence: <2s for cluster-wide changes
+- Network partition: Graceful degradation, auto-recovery
+
+**Verification Checklist**:
+```bash
+# 1. All tests pass (including new distributed tests)
+cargo test --all
+
+# 2. Benchmarks verify no regression
+cargo bench --all
+
+# 3. Load test: 1K RPS sustained for 30s
+wrk2 -t2 -c10 -d30s -R1000 --latency \
+  -s load-tests/throttle.lua \
+  http://localhost:8080/should_throttle
+# Check: p99 <5ms, success rate 100%
+
+# 4. Multi-node manual test (3 nodes, see above)
+
+# 5. Code quality checks
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --check
 ```
 
 **Commit Message**: `Milestone 2: Distributed rate limiting with Chitchat gossip`
@@ -584,26 +759,238 @@ jobs -p | xargs kill
 
 **Deliverable**: Production-ready v1.0.0 release
 
-**Verification**:
-```bash
-# All tests pass
-cargo test
+**Testing Requirements (Comprehensive)**:
 
-# Benchmarks meet targets
-cargo bench
-# Should show >50k req/sec throughput
+1. **All Existing Tests Pass**:
+   ```bash
+   cargo test --all --all-features
+   cargo clippy --all-targets --all-features -- -D warnings
+   cargo fmt --check
+   cargo audit  # No security vulnerabilities
+   ```
 
-# Build release binary
-cargo build --release -p nenya-sentinel
+2. **Benchmarks Meet Targets**:
+   ```bash
+   # Library benchmarks (baseline: ~40ns decision, ~1-2ns PID)
+   cargo bench --bench rate_limiter_bench
+   cargo bench --bench pid_controller_bench
 
-# Verify documentation complete
-ls docs/
-# Should have: architecture.md, roadmap.md, deployment/
+   # HTTP API benchmarks (target: <500μs handler latency)
+   cargo bench -p nenya-sentinel --bench http_api_bench
 
-# CI/CD pipeline passes
-git push origin main
-# GitHub Actions should be green
-```
+   # Gossip benchmarks (target: <100μs overhead)
+   cargo bench -p nenya-sentinel --bench gossip_bench
+
+   # Compare against Milestone 0 baseline
+   cargo bench -- --baseline milestone-0
+   # Verify: No significant regressions
+   ```
+
+3. **Load Testing Suite** (comprehensive):
+
+   **a) Single-Node Constant Load**:
+   ```bash
+   # Start server
+   cargo run --release -p nenya-sentinel &
+
+   # Test: 1K RPS sustained for 5 minutes
+   wrk2 -t4 -c20 -d300s -R1000 \
+     --latency \
+     -s load-tests/throttle.lua \
+     http://localhost:8080/should_throttle
+
+   # Expected results:
+   # - p50: <1ms
+   # - p95: <2ms
+   # - p99: <5ms
+   # - p99.9: <10ms
+   # - p99.99: <50ms
+   # - Success rate: 100%
+   # - Sustained throughput: 1000 RPS
+
+   kill %1  # Stop server
+   ```
+
+   **b) Single-Node High Throughput**:
+   ```bash
+   # Test: Maximum throughput (target: >50K RPS)
+   wrk2 -t8 -c100 -d60s -R100000 \
+     --latency \
+     -s load-tests/throttle.lua \
+     http://localhost:8080/should_throttle
+
+   # Expected: Sustains >50K RPS with p99 <10ms
+   ```
+
+   **c) Multi-Scope Load**:
+   ```bash
+   # Test: 1000 different scopes, 10 RPS each = 10K total RPS
+   # Create load-tests/multi_scope.lua
+   wrk2 -t4 -c40 -d120s -R10000 \
+     --latency \
+     -s load-tests/multi_scope.lua \
+     http://localhost:8080/should_throttle
+
+   # Verify: All scopes properly tracked, no memory leaks
+   ```
+
+   **d) Distributed Load (3 nodes)**:
+   ```bash
+   # Start 3-node cluster (in separate terminals)
+   cargo run --release -p nenya-sentinel -- \
+     --listen-addr 127.0.0.1:8080 --gossip-addr 127.0.0.1:8081 &
+
+   cargo run --release -p nenya-sentinel -- \
+     --listen-addr 127.0.0.1:8090 --gossip-addr 127.0.0.1:8091 \
+     --seed-nodes 127.0.0.1:8081 &
+
+   cargo run --release -p nenya-sentinel -- \
+     --listen-addr 127.0.0.1:8100 --gossip-addr 127.0.0.1:8101 \
+     --seed-nodes 127.0.0.1:8081 &
+
+   # Test: Load distributed across all nodes
+   # Send 333 RPS to each node = 1000 RPS total
+   wrk2 -t2 -c10 -d60s -R333 \
+     --latency -s load-tests/throttle.lua http://localhost:8080/should_throttle &
+   wrk2 -t2 -c10 -d60s -R333 \
+     --latency -s load-tests/throttle.lua http://localhost:8090/should_throttle &
+   wrk2 -t2 -c10 -d60s -R334 \
+     --latency -s load-tests/throttle.lua http://localhost:8100/should_throttle &
+
+   wait  # Wait for all load tests to complete
+
+   # Verify:
+   # - Total cluster accepts ~target rate (accounting for coordination)
+   # - Gossip converges within 2-3s
+   # - No node crashes or hangs
+
+   jobs -p | xargs kill  # Clean up
+   ```
+
+   **e) Burst Load**:
+   ```bash
+   # Test: Normal load with periodic bursts
+   # Create load-tests/burst_load.lua (alternates 500 RPS / 5000 RPS)
+   cargo run --release -p nenya-sentinel &
+
+   wrk2 -t4 -c50 -d180s \
+     --latency \
+     -s load-tests/burst_load.lua \
+     http://localhost:8080/should_throttle
+
+   # Verify: PID adapts to bursts, no crashes
+   kill %1
+   ```
+
+   **f) Ramp-Up Load**:
+   ```bash
+   # Test: Gradual ramp from 100 to 10K RPS over 5 minutes
+   # Create load-tests/ramp_load.sh
+   ./load-tests/ramp_load.sh
+
+   # Verify: Smooth scaling, no memory issues at high load
+   ```
+
+4. **Stress Testing**:
+   ```bash
+   # Test: 10,000 unique scopes under load
+   wrk2 -t8 -c100 -d300s -R50000 \
+     --latency \
+     -s load-tests/stress_scopes.lua \
+     http://localhost:8080/should_throttle
+
+   # Monitor with:
+   # - Memory usage (should be stable, no leaks)
+   # - CPU usage (should be reasonable, <80%)
+   # - Latency (should not degrade over time)
+   ```
+
+5. **Soak Testing** (optional but recommended):
+   ```bash
+   # Test: 24-hour sustained load at moderate rate
+   nohup wrk2 -t4 -c20 -d86400s -R5000 \
+     --latency \
+     -s load-tests/throttle.lua \
+     http://localhost:8080/should_throttle \
+     > soak-test.log 2>&1 &
+
+   # Check after 24 hours:
+   # - No crashes
+   # - No memory leaks
+   # - Latency stable
+   # - All metrics healthy
+   ```
+
+6. **Failure Scenario Testing**:
+   ```bash
+   # a) Network partition recovery
+   # Start 3 nodes, block gossip, verify graceful degradation,
+   # restore network, verify auto-recovery
+
+   # b) Node crash and rejoin
+   # Kill a node, verify cluster continues, restart node,
+   # verify rejoin and sync
+
+   # c) Discovery failure
+   # Disable discovery, verify fallback to static seeds
+
+   # d) Invalid config handling
+   # Test with missing cluster secret, invalid TOML, etc.
+   # Verify clear error messages
+   ```
+
+7. **Documentation Verification**:
+   ```bash
+   # Build release binary
+   cargo build --release -p nenya-sentinel
+
+   # Verify documentation complete
+   ls docs/
+   # Should have: architecture.md, roadmap.md, deployment/
+
+   # Test deployment examples
+   # - Docker Compose: docker-compose up -d
+   # - Kubernetes: kubectl apply -f k8s/
+   # - Systemd: systemctl start nenya
+
+   # Verify runbook accuracy
+   # - Walk through common issues
+   # - Test secret rotation procedure
+   ```
+
+8. **CI/CD Pipeline**:
+   ```bash
+   # Ensure all checks pass in GitHub Actions:
+   # - Tests (all platforms)
+   # - Benchmarks
+   # - Clippy
+   # - Security audit
+   # - Documentation build
+   # - Docker image build
+
+   git push origin main
+   # GitHub Actions should be green
+   ```
+
+**Performance Targets (Milestone 5 - Production)**:
+- Library decision: ~40ns (established)
+- HTTP handler: <500μs p99
+- End-to-end: <5ms p99 (including network)
+- Throughput: >50K RPS per node
+- Gossip overhead: <100μs per decision
+- Memory: Stable under 100MB for 1K scopes
+- CPU: <50% at 10K RPS
+
+**Acceptance Criteria**:
+- ✅ All tests pass (170 library + binary integration + distributed tests)
+- ✅ All benchmarks meet targets
+- ✅ Load tests: 1K RPS for 5min with p99 <5ms
+- ✅ Load tests: >50K RPS sustained for 1min
+- ✅ Multi-node: 3-node cluster coordinates properly
+- ✅ Soak test: 24hr at 5K RPS (no crashes, no leaks)
+- ✅ Documentation complete and accurate
+- ✅ CI/CD green on all checks
+- ✅ Zero clippy warnings, zero audit vulnerabilities
 
 **Commit Message**: `Milestone 5: Production hardening and v1.0.0 preparation`
 

@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f1cc29b5bb4734aff07e405d343a69c6920b1accd1d565f6205d6489c1864a9d # shrinks to setpoint = 114.00180966208032, error_limit = 10.0, ki = 0.05
+cc e30ec3de5fb0d1e6340cab96ecdb3f587c8558fd735138c85016b2d609632fbd # shrinks to target = 69.9953908939019, num_requests = 90
+cc 79f9e706791448d0ab137b10bd1506b6a00b564712bb6eb3f7a72fc1822dace3 # shrinks to target = 61.11191084227402, num_requests = 65
+cc 33afa2541bccb5f35df08f430f73697ce8eea86fe867d3eb35bff5b2b66bba9b # shrinks to target_rate = 185.79213952390924, max_rate = 50.0, load_multiplier = 0.5
+cc 729da305077a15574c378e7f46d4c9a9c8aa082da31d024171a42c43bd027f08 # shrinks to target = 68.05069607931232, num_requests = 83
+cc cee8323163b0b05d188a82742f608a4d2be78a4f069512ebb835669176144eaa # shrinks to target_rate = 155.73569538428737, max_rate = 50.0, load_multiplier = 0.5

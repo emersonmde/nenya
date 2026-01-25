@@ -29,6 +29,9 @@ clap = "4.5.4"
 eframe = "0.28.1"
 egui = "0.28.1"
 egui_plot = "0.28.1"
+proptest = "1.4"
+approx = "0.5"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [features]
 default = []
@@ -46,3 +49,11 @@ server = [
 [[bin]]
 name = "nenya"
 required-features = ["server"]
+
+[[bench]]
+name = "rate_limiter_bench"
+harness = false
+
+[[bench]]
+name = "pid_controller_bench"
+harness = false
