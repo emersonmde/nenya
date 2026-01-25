@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use clap::{Arg, Command};
 
 use nenya::pid_controller::PIDController;
-use nenya::RateLimiter;
+use nenya::{RateLimiter, RateLimiterBuilder};
 
 const LINE_LENGTH: usize = 80;
 
@@ -166,13 +166,12 @@ fn main() {
         error_limit,
         output_limit,
     );
-    let mut rate_limiter = RateLimiter::new(
-        target_tps,
-        min_tps,
-        max_tps,
-        pid_controller,
-        update_interval,
-    );
+    let mut rate_limiter = RateLimiterBuilder::new(target_tps)
+        .min_rate(min_tps)
+        .max_rate(max_tps)
+        .pid_controller(pid_controller)
+        .update_interval(update_interval)
+        .build();
 
     let generator = RequestGenerator::new(base_tps, amplitudes, frequencies);
     generate_requests(&mut rate_limiter, &generator, trailing_window, duration);
@@ -282,7 +281,10 @@ fn print_metrics(
     println!("\rTrailing Accepted TPS: {:.2}", trailing_tps);
     println!("\rGenerated TPS: {:.2}", generated_tps);
     println!("\rTarget TPS: {:.2}", rate_limiter.target_rate());
-    println!("\rMeasured TPS: {:.2}", rate_limiter.request_rate());
+    println!(
+        "\rMeasured TPS: {:.2}",
+        rate_limiter.accepted_request_rate()
+    );
 }
 
 pub struct RequestGenerator {

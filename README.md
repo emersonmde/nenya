@@ -14,7 +14,8 @@
 ## Features
 
 - **Adaptive PID Control**: Dynamically adjusts rate limits based on traffic patterns
-- **Configurable Sliding Window**: Accurate TPS measurement with configurable windows
+- **Token Bucket + Sliding Window Hybrid**: Precise throttling with accurate rate measurement
+- **Timestamp Collision Immunity**: Handles tight-loop scenarios without rate calculation artifacts
 - **Generic Implementation**: Works with any numeric type (f32, f64, etc.)
 - **Distributed Coordination**: Share rate limits across multiple instances (coming soon)
 

@@ -65,22 +65,33 @@ pub(crate) mod gossip;
 #[cfg(feature = "server")]
 pub(crate) mod discovery;
 
-/// Sliding window rate limiter with an integrated PID controller for dynamic target rate adjustment.
+/// Token bucket rate limiter with sliding window measurement and PID controller for adaptive coordination.
+///
+/// This hybrid architecture uses:
+/// - Token bucket for precise, collision-immune throttling decisions
+/// - Sliding window for accurate rate measurement (PID feedback)
+/// - PID controller for adaptive distributed coordination
 #[derive(Debug)]
 pub struct RateLimiter<T> {
-    request_rate: T,
-    accepted_request_rate: T,
+    // Token Bucket state (local throttling)
+    tokens: T,
+    last_refill: Instant,
+    refill_rate: T,
+    bucket_capacity: T,
+
+    // Sliding Window state (rate measurement)
+    accepted_request_timestamps: VecDeque<Instant>,
+    local_accepted_request_rate: T,
+
+    // PID Control state (adaptive coordination)
+    pid_controller: PIDController<T>,
     target_rate: T,
     min_rate: T,
     max_rate: T,
-    pid_controller: PIDController<T>,
-    last_updated: Instant,
-    previous_output: T,
     update_interval: Duration,
-    request_timestamps: VecDeque<Instant>,
-    accepted_request_timestamps: VecDeque<Instant>,
-    local_accepted_request_rate: T, // Local rate only (for throttling decisions)
-    external_request_rate: T,
+    last_updated: Instant,
+
+    // External rates (distributed coordination)
     external_accepted_request_rate: T,
 }
 
@@ -92,23 +103,45 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiter<T> {
         max_rate: T,
         pid_controller: PIDController<T>,
         update_interval: Duration,
+        bucket_capacity: T,
     ) -> RateLimiter<T> {
+        let now = Instant::now();
         RateLimiter {
-            request_rate: T::zero(),
-            accepted_request_rate: T::zero(),
+            // Token bucket initialized with full capacity
+            tokens: bucket_capacity,
+            last_refill: now,
+            refill_rate: target_rate,
+            bucket_capacity,
+
+            // Sliding window starts empty
+            accepted_request_timestamps: VecDeque::new(),
+            local_accepted_request_rate: T::zero(),
+
+            // PID control
+            pid_controller,
             target_rate,
             min_rate,
             max_rate,
-            pid_controller,
-            last_updated: Instant::now(),
-            previous_output: T::zero(),
             update_interval,
-            request_timestamps: VecDeque::new(),
-            accepted_request_timestamps: VecDeque::new(),
-            local_accepted_request_rate: T::zero(),
-            external_request_rate: T::zero(),
+            last_updated: now,
+
+            // External rates
             external_accepted_request_rate: T::zero(),
         }
+    }
+
+    /// Refills the token bucket based on elapsed time since last refill.
+    ///
+    /// Tokens are added based on: elapsed_time * refill_rate
+    /// The token count is capped at bucket_capacity to prevent unbounded burst.
+    fn refill_tokens(&mut self, now: Instant) {
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+
+        // Calculate new tokens based on refill rate
+        let new_tokens = T::from_f64(elapsed).unwrap() * self.refill_rate;
+        self.tokens = (self.tokens + new_tokens).min(self.bucket_capacity);
+
+        self.last_refill = now;
     }
 
     /// Determines if the current request should be throttled based on the rate limiter's state.
@@ -123,11 +156,8 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiter<T> {
 
     /// Determines if a request at the given timestamp should be throttled.
     ///
-    /// This is the core rate limiting logic with injectable time. The timestamp parameter
-    /// allows for:
-    /// - Deterministic testing without actual time passing
-    /// - Replaying historical request patterns
-    /// - Simulating distributed request timestamps
+    /// This is the core rate limiting logic with injectable time. Uses a token bucket
+    /// for precise throttling decisions, immune to timestamp collisions.
     ///
     /// # Arguments
     /// * `now` - The timestamp of the current request
@@ -158,34 +188,26 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiter<T> {
     /// }
     /// ```
     pub fn should_throttle_at(&mut self, now: Instant) -> bool {
-        self.trim_request_window(now);
-        self.calculate_request_rate(now);
+        // 1. Refill tokens based on elapsed time
+        self.refill_tokens(now);
 
-        // Update PID controller and target rate periodically
-        if now.duration_since(self.last_updated) > self.update_interval {
-            self.last_updated = now;
-
-            // Use accepted_request_rate as the process variable for PID control
-            // We want to control the accepted rate to match the setpoint,
-            // not the incoming request rate (which we cannot control)
-            let output = self
-                .pid_controller
-                .compute_correction(self.accepted_request_rate);
-            self.previous_output = output;
-
-            self.target_rate =
-                num_traits::clamp(self.target_rate + output, self.min_rate, self.max_rate);
+        // 2. Periodically update PID control (regardless of accept/throttle decision)
+        if now.duration_since(self.last_updated) >= self.update_interval {
+            self.update_pid_control(now);
         }
 
-        // Make a throttling decision based on the target rate
-        // Use LOCAL accepted rate for throttling (not combined with external)
-        let should_handle_request = self.local_accepted_request_rate <= self.target_rate;
-        if should_handle_request {
+        // 3. Make throttle decision (token bucket)
+        if self.tokens >= T::one() {
+            self.tokens = self.tokens - T::one();
+
+            // Record acceptance for rate measurement
             self.accepted_request_timestamps.push_back(now);
-        }
-        self.request_timestamps.push_back(now);
+            self.trim_accepted_timestamps(now);
 
-        !should_handle_request
+            false // Accept request
+        } else {
+            true // Throttle request
+        }
     }
 
     /// Updates internal state (trims windows, updates PID) at the given timestamp
@@ -198,83 +220,65 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiter<T> {
     /// In production code, you typically only call `should_throttle()` or `should_throttle_at()`
     /// when actual requests arrive.
     pub fn update_state_at(&mut self, now: Instant) {
-        self.trim_request_window(now);
-        self.calculate_request_rate(now);
+        self.refill_tokens(now);
+        self.trim_accepted_timestamps(now);
+        self.calculate_local_accepted_rate(now);
 
-        // Update PID controller and target rate periodically
-        if now.duration_since(self.last_updated) > self.update_interval {
-            self.last_updated = now;
-
-            let output = self
-                .pid_controller
-                .compute_correction(self.accepted_request_rate);
-            self.previous_output = output;
-
-            self.target_rate =
-                num_traits::clamp(self.target_rate + output, self.min_rate, self.max_rate);
+        // Update PID controller periodically
+        if now.duration_since(self.last_updated) >= self.update_interval {
+            self.update_pid_control(now);
         }
     }
 
-    /// Calculates the current request rate based on the timestamps of recent requests.
-    fn calculate_request_rate(&mut self, now: Instant) {
-        let min_duration = 0.1; // Minimum duration threshold in seconds
+    /// Updates PID control by measuring rate and adjusting refill_rate.
+    ///
+    /// This method:
+    /// 1. Measures local accepted rate from sliding window
+    /// 2. Aggregates with external rates
+    /// 3. Computes PID correction
+    /// 4. Adjusts refill_rate (clamped to min/max bounds)
+    fn update_pid_control(&mut self, now: Instant) {
+        // Measure local accepted rate (sliding window)
+        self.calculate_local_accepted_rate(now);
 
-        // Calculate local accepted rate (from our own timestamps only)
-        self.local_accepted_request_rate =
-            if let Some(&oldest) = self.accepted_request_timestamps.front() {
-                let window_duration = now.duration_since(oldest).as_secs_f32();
-                let effective_duration = if window_duration < min_duration {
-                    min_duration
-                } else {
-                    window_duration
-                };
-
-                if T::from_f32(effective_duration).unwrap() > T::zero() {
-                    T::from_usize(self.accepted_request_timestamps.len()).unwrap()
-                        / T::from_f32(effective_duration).unwrap()
-                } else {
-                    T::zero()
-                }
-            } else {
-                T::zero()
-            };
-
-        // Combine local + external for PID control
-        self.accepted_request_rate =
+        // Aggregate with external rates
+        let total_accepted_rate =
             self.local_accepted_request_rate + self.external_accepted_request_rate;
 
-        if let Some(&oldest) = self.request_timestamps.front() {
-            let window_duration = now.duration_since(oldest).as_secs_f32();
-            let effective_duration = if window_duration < min_duration {
-                min_duration
-            } else {
-                window_duration
-            };
+        // PID computes correction
+        let correction = self.pid_controller.compute_correction(total_accepted_rate);
 
-            self.request_rate = if T::from_f32(effective_duration).unwrap() > T::zero() {
-                T::from_usize(self.request_timestamps.len()).unwrap()
-                    / T::from_f32(effective_duration).unwrap()
-            } else {
-                T::zero()
-            };
-        } else {
-            self.request_rate = T::zero();
-        }
-        self.request_rate = self.request_rate + self.external_request_rate;
+        // Adjust refill_rate (clamped to bounds)
+        self.refill_rate =
+            num_traits::clamp(self.target_rate + correction, self.min_rate, self.max_rate);
+
+        self.last_updated = now;
     }
 
-    /// Trims old request timestamps that are outside the update interval.
-    fn trim_request_window(&mut self, now: Instant) {
+    /// Calculates the local accepted request rate based on the sliding window.
+    ///
+    /// Uses a smaller minimum duration threshold (1ms) compared to the old implementation,
+    /// because token bucket throttling reduces timestamp collisions in the accepted stream.
+    fn calculate_local_accepted_rate(&mut self, now: Instant) {
+        if let Some(&oldest) = self.accepted_request_timestamps.front() {
+            let duration = now.duration_since(oldest).as_secs_f64();
+
+            // Smaller minimum duration acceptable (fewer collisions due to token bucket)
+            let effective_duration = duration.max(0.001); // 1ms minimum
+
+            self.local_accepted_request_rate =
+                T::from_usize(self.accepted_request_timestamps.len()).unwrap()
+                    / T::from_f64(effective_duration).unwrap();
+        } else {
+            self.local_accepted_request_rate = T::zero();
+        }
+    }
+
+    /// Trims old accepted request timestamps that are outside the update interval.
+    fn trim_accepted_timestamps(&mut self, now: Instant) {
         while let Some(timestamp) = self.accepted_request_timestamps.front() {
             if now.duration_since(*timestamp) > self.update_interval {
                 self.accepted_request_timestamps.pop_front();
-            } else {
-                break;
-            }
-        }
-        while let Some(timestamp) = self.request_timestamps.front() {
-            if now.duration_since(*timestamp) > self.update_interval {
-                self.request_timestamps.pop_front();
             } else {
                 break;
             }
@@ -291,29 +295,24 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiter<T> {
         self.target_rate
     }
 
-    /// Returns the current request rate.
-    pub fn request_rate(&self) -> T {
-        self.request_rate
+    /// Returns the current refill rate (adjusted by PID).
+    pub fn refill_rate(&self) -> T {
+        self.refill_rate
+    }
+
+    /// Returns the current token count.
+    pub fn tokens(&self) -> T {
+        self.tokens
     }
 
     /// Returns the current accepted request rate (combined local + external).
     pub fn accepted_request_rate(&self) -> T {
-        self.accepted_request_rate
+        self.local_accepted_request_rate + self.external_accepted_request_rate
     }
 
     /// Returns the local accepted request rate (excluding external rates).
     pub fn local_accepted_request_rate(&self) -> T {
         self.local_accepted_request_rate
-    }
-
-    /// Returns the current external request rate.
-    pub fn external_request_rate(&self) -> T {
-        self.external_request_rate
-    }
-
-    /// Sets the external request rate.
-    pub fn set_external_request_rate(&mut self, external_request_rate: impl Into<T>) {
-        self.external_request_rate = external_request_rate.into()
     }
 
     /// Returns the current external accepted request rate.
@@ -335,9 +334,9 @@ pub struct RateLimiterBuilder<T> {
     target_rate: T,
     min_rate: T,
     max_rate: T,
+    bucket_capacity: Option<T>,
     pid_controller: Option<PIDController<T>>,
     update_interval: Duration,
-    external_request_rate: T,
     external_accepted_request_rate: T,
     initial_timestamp: Option<Instant>,
 }
@@ -349,9 +348,9 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiterBuilder<T> {
             target_rate,
             min_rate: target_rate,
             max_rate: target_rate,
+            bucket_capacity: None,
             pid_controller: None,
             update_interval: Duration::from_secs(1),
-            external_request_rate: T::zero(),
             external_accepted_request_rate: T::zero(),
             initial_timestamp: None,
         }
@@ -369,6 +368,25 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiterBuilder<T> {
         self
     }
 
+    /// Sets the token bucket capacity.
+    ///
+    /// The bucket capacity determines the maximum burst size. Defaults to target_rate * 1.0
+    /// (allowing a 1 second burst at target rate).
+    ///
+    /// # Example
+    /// ```rust
+    /// use nenya::RateLimiterBuilder;
+    ///
+    /// // Allow 2-second burst at 100 RPS target
+    /// let limiter = RateLimiterBuilder::new(100.0)
+    ///     .bucket_capacity(200.0)
+    ///     .build();
+    /// ```
+    pub fn bucket_capacity(mut self, capacity: T) -> Self {
+        self.bucket_capacity = Some(capacity);
+        self
+    }
+
     /// Sets the PID controller for the rate limiter.
     pub fn pid_controller(mut self, pid_controller: PIDController<T>) -> Self {
         self.pid_controller = Some(pid_controller);
@@ -378,12 +396,6 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiterBuilder<T> {
     /// Sets the update interval for the PID controller.
     pub fn update_interval(mut self, update_interval: Duration) -> Self {
         self.update_interval = update_interval;
-        self
-    }
-
-    /// Sets the external request rate.
-    pub fn external_request_rate(mut self, external_request_rate: T) -> Self {
-        self.external_request_rate = external_request_rate;
         self
     }
 
@@ -424,22 +436,31 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiterBuilder<T> {
 
     /// Builds and returns the `RateLimiter` instance.
     pub fn build(self) -> RateLimiter<T> {
+        let now = self.initial_timestamp.unwrap_or_else(Instant::now);
+        let bucket_capacity = self.bucket_capacity.unwrap_or(self.target_rate);
+
         RateLimiter {
-            request_rate: T::zero(),
-            accepted_request_rate: T::zero(),
-            target_rate: self.target_rate,
-            min_rate: self.min_rate,
-            max_rate: self.max_rate,
+            // Token bucket initialized with full capacity
+            tokens: bucket_capacity,
+            last_refill: now,
+            refill_rate: self.target_rate,
+            bucket_capacity,
+
+            // Sliding window starts empty
+            accepted_request_timestamps: VecDeque::new(),
+            local_accepted_request_rate: T::zero(),
+
+            // PID control
             pid_controller: self
                 .pid_controller
                 .unwrap_or_else(|| PIDController::new_static_controller(self.target_rate)),
-            last_updated: self.initial_timestamp.unwrap_or_else(Instant::now),
-            previous_output: T::zero(),
+            target_rate: self.target_rate,
+            min_rate: self.min_rate,
+            max_rate: self.max_rate,
             update_interval: self.update_interval,
-            request_timestamps: VecDeque::new(),
-            accepted_request_timestamps: VecDeque::new(),
-            local_accepted_request_rate: T::zero(),
-            external_request_rate: self.external_request_rate,
+            last_updated: now,
+
+            // External rates
             external_accepted_request_rate: self.external_accepted_request_rate,
         }
     }
@@ -467,6 +488,7 @@ mod tests {
             max_rate,
             pid_controller,
             update_interval,
+            target_rate, // Default bucket_capacity = target_rate (1 second burst)
         )
     }
 
@@ -501,14 +523,21 @@ mod tests {
         let pid = create_pid_controller(1.0, 0.1, 0.01, 0.001, 0.0, None, None);
         let rate_limiter = create_rate_limiter(10.0, 5.0, 15.0, pid, Duration::from_secs(1));
 
+        // Token bucket state
+        assert_eq!(rate_limiter.tokens(), 10.0); // Initialized to bucket_capacity
+        assert_eq!(rate_limiter.refill_rate(), 10.0); // Initialized to target_rate
+        assert_eq!(rate_limiter.bucket_capacity, 10.0);
+        assert!(rate_limiter.last_refill.elapsed().as_secs() <= 1);
+
+        // Rate state
         assert_eq!(rate_limiter.target_rate(), 10.0);
         assert_eq!(rate_limiter.min_rate, 5.0);
         assert_eq!(rate_limiter.max_rate, 15.0);
-        assert_eq!(rate_limiter.request_rate(), 0.0);
         assert_eq!(rate_limiter.accepted_request_rate(), 0.0);
+        assert_eq!(rate_limiter.local_accepted_request_rate(), 0.0);
         assert!(rate_limiter.last_updated.elapsed().as_secs() <= 1);
-        assert_eq!(rate_limiter.previous_output, 0.0);
-        assert_eq!(rate_limiter.request_timestamps.len(), 0);
+
+        // Timestamps
         assert_eq!(rate_limiter.accepted_request_timestamps.len(), 0);
     }
 
@@ -517,69 +546,99 @@ mod tests {
         let pid = PIDController::new_static_controller(10.0);
         let mut rate_limiter = create_rate_limiter(10.0, 10.0, 10.0, pid, Duration::from_secs(1));
 
+        // Phase 1: Exhaust tokens with burst
+        // Start with 10 tokens, consume them all
+        for i in 0..10 {
+            let should_throttle = rate_limiter.should_throttle();
+            assert!(
+                !should_throttle,
+                "Should accept burst request {} (have tokens)",
+                i
+            );
+        }
+
+        // Phase 2: Now tokens exhausted, should throttle
+        let mut throttled_count = 0;
         for _ in 0..10 {
-            let should_throttle = rate_limiter.should_throttle();
-            assert!(!should_throttle);
-            sleep(Duration::from_millis(100));
+            if rate_limiter.should_throttle() {
+                throttled_count += 1;
+            }
         }
+        assert!(
+            throttled_count > 5,
+            "Should throttle most requests when no tokens (throttled {})",
+            throttled_count
+        );
 
-        rate_limiter.should_throttle();
-        rate_limiter.should_throttle();
-        rate_limiter.should_throttle();
+        // Phase 3: Wait for refill and try again
+        sleep(Duration::from_secs(1)); // Allow full refill (10 tokens)
 
+        // Should accept ~10 requests now
+        let mut accepted_count = 0;
         for _ in 0..10 {
-            let should_throttle = rate_limiter.should_throttle();
-            assert!(should_throttle);
+            if !rate_limiter.should_throttle() {
+                accepted_count += 1;
+            }
         }
+        assert!(
+            accepted_count >= 8,
+            "Should accept most requests after refill (accepted {})",
+            accepted_count
+        );
 
-        sleep(Duration::from_secs(2));
-
-        for _ in 0..5 {
-            let should_throttle = rate_limiter.should_throttle();
-            assert!(!should_throttle);
-            sleep(Duration::from_millis(100));
-        }
-
-        assert!(rate_limiter.request_rate() > 0.0);
         assert!(rate_limiter.accepted_request_rate() > 0.0);
         assert!(!rate_limiter.accepted_request_timestamps.is_empty());
-        assert!(!rate_limiter.request_timestamps.is_empty());
     }
 
     #[test]
     fn test_should_throttle_under_load_with_external_tps() {
         let pid = PIDController::new_static_controller(10.0);
         let mut rate_limiter = create_rate_limiter(12.0, 12.0, 12.0, pid, Duration::from_secs(1));
-        rate_limiter.set_external_request_rate(2.0);
         rate_limiter.set_external_accepted_request_rate(2.0);
 
+        // Phase 1: Exhaust tokens with burst
+        // Start with 12 tokens, consume them all
+        for i in 0..12 {
+            let should_throttle = rate_limiter.should_throttle();
+            assert!(
+                !should_throttle,
+                "Should accept burst request {} (have tokens)",
+                i
+            );
+        }
+
+        // Phase 2: Now tokens exhausted, should throttle
+        let mut throttled_count = 0;
         for _ in 0..10 {
-            let should_throttle = rate_limiter.should_throttle();
-            assert!(!should_throttle);
-            sleep(Duration::from_millis(100));
+            if rate_limiter.should_throttle() {
+                throttled_count += 1;
+            }
         }
+        assert!(
+            throttled_count > 5,
+            "Should throttle most requests when no tokens (throttled {})",
+            throttled_count
+        );
 
-        rate_limiter.should_throttle();
-        rate_limiter.should_throttle();
-        rate_limiter.should_throttle();
+        // Phase 3: Wait for refill and try again
+        sleep(Duration::from_secs(1)); // Allow full refill (12 tokens)
 
-        for _ in 0..10 {
-            let should_throttle = rate_limiter.should_throttle();
-            assert!(should_throttle);
+        // Should accept ~12 requests now
+        let mut accepted_count = 0;
+        for _ in 0..12 {
+            if !rate_limiter.should_throttle() {
+                accepted_count += 1;
+            }
         }
+        assert!(
+            accepted_count >= 10,
+            "Should accept most requests after refill (accepted {})",
+            accepted_count
+        );
 
-        sleep(Duration::from_secs(2));
-
-        for _ in 0..5 {
-            let should_throttle = rate_limiter.should_throttle();
-            assert!(!should_throttle);
-            sleep(Duration::from_millis(100));
-        }
-
-        assert!(rate_limiter.request_rate() > 0.0);
+        // Total accepted rate includes external
         assert!(rate_limiter.accepted_request_rate() > 0.0);
         assert!(!rate_limiter.accepted_request_timestamps.is_empty());
-        assert!(!rate_limiter.request_timestamps.is_empty());
     }
 
     #[test]
@@ -593,48 +652,52 @@ mod tests {
 
         sleep(Duration::from_secs(2));
 
-        let old_target_rate = rate_limiter.target_rate();
+        let old_refill_rate = rate_limiter.refill_rate();
         rate_limiter.should_throttle();
-        let new_target_rate = rate_limiter.target_rate();
+        let new_refill_rate = rate_limiter.refill_rate();
 
-        assert_ne!(new_target_rate, old_target_rate);
-        assert!((5.0..=15.0).contains(&new_target_rate))
+        // PID should adjust refill_rate (not target_rate)
+        assert_ne!(new_refill_rate, old_refill_rate);
+        assert!((5.0..=15.0).contains(&new_refill_rate));
+
+        // target_rate should remain constant
+        assert_eq!(rate_limiter.target_rate(), 10.0);
     }
 
     #[test]
-    fn test_trim_request_window() {
+    fn test_trim_accepted_timestamps() {
         let pid = create_pid_controller(1.0, 0.1, 0.01, 0.001, 0.0, None, None);
         let mut rate_limiter = create_rate_limiter(10.0, 5.0, 15.0, pid, Duration::from_secs(1));
 
         let now = Instant::now();
         rate_limiter
-            .request_timestamps
+            .accepted_request_timestamps
             .push_back(now - Duration::from_secs(2));
         rate_limiter
-            .request_timestamps
+            .accepted_request_timestamps
             .push_back(now - Duration::from_secs(1));
 
-        rate_limiter.trim_request_window(now);
+        rate_limiter.trim_accepted_timestamps(now);
 
-        assert_eq!(rate_limiter.request_timestamps.len(), 1);
+        assert_eq!(rate_limiter.accepted_request_timestamps.len(), 1);
     }
 
     #[test]
-    fn test_calculate_request_rate() {
+    fn test_calculate_local_accepted_rate() {
         let pid = create_pid_controller(1.0, 0.1, 0.01, 0.001, 0.0, None, None);
         let mut rate_limiter = create_rate_limiter(10.0, 5.0, 15.0, pid, Duration::from_secs(1));
 
         let now = Instant::now();
         rate_limiter
-            .request_timestamps
+            .accepted_request_timestamps
             .push_back(now - Duration::from_secs(2));
         rate_limiter
-            .request_timestamps
+            .accepted_request_timestamps
             .push_back(now - Duration::from_secs(1));
 
-        rate_limiter.calculate_request_rate(now);
+        rate_limiter.calculate_local_accepted_rate(now);
 
-        assert!(rate_limiter.request_rate() > 0.0);
+        assert!(rate_limiter.local_accepted_request_rate() > 0.0);
     }
 
     #[test]
@@ -642,31 +705,9 @@ mod tests {
         let pid = create_pid_controller(1.0, 0.1, 0.01, 0.001, 0.0, None, None);
         let mut rate_limiter = create_rate_limiter(10.0, 5.0, 15.0, pid, Duration::from_secs(1));
 
-        rate_limiter.set_external_request_rate(2.0);
         rate_limiter.set_external_accepted_request_rate(2.0);
 
-        assert_eq!(rate_limiter.external_request_rate(), 2.0);
         assert_eq!(rate_limiter.external_accepted_request_rate(), 2.0);
-    }
-
-    #[test]
-    fn test_request_rate_with_external_rate() {
-        let pid = create_pid_controller(1.0, 0.1, 0.01, 0.001, 0.0, None, None);
-        let mut rate_limiter = create_rate_limiter(10.0, 5.0, 15.0, pid, Duration::from_secs(1));
-
-        rate_limiter.set_external_request_rate(2.0);
-
-        let now = Instant::now();
-        rate_limiter
-            .request_timestamps
-            .push_back(now - Duration::from_secs(2));
-        rate_limiter
-            .request_timestamps
-            .push_back(now - Duration::from_secs(1));
-
-        rate_limiter.calculate_request_rate(now);
-
-        assert_eq!(rate_limiter.request_rate(), 2.0 + (2.0 / 2.0));
     }
 
     #[test]
@@ -684,7 +725,7 @@ mod tests {
             .accepted_request_timestamps
             .push_back(now - Duration::from_secs(1));
 
-        rate_limiter.calculate_request_rate(now);
+        rate_limiter.calculate_local_accepted_rate(now);
 
         assert_eq!(rate_limiter.accepted_request_rate(), 2.0 + (2.0 / 2.0));
     }
@@ -693,34 +734,34 @@ mod tests {
 
     #[test]
     fn test_rate_calculation_minimum_duration_threshold() {
-        // Verify that minimum duration threshold (0.1s) prevents division by tiny numbers
+        // Verify that minimum duration threshold (1ms) prevents division by tiny numbers
         let pid = create_pid_controller(1.0, 0.1, 0.01, 0.001, 0.0, None, None);
         let mut rate_limiter = create_rate_limiter(100.0, 50.0, 150.0, pid, Duration::from_secs(1));
 
         let now = Instant::now();
 
-        // Add timestamps very close together (< 0.1s)
+        // Add timestamps very close together (< 1ms)
         rate_limiter
-            .request_timestamps
-            .push_back(now - Duration::from_millis(50));
+            .accepted_request_timestamps
+            .push_back(now - Duration::from_micros(500));
         rate_limiter
-            .request_timestamps
-            .push_back(now - Duration::from_millis(40));
+            .accepted_request_timestamps
+            .push_back(now - Duration::from_micros(400));
         rate_limiter
-            .request_timestamps
-            .push_back(now - Duration::from_millis(30));
+            .accepted_request_timestamps
+            .push_back(now - Duration::from_micros(300));
 
-        rate_limiter.calculate_request_rate(now);
+        rate_limiter.calculate_local_accepted_rate(now);
 
-        // With 3 requests and actual duration 0.05s, without min threshold:
-        // rate would be 3 / 0.05 = 60 TPS
-        // With min threshold of 0.1s:
-        // rate should be 3 / 0.1 = 30 TPS
-        let calculated_rate = rate_limiter.request_rate();
+        // With 3 requests and actual duration 0.0005s, without min threshold:
+        // rate would be 3 / 0.0005 = 6000 TPS
+        // With min threshold of 0.001s (1ms):
+        // rate should be 3 / 0.001 = 3000 TPS
+        let calculated_rate = rate_limiter.local_accepted_request_rate();
 
         assert!(
-            (calculated_rate - 30.0).abs() < 1.0,
-            "Rate {} should use 0.1s minimum duration",
+            (calculated_rate - 3000.0).abs() < 100.0,
+            "Rate {} should use 1ms minimum duration",
             calculated_rate
         );
     }
@@ -735,32 +776,38 @@ mod tests {
 
         // Add timestamps spanning > window duration
         rate_limiter
-            .request_timestamps
+            .accepted_request_timestamps
             .push_back(now - Duration::from_secs(5)); // Too old
         rate_limiter
-            .request_timestamps
+            .accepted_request_timestamps
             .push_back(now - Duration::from_secs(3)); // Too old
         rate_limiter
-            .request_timestamps
+            .accepted_request_timestamps
             .push_back(now - Duration::from_secs(1)); // Recent
-        rate_limiter.request_timestamps.push_back(now); // Recent
+        rate_limiter.accepted_request_timestamps.push_back(now); // Recent
 
-        rate_limiter.trim_request_window(now);
+        rate_limiter.trim_accepted_timestamps(now);
 
         // Only timestamps within last 2 seconds should remain
         assert_eq!(
-            rate_limiter.request_timestamps.len(),
+            rate_limiter.accepted_request_timestamps.len(),
             2,
             "Should trim old timestamps"
         );
 
         // Verify the remaining ones are the recent ones
         assert!(
-            rate_limiter.request_timestamps[0].elapsed().as_secs() <= 2,
+            rate_limiter.accepted_request_timestamps[0]
+                .elapsed()
+                .as_secs()
+                <= 2,
             "First remaining timestamp should be recent"
         );
         assert!(
-            rate_limiter.request_timestamps[1].elapsed().as_secs() <= 1,
+            rate_limiter.accepted_request_timestamps[1]
+                .elapsed()
+                .as_secs()
+                <= 1,
             "Second remaining timestamp should be recent"
         );
     }
@@ -775,32 +822,19 @@ mod tests {
 
         // Setup local rate: 2 requests over 1 second = 2 TPS
         rate_limiter
-            .request_timestamps
-            .push_back(now - Duration::from_secs(1));
-        rate_limiter.request_timestamps.push_back(now);
-
-        rate_limiter
             .accepted_request_timestamps
             .push_back(now - Duration::from_secs(1));
         rate_limiter.accepted_request_timestamps.push_back(now);
 
         // Set external rates
-        rate_limiter.set_external_request_rate(30.0);
         rate_limiter.set_external_accepted_request_rate(30.0);
 
-        rate_limiter.calculate_request_rate(now);
+        rate_limiter.calculate_local_accepted_rate(now);
 
-        // Total request rate should be local + external
+        // Total accepted rate should be local + external
         // Local: 2 requests / 1.0s = 2 TPS
         // External: 30 TPS
         // Total: 32 TPS
-        let total_rate = rate_limiter.request_rate();
-        assert!(
-            (total_rate - 32.0).abs() < 1.0,
-            "Total rate {} should be local(2) + external(30)",
-            total_rate
-        );
-
         let total_accepted = rate_limiter.accepted_request_rate();
         assert!(
             (total_accepted - 32.0).abs() < 1.0,
@@ -816,19 +850,19 @@ mod tests {
         let mut rate_limiter =
             create_rate_limiter(100.0, 50.0, 150.0, pid, Duration::from_millis(500));
 
-        // Record initial target rate
-        let initial_target = rate_limiter.target_rate();
+        // Record initial refill rate
+        let initial_refill_rate = rate_limiter.refill_rate();
 
         // Make many rapid calls (much faster than update_interval)
         for _ in 0..20 {
             rate_limiter.should_throttle();
         }
 
-        // Target rate should not have changed yet (no time passed)
-        let target_after_rapid = rate_limiter.target_rate();
+        // Refill rate should not have changed yet (no time passed)
+        let refill_rate_after_rapid = rate_limiter.refill_rate();
         assert_eq!(
-            target_after_rapid, initial_target,
-            "Target rate should not change without time passing"
+            refill_rate_after_rapid, initial_refill_rate,
+            "Refill rate should not change without time passing"
         );
 
         // Wait for update interval to pass
@@ -840,49 +874,195 @@ mod tests {
         }
 
         // Now PID should have updated
-        let target_after_wait = rate_limiter.target_rate();
-        // Target should have changed (PID adjusted)
+        let refill_rate_after_wait = rate_limiter.refill_rate();
+        // Refill rate should have changed (PID adjusted)
         // Can't predict exact value, but should be different
         assert!(
-            (target_after_wait - initial_target).abs() > 0.01,
-            "Target rate should change after update_interval passes"
+            (refill_rate_after_wait - initial_refill_rate).abs() > 0.01,
+            "Refill rate should change after update_interval passes"
+        );
+
+        // Target rate should remain constant
+        assert_eq!(rate_limiter.target_rate(), 100.0);
+    }
+
+    // ===== Token Bucket Unit Tests =====
+
+    #[test]
+    fn test_token_bucket_refill() {
+        // Verify token refill calculation
+        let pid = PIDController::new_static_controller(100.0);
+        let mut rate_limiter = create_rate_limiter(100.0, 50.0, 150.0, pid, Duration::from_secs(1));
+
+        // Consume all tokens
+        for _ in 0..100 {
+            rate_limiter.should_throttle();
+        }
+
+        // Should have ~0 tokens now
+        assert!(rate_limiter.tokens() < 1.0, "Should have exhausted tokens");
+
+        // Wait 1 second
+        sleep(Duration::from_secs(1));
+
+        // Trigger refill by calling should_throttle
+        rate_limiter.should_throttle();
+
+        // Should have refilled ~100 tokens (refill_rate=100, elapsed=1.0s)
+        let tokens = rate_limiter.tokens();
+        assert!(
+            tokens >= 99.0,
+            "Should refill to ~100 tokens, got {}",
+            tokens
         );
     }
 
     #[test]
-    fn test_throttle_decision_threshold() {
-        // Verify throttling decision is based on: accepted_rate <= target_rate
+    fn test_token_bucket_capacity_limit() {
+        // Verify tokens never exceed bucket_capacity
+        let pid = PIDController::new_static_controller(100.0);
+        let mut rate_limiter = create_rate_limiter(100.0, 50.0, 150.0, pid, Duration::from_secs(1));
+
+        // Start with full bucket (100 tokens)
+        assert_eq!(rate_limiter.tokens(), 100.0);
+
+        // Wait a long time
+        sleep(Duration::from_secs(2));
+
+        // Trigger refill
+        rate_limiter.should_throttle();
+
+        // Should still be capped at bucket_capacity (100)
+        let tokens = rate_limiter.tokens();
+        assert!(
+            tokens <= 100.0,
+            "Tokens {} should be capped at capacity 100",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_token_consumption() {
+        // Verify tokens decrease by 1 on each accept
+        let pid = PIDController::new_static_controller(100.0);
+        let mut rate_limiter = create_rate_limiter(100.0, 50.0, 150.0, pid, Duration::from_secs(1));
+
+        let initial_tokens = rate_limiter.tokens();
+
+        // Accept one request
+        let throttled = rate_limiter.should_throttle();
+        assert!(!throttled, "Should accept request");
+
+        // Tokens should have decreased by 1
+        let after_tokens = rate_limiter.tokens();
+        assert!(
+            (initial_tokens - after_tokens - 1.0).abs() < 0.01,
+            "Should consume 1 token, went from {} to {}",
+            initial_tokens,
+            after_tokens
+        );
+    }
+
+    #[test]
+    fn test_throttle_when_no_tokens() {
+        // Verify throttling when tokens < 1
         let pid = PIDController::new_static_controller(10.0);
         let mut rate_limiter = create_rate_limiter(10.0, 5.0, 15.0, pid, Duration::from_secs(1));
 
-        // At start, accepted_rate = 0, should accept requests
-        // Space out requests to keep rate under target (10 TPS = 100ms per request)
-        for _ in 0..5 {
-            let throttled = rate_limiter.should_throttle();
-            assert!(!throttled, "Should accept when accepted_rate < target_rate");
-            sleep(Duration::from_millis(150)); // Slower than 10 TPS
-        }
-
-        // After many requests in quick succession, should start throttling
-        for _ in 0..20 {
+        // Exhaust all tokens
+        for _ in 0..10 {
             rate_limiter.should_throttle();
         }
 
-        // Should throttle when rate exceeds target
+        // Should have < 1 token
+        assert!(
+            rate_limiter.tokens() < 1.0,
+            "Should have < 1 token, got {}",
+            rate_limiter.tokens()
+        );
+
+        // Should throttle
+        let throttled = rate_limiter.should_throttle();
+        assert!(throttled, "Should throttle when tokens < 1");
+
+        // No timestamp should be recorded
+        let timestamps_len = rate_limiter.accepted_request_timestamps.len();
+        assert_eq!(
+            timestamps_len, 10,
+            "Throttled request should not record timestamp"
+        );
+    }
+
+    #[test]
+    fn test_refill_rate_adjustment_by_pid() {
+        // Verify PID adjusts refill_rate correctly
+        let pid = create_pid_controller(100.0, 1.0, 0.1, 0.01, 0.0, None, None);
+        let mut rate_limiter = create_rate_limiter(100.0, 50.0, 150.0, pid, Duration::from_secs(1));
+
+        let initial_refill_rate = rate_limiter.refill_rate();
+        assert_eq!(initial_refill_rate, 100.0);
+
+        // Generate high load to create negative error
+        for _ in 0..150 {
+            rate_limiter.should_throttle();
+        }
+
+        // Wait for PID update
+        sleep(Duration::from_secs(2));
+        rate_limiter.should_throttle();
+
+        // PID should have adjusted refill_rate
+        let new_refill_rate = rate_limiter.refill_rate();
+        assert_ne!(
+            new_refill_rate, initial_refill_rate,
+            "PID should adjust refill_rate"
+        );
+
+        // Should be clamped to [min_rate, max_rate]
+        assert!(
+            (50.0..=150.0).contains(&new_refill_rate),
+            "Refill rate {} should be within bounds [50, 150]",
+            new_refill_rate
+        );
+
+        // Target rate should remain constant
+        assert_eq!(rate_limiter.target_rate(), 100.0);
+    }
+
+    #[test]
+    fn test_throttle_decision_threshold() {
+        // Verify throttling decision is based on token availability
+        let pid = PIDController::new_static_controller(10.0);
+        let mut rate_limiter = create_rate_limiter(10.0, 5.0, 15.0, pid, Duration::from_secs(1));
+
+        // At start, tokens = 10 (bucket_capacity), should accept up to 10 requests immediately
+        for i in 0..10 {
+            let throttled = rate_limiter.should_throttle();
+            assert!(
+                !throttled,
+                "Should accept request {} when tokens available",
+                i
+            );
+        }
+
+        // Now tokens are exhausted, should throttle
+        let should_throttle = rate_limiter.should_throttle();
+        assert!(should_throttle, "Should throttle when no tokens available");
+
+        // Wait for tokens to refill (10 TPS = 100ms per token)
+        sleep(Duration::from_millis(500)); // Should refill ~5 tokens
+
+        // Should accept some requests now
+        for i in 0..5 {
+            let throttled = rate_limiter.should_throttle();
+            assert!(!throttled, "Should accept request {} after refill", i);
+        }
+
+        // Should throttle again
         let should_throttle = rate_limiter.should_throttle();
         assert!(
             should_throttle,
-            "Should throttle when accepted_rate > target_rate"
+            "Should throttle again when tokens exhausted"
         );
-
-        // Wait for window to reset
-        sleep(Duration::from_secs(2));
-
-        // Should accept again
-        for _ in 0..3 {
-            let throttled = rate_limiter.should_throttle();
-            assert!(!throttled, "Should accept again after window resets");
-            sleep(Duration::from_millis(200));
-        }
     }
 }

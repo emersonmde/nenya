@@ -293,8 +293,7 @@ fn external_rate_coordination_overhead(c: &mut Criterion) {
             .build();
 
         // Simulate external rates from 3 other nodes
-        limiter.set_external_request_rate(30.0);
-        limiter.set_external_accepted_request_rate(28.0);
+        limiter.set_external_accepted_request_rate(30.0);
 
         b.iter(|| black_box(limiter.should_throttle()))
     });

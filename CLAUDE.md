@@ -138,6 +138,11 @@ src/
 
 ### nenya Library
 
+**Architecture - Token Bucket + Sliding Window + PID Hybrid**:
+- **Token Bucket**: Fast per-request throttling decisions, immune to timestamp collisions
+- **Sliding Window**: Accurate rate measurement for PID feedback (accepted requests only)
+- **PID Controller**: Adaptive coordination by adjusting token refill rate
+
 **Generic Numeric Types**:
 - Generic over `T: Float + Signed + FromPrimitive + Copy`
 - Enables f32/f64 tradeoffs
@@ -145,19 +150,18 @@ src/
 
 **Time Handling**:
 - `std::time::Instant` for monotonic timestamps
-- Minimum duration threshold (0.1s) prevents division by tiny numbers
+- Minimum duration threshold (0.001s / 1ms) for accepted timestamp rate calculations
 
 **External Rate Injection** (critical for distribution):
-- `set_external_request_rate(rate)` - Add remote request rates
-- `set_external_accepted_request_rate(rate)` - Add remote accepted rates
-- RateLimiter sums local + external rates for PID control
+- `set_external_accepted_request_rate(rate)` - Add remote accepted rates from other nodes
+- RateLimiter sums local + external accepted rates for PID control
 - This is how nenya-sentinel coordinates across nodes
 
 **PID Controller**:
-- Setpoint = target request rate (e.g., 100 RPS)
-- Process variable = actual request rate (measured via sliding window)
+- Setpoint = target accepted rate (e.g., 100 RPS)
+- Process variable = actual accepted rate (measured via sliding window)
 - Error = setpoint - actual
-- Output = correction to apply to target rate
+- Output = correction to apply to refill_rate
 - Clamped to min_rate/max_rate bounds
 
 ### nenya-sentinel (Future)
@@ -169,11 +173,11 @@ src/
 - Each scope has independent PID controller
 
 **Distributed Coordination**:
-1. Local RateLimiter tracks local request rate
-2. Gossip protocol shares rates with peers
+1. Local RateLimiter tracks local accepted rate
+2. Gossip protocol shares accepted rates with peers
 3. Manager aggregates peer rates: `sum(peer.scope.accepted_rate)`
-4. Sets external_rate on local limiter: `limiter.set_external_request_rate(sum)`
-5. PID controller adjusts based on total (local + remote) rate
+4. Sets external_rate on local limiter: `limiter.set_external_accepted_request_rate(sum)`
+5. PID controller adjusts refill_rate based on total (local + remote) accepted rate
 
 **Configuration Hierarchy**:
 1. Hardcoded defaults

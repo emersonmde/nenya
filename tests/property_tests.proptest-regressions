@@ -10,3 +10,6 @@ cc 79f9e706791448d0ab137b10bd1506b6a00b564712bb6eb3f7a72fc1822dace3 # shrinks to
 cc 33afa2541bccb5f35df08f430f73697ce8eea86fe867d3eb35bff5b2b66bba9b # shrinks to target_rate = 185.79213952390924, max_rate = 50.0, load_multiplier = 0.5
 cc 729da305077a15574c378e7f46d4c9a9c8aa082da31d024171a42c43bd027f08 # shrinks to target = 68.05069607931232, num_requests = 83
 cc cee8323163b0b05d188a82742f608a4d2be78a4f069512ebb835669176144eaa # shrinks to target_rate = 155.73569538428737, max_rate = 50.0, load_multiplier = 0.5
+cc 04270205a2df9032ab64d38b563ec968781a8e91c32cbf09ee6ed81470384c6a # shrinks to setpoint = 50.0, load_multiplier = 2.8655814083819253
+cc 137c4c99dfe290e9d4194359aef57c3a52d124a7c0e5f0fee1ca84a20f2f2556 # shrinks to setpoint = 50.0, load_multiplier = 2.558798478396007
+cc fb41b5ee5e564b139d948e4e2e887968a3a3e87531424dbab33f7fe6adc50fcf # shrinks to setpoint = 53.91549737505281, load_multiplier = 2.557172139300492
