@@ -1,2 +1,2 @@
-window.ALL_CRATES = ["nenya","nenya_sentinel"];
-//{"start":21,"fragment_lengths":[7,17]}
+window.ALL_CRATES = ["nenya"];
+//{"start":21,"fragment_lengths":[7]}

@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"mod":["sentinel_client","sentinel_server"],"struct":["MetricData","Metrics","SegmentConfig","ShouldThrottleRequest","ShouldThrottleResponse"]};

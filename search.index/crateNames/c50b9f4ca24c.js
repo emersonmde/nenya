@@ -1,1 +1,0 @@
-rd_("enenyannenya_sentinel")
