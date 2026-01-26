@@ -84,47 +84,47 @@ fn main() {
             Arg::new("kp")
                 .long("kp")
                 .value_parser(clap::value_parser!(f32))
-                .default_value("0.5")
+                .default_value("0.8")
                 .help("Proportional gain for the PID controller"),
         )
         .arg(
             Arg::new("ki")
                 .long("ki")
                 .value_parser(clap::value_parser!(f32))
-                .default_value("0.1")
+                .default_value("0.05")
                 .help("Integral gain for the PID controller"),
         )
         .arg(
             Arg::new("kd")
                 .long("kd")
                 .value_parser(clap::value_parser!(f32))
-                .default_value("0.05")
+                .default_value("0.04")
                 .help("Derivative gain for the PID controller"),
         )
         .arg(
             Arg::new("error_bias")
                 .long("error_bias")
                 .value_parser(clap::value_parser!(f32))
-                .default_value("1.5")
+                .default_value("1.0")
                 .help("Bias factor for the integral term"),
         )
         .arg(
             Arg::new("error_limit")
                 .long("error_limit")
                 .value_parser(clap::value_parser!(f32))
-                .help("Error limit for the PID controller"),
+                .help("Error limit for the PID controller (defaults to 0.2 * target_tps)"),
         )
         .arg(
             Arg::new("output_limit")
                 .long("output_limit")
                 .value_parser(clap::value_parser!(f32))
-                .help("Output limit for the PID controller"),
+                .help("Output limit for the PID controller (defaults to 0.05 * target_tps)"),
         )
         .arg(
             Arg::new("update_interval")
                 .long("update_interval")
                 .value_parser(clap::value_parser!(u64))
-                .default_value("1000")
+                .default_value("500")
                 .help("Update interval for the PID controller (milliseconds)"),
         )
         .get_matches();
@@ -162,13 +162,13 @@ fn main() {
         .kd(kd)
         .error_bias(error_bias);
 
-    if let Some(error_limit) = error_limit {
-        builder = builder.error_limit(error_limit);
-    }
+    // Apply error_limit (default: 0.2 * target_tps)
+    let error_limit = error_limit.unwrap_or(0.2 * target_tps);
+    builder = builder.error_limit(error_limit);
 
-    if let Some(output_limit) = output_limit {
-        builder = builder.output_limit(output_limit);
-    }
+    // Apply output_limit (default: 0.05 * target_tps)
+    let output_limit = output_limit.unwrap_or(0.05 * target_tps);
+    builder = builder.output_limit(output_limit);
 
     let pid_controller = builder.build();
     let rate_limiter = RateLimiterBuilder::new(target_tps)
@@ -207,6 +207,7 @@ struct App {
     trailing_window: Duration,
     duration: Duration,
     start: Instant,
+    last_frame: Instant,
     accepted_requests: usize,
     total_requests: usize,
     setpoint_data: Vec<[f64; 2]>,
@@ -214,9 +215,12 @@ struct App {
     generated_tps_data: Vec<[f64; 2]>,
     target_tps_data: Vec<[f64; 2]>,
     throttled_tps_data: Vec<[f64; 2]>,
+    trailing_generated_tps_data: Vec<[f64; 2]>,
     accepted_request_times: VecDeque<Instant>,
     throttled_request_times: VecDeque<Instant>,
+    all_request_times: VecDeque<Instant>,
     last_time_point_added: f64,
+    request_accumulator: f64,
 }
 
 impl App {
@@ -226,12 +230,14 @@ impl App {
         trailing_window: Duration,
         duration: Duration,
     ) -> Self {
+        let now = Instant::now();
         Self {
             rate_limiter,
             generator,
             trailing_window,
             duration,
-            start: Instant::now(),
+            start: now,
+            last_frame: now,
             accepted_requests: 0,
             total_requests: 0,
             setpoint_data: Vec::new(),
@@ -239,36 +245,54 @@ impl App {
             generated_tps_data: Vec::new(),
             target_tps_data: Vec::new(),
             throttled_tps_data: Vec::new(),
+            trailing_generated_tps_data: Vec::new(),
             accepted_request_times: VecDeque::new(),
             throttled_request_times: VecDeque::new(),
+            all_request_times: VecDeque::new(),
             last_time_point_added: 0.0,
+            request_accumulator: 0.0,
         }
     }
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let now = Instant::now();
         let elapsed_seconds = self.start.elapsed().as_secs_f64();
 
         if elapsed_seconds < self.duration.as_secs_f64() {
             // Generate a varying request rate using the RequestGenerator
             let generated_tps = self.generator.generate_request_rate(elapsed_seconds);
-            let inter_request_delay = if generated_tps > 0.0 {
-                (1000.0 / generated_tps) as u64
-            } else {
-                1000
-            };
 
-            let should_throttle_request = self.rate_limiter.should_throttle();
-            self.total_requests += 1;
-            let now = Instant::now();
+            // Calculate actual time elapsed since last frame
+            let frame_duration = now.duration_since(self.last_frame).as_secs_f64();
+            self.last_frame = now;
 
-            // Add new indicator at the end of the buffer
-            if should_throttle_request {
-                self.throttled_request_times.push_back(now);
-            } else {
-                self.accepted_requests += 1;
-                self.accepted_request_times.push_back(now);
+            // Accumulate fractional requests to avoid losing precision at low rates
+            self.request_accumulator += generated_tps * frame_duration;
+
+            // Generate requests from accumulated fractional count
+            let requests_this_frame = self.request_accumulator.floor() as usize;
+            self.request_accumulator -= requests_this_frame as f64;
+
+            // Process multiple requests per frame to match the generated rate
+            for _ in 0..requests_this_frame {
+                let should_throttle_request = self.rate_limiter.should_throttle();
+                self.total_requests += 1;
+                let now = Instant::now();
+
+                // Track all requests for trailing generated TPS
+                self.all_request_times.push_back(now);
+
+                // Add new indicator at the end of the buffer
+                if should_throttle_request {
+                    self.throttled_request_times.push_back(now);
+                } else {
+                    self.accepted_requests += 1;
+                    self.accepted_request_times.push_back(now);
+                }
             }
+
+            let now = Instant::now();
 
             // Remove old timestamps outside the trailing window
             while let Some(&time) = self.accepted_request_times.front() {
@@ -287,10 +311,20 @@ impl eframe::App for App {
                 }
             }
 
+            while let Some(&time) = self.all_request_times.front() {
+                if now.duration_since(time) > self.trailing_window {
+                    self.all_request_times.pop_front();
+                } else {
+                    break;
+                }
+            }
+
             let trailing_tps =
                 self.accepted_request_times.len() as f64 / self.trailing_window.as_secs_f64();
             let throttled_tps =
                 self.throttled_request_times.len() as f64 / self.trailing_window.as_secs_f64();
+            let trailing_generated_tps =
+                self.all_request_times.len() as f64 / self.trailing_window.as_secs_f64();
 
             if elapsed_seconds - self.last_time_point_added >= 0.033 {
                 self.setpoint_data
@@ -302,11 +336,14 @@ impl eframe::App for App {
                     .push([elapsed_seconds, self.rate_limiter.target_rate() as f64]);
                 self.throttled_tps_data
                     .push([elapsed_seconds, throttled_tps]);
+                self.trailing_generated_tps_data
+                    .push([elapsed_seconds, trailing_generated_tps]);
 
                 self.last_time_point_added = elapsed_seconds;
             }
 
-            ctx.request_repaint_after(Duration::from_millis(inter_request_delay));
+            // Fixed frame rate
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -315,7 +352,14 @@ impl eframe::App for App {
                 .legend(egui_plot::Legend::default().position(Corner::LeftTop))
                 .show(ui, |plot_ui| {
                     plot_ui.line(Line::new(self.setpoint_data.clone()).name("Setpoint"));
-                    plot_ui.line(Line::new(self.generated_tps_data.clone()).name("Generated TPS"));
+                    plot_ui.line(
+                        Line::new(self.generated_tps_data.clone())
+                            .name("Generated TPS (instantaneous)"),
+                    );
+                    plot_ui.line(
+                        Line::new(self.trailing_generated_tps_data.clone())
+                            .name("Trailing Generated TPS"),
+                    );
                     plot_ui.line(
                         Line::new(self.trailing_tps_data.clone()).name("Trailing Accepted TPS"),
                     );

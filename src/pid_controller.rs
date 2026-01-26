@@ -135,6 +135,14 @@ impl<T: Float + Signed + Copy> PIDController<T> {
     pub fn setpoint(&self) -> T {
         self.setpoint
     }
+
+    /// Sets a new setpoint for the PID controller.
+    ///
+    /// This allows dynamic adjustment of the target value, useful for distributed
+    /// coordination where the setpoint changes based on cluster size.
+    pub fn set_setpoint(&mut self, setpoint: T) {
+        self.setpoint = setpoint;
+    }
 }
 
 /// Builder for creating a `PIDController` instance.

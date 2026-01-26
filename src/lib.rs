@@ -71,6 +71,17 @@ pub(crate) mod discovery;
 /// - Token bucket for precise, collision-immune throttling decisions
 /// - Sliding window for accurate rate measurement (PID feedback)
 /// - PID controller for adaptive distributed coordination
+///
+/// # Coordination Modes
+///
+/// **Single-Node Mode** (default):
+/// - `cluster_target = None`: PID tracks local rate only
+/// - `num_peers = 0`: No distribution
+///
+/// **Distributed Mode** (multi-node cluster):
+/// - `cluster_target = Some(1000.0)`: Cluster-wide rate target
+/// - `num_peers` tracked via gossip: Number of peer nodes
+/// - Equal division PID: Each node takes proportional share of cluster error
 #[derive(Debug)]
 pub struct RateLimiter<T> {
     // Token Bucket state (local throttling)
@@ -85,18 +96,23 @@ pub struct RateLimiter<T> {
 
     // PID Control state (adaptive coordination)
     pid_controller: PIDController<T>,
-    target_rate: T,
+    target_rate: T,            // Base rate for this node (single-node mode)
+    cluster_target: Option<T>, // Cluster-wide target (distributed mode)
     min_rate: T,
     max_rate: T,
     update_interval: Duration,
     last_updated: Instant,
 
-    // External rates (distributed coordination)
+    // Distributed coordination
     external_accepted_request_rate: T,
+    num_peers: usize, // Number of peer nodes (0 = single-node mode)
 }
 
 impl<T: Float + Signed + FromPrimitive + Copy> RateLimiter<T> {
     /// Creates a new `RateLimiter` instance.
+    ///
+    /// For single-node mode, use `target_rate` as the local rate target.
+    /// For distributed mode, use `cluster_target()` builder method to set cluster-wide target.
     pub fn new(
         target_rate: T,
         min_rate: T,
@@ -120,13 +136,15 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiter<T> {
             // PID control
             pid_controller,
             target_rate,
+            cluster_target: None, // Single-node by default
             min_rate,
             max_rate,
             update_interval,
             last_updated: now,
 
-            // External rates
+            // Distributed coordination
             external_accepted_request_rate: T::zero(),
+            num_peers: 0, // Single-node by default
         }
     }
 
@@ -232,21 +250,43 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiter<T> {
 
     /// Updates PID control by measuring rate and adjusting refill_rate.
     ///
-    /// This method:
-    /// 1. Measures local accepted rate from sliding window
-    /// 2. Aggregates with external rates
-    /// 3. Computes PID correction
-    /// 4. Adjusts refill_rate (clamped to min/max bounds)
+    /// # Coordination Modes
+    ///
+    /// **Single-Node Mode** (`cluster_target = None`):
+    /// 1. Measures local accepted rate
+    /// 2. PID tracks toward `target_rate`
+    /// 3. Adjusts refill_rate based on local performance
+    ///
+    /// **Distributed Mode** (`cluster_target = Some(...)`):
+    /// 1. Measures cluster total rate (local + external from gossip)
+    /// 2. Computes cluster error: `cluster_target - cluster_total`
+    /// 3. Divides error equally: `my_error_share = cluster_error / num_nodes`
+    /// 4. PID adjusts refill_rate based on proportional share
+    /// 5. All nodes converge to distribute cluster target fairly
     fn update_pid_control(&mut self, now: Instant) {
         // Measure local accepted rate (sliding window)
         self.calculate_local_accepted_rate(now);
 
-        // Aggregate with external rates
-        let total_accepted_rate =
-            self.local_accepted_request_rate + self.external_accepted_request_rate;
+        // Determine target and signal based on coordination mode
+        let (setpoint, signal) = if let Some(cluster_target) = self.cluster_target {
+            // Distributed mode: Equal division PID
+            let cluster_total =
+                self.local_accepted_request_rate + self.external_accepted_request_rate;
+            let num_nodes = T::from_usize(1 + self.num_peers).unwrap();
 
-        // PID computes correction
-        let correction = self.pid_controller.compute_correction(total_accepted_rate);
+            // Divide cluster target and actual among nodes
+            let my_target = cluster_target / num_nodes;
+            let my_signal = cluster_total / num_nodes;
+
+            (my_target, my_signal)
+        } else {
+            // Single-node mode: Track local target
+            (self.target_rate, self.local_accepted_request_rate)
+        };
+
+        // Update PID setpoint and compute correction
+        self.pid_controller.set_setpoint(setpoint);
+        let correction = self.pid_controller.compute_correction(signal);
 
         // Adjust refill_rate (clamped to bounds)
         self.refill_rate =
@@ -321,37 +361,73 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiter<T> {
     }
 
     /// Sets the external accepted request rate.
+    ///
+    /// This is used in distributed mode to aggregate rates from peer nodes via gossip.
     pub fn set_external_accepted_request_rate(
         &mut self,
         external_accepted_request_rate: impl Into<T>,
     ) {
         self.external_accepted_request_rate = external_accepted_request_rate.into()
     }
+
+    /// Sets the number of peer nodes in the cluster.
+    ///
+    /// This is used in distributed mode for equal division PID:
+    /// - `num_peers = 0`: Single-node mode (default)
+    /// - `num_peers > 0`: Distributed mode with `1 + num_peers` total nodes
+    ///
+    /// The gossip protocol should update this value when cluster membership changes.
+    pub fn set_num_peers(&mut self, num_peers: usize) {
+        self.num_peers = num_peers;
+    }
+
+    /// Returns the number of peer nodes (not including self).
+    pub fn num_peers(&self) -> usize {
+        self.num_peers
+    }
+
+    /// Returns the cluster target rate (if in distributed mode).
+    pub fn cluster_target(&self) -> Option<T> {
+        self.cluster_target
+    }
+
+    /// Returns the coordination mode.
+    ///
+    /// Returns `true` if in distributed mode (cluster_target is set), `false` for single-node.
+    pub fn is_distributed(&self) -> bool {
+        self.cluster_target.is_some()
+    }
 }
 
 /// Builder for creating a `RateLimiter` instance.
 pub struct RateLimiterBuilder<T> {
     target_rate: T,
+    cluster_target: Option<T>,
     min_rate: T,
     max_rate: T,
     bucket_capacity: Option<T>,
     pid_controller: Option<PIDController<T>>,
     update_interval: Duration,
     external_accepted_request_rate: T,
+    num_peers: usize,
     initial_timestamp: Option<Instant>,
 }
 
 impl<T: Float + Signed + FromPrimitive + Copy> RateLimiterBuilder<T> {
     /// Creates a new `RateLimiterBuilder` with default values.
+    ///
+    /// By default, creates a single-node rate limiter. Use `cluster_target()` for distributed mode.
     pub fn new(target_rate: T) -> Self {
         RateLimiterBuilder {
             target_rate,
+            cluster_target: None,
             min_rate: target_rate,
             max_rate: target_rate,
             bucket_capacity: None,
             pid_controller: None,
             update_interval: Duration::from_secs(1),
             external_accepted_request_rate: T::zero(),
+            num_peers: 0,
             initial_timestamp: None,
         }
     }
@@ -399,9 +475,38 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiterBuilder<T> {
         self
     }
 
+    /// Sets the cluster-wide target rate (enables distributed mode).
+    ///
+    /// When set, the rate limiter operates in distributed mode using equal division PID.
+    /// Each node coordinates to achieve the cluster target collectively.
+    ///
+    /// # Example
+    /// ```rust
+    /// use nenya::RateLimiterBuilder;
+    /// use nenya::pid_controller::PIDControllerBuilder;
+    ///
+    /// let pid = PIDControllerBuilder::new(0.0).kp(0.5).build(); // Setpoint adjusted automatically
+    /// let limiter = RateLimiterBuilder::new(100.0)  // Base rate per node
+    ///     .cluster_target(1000.0)  // Cluster-wide target
+    ///     .pid_controller(pid)
+    ///     .build();
+    /// ```
+    pub fn cluster_target(mut self, cluster_target: T) -> Self {
+        self.cluster_target = Some(cluster_target);
+        self
+    }
+
     /// Sets the external accepted request rate.
     pub fn external_accepted_request_rate(mut self, external_accepted_request_rate: T) -> Self {
         self.external_accepted_request_rate = external_accepted_request_rate;
+        self
+    }
+
+    /// Sets the number of peer nodes (for distributed mode).
+    ///
+    /// This is typically updated dynamically by the gossip protocol.
+    pub fn num_peers(mut self, num_peers: usize) -> Self {
+        self.num_peers = num_peers;
         self
     }
 
@@ -439,6 +544,13 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiterBuilder<T> {
         let now = self.initial_timestamp.unwrap_or_else(Instant::now);
         let bucket_capacity = self.bucket_capacity.unwrap_or(self.target_rate);
 
+        // For distributed mode with PID, setpoint will be adjusted dynamically per update
+        let initial_setpoint = if self.cluster_target.is_some() {
+            T::zero() // Will be set in update_pid_control()
+        } else {
+            self.target_rate
+        };
+
         RateLimiter {
             // Token bucket initialized with full capacity
             tokens: bucket_capacity,
@@ -453,15 +565,17 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiterBuilder<T> {
             // PID control
             pid_controller: self
                 .pid_controller
-                .unwrap_or_else(|| PIDController::new_static_controller(self.target_rate)),
+                .unwrap_or_else(|| PIDController::new_static_controller(initial_setpoint)),
             target_rate: self.target_rate,
+            cluster_target: self.cluster_target,
             min_rate: self.min_rate,
             max_rate: self.max_rate,
             update_interval: self.update_interval,
             last_updated: now,
 
-            // External rates
+            // Distributed coordination
             external_accepted_request_rate: self.external_accepted_request_rate,
+            num_peers: self.num_peers,
         }
     }
 }
@@ -1027,6 +1141,127 @@ mod tests {
 
         // Target rate should remain constant
         assert_eq!(rate_limiter.target_rate(), 100.0);
+    }
+
+    // ===== Distributed Coordination Tests =====
+
+    #[test]
+    fn test_distributed_mode_configuration() {
+        // Test that distributed mode is properly configured
+        let pid = create_pid_controller(0.0, 1.0, 0.0, 0.0, 0.0, None, None);
+
+        // Distributed mode: cluster_target set
+        let rate_limiter = RateLimiterBuilder::new(100.0)
+            .cluster_target(300.0)
+            .num_peers(2) // 3 nodes total
+            .min_rate(50.0)
+            .max_rate(150.0)
+            .pid_controller(pid)
+            .build();
+
+        // Verify distributed mode is active
+        assert!(rate_limiter.is_distributed());
+        assert_eq!(rate_limiter.cluster_target(), Some(300.0));
+        assert_eq!(rate_limiter.num_peers(), 2);
+
+        // Single-node mode: no cluster_target
+        let single_limiter = RateLimiterBuilder::new(100.0)
+            .min_rate(50.0)
+            .max_rate(150.0)
+            .build();
+
+        assert!(!single_limiter.is_distributed());
+        assert_eq!(single_limiter.cluster_target(), None);
+        assert_eq!(single_limiter.num_peers(), 0);
+    }
+
+    #[test]
+    fn test_distributed_peer_tracking() {
+        // Test that peer count can be updated
+        let pid = create_pid_controller(0.0, 1.0, 0.0, 0.0, 0.0, None, None);
+
+        let mut rate_limiter = RateLimiterBuilder::new(100.0)
+            .cluster_target(300.0)
+            .pid_controller(pid)
+            .build();
+
+        // Initially no peers
+        assert_eq!(rate_limiter.num_peers(), 0);
+
+        // Gossip discovers peers
+        rate_limiter.set_num_peers(2);
+        assert_eq!(rate_limiter.num_peers(), 2);
+
+        // Peer leaves
+        rate_limiter.set_num_peers(1);
+        assert_eq!(rate_limiter.num_peers(), 1);
+    }
+
+    #[test]
+    fn test_distributed_mode_over_target() {
+        // Test distributed coordination when cluster exceeds target
+        let pid = create_pid_controller(0.0, 0.5, 0.0, 0.0, 0.0, None, None);
+
+        let mut rate_limiter = RateLimiterBuilder::new(100.0)
+            .cluster_target(300.0)
+            .num_peers(2) // 3 nodes total
+            .min_rate(50.0)
+            .max_rate(150.0)
+            .pid_controller(pid)
+            .update_interval(Duration::from_millis(100))
+            .build();
+
+        // Simulate: Cluster is over target
+        // Cluster total: 360 RPS (local: 120, external: 240)
+        // Cluster error: 300 - 360 = -60 RPS
+        // Per-node error: -60 / 3 = -20 RPS
+        // PID should decrease refill_rate
+
+        rate_limiter.set_external_accepted_request_rate(240.0);
+
+        // Generate high load
+        for _ in 0..120 {
+            rate_limiter.should_throttle();
+        }
+
+        sleep(Duration::from_millis(150));
+        rate_limiter.should_throttle();
+
+        // Refill rate should decrease (overloaded cluster)
+        let refill_rate = rate_limiter.refill_rate();
+        assert!(
+            refill_rate < 100.0,
+            "Refill rate {} should decrease when cluster exceeds target",
+            refill_rate
+        );
+    }
+
+    #[test]
+    fn test_single_node_mode_backward_compatibility() {
+        // Verify backward compatibility - single-node mode works as before
+        let pid = create_pid_controller(100.0, 0.5, 0.0, 0.0, 0.0, None, None);
+
+        // No cluster_target = single-node mode (backward compatible)
+        let mut rate_limiter = RateLimiterBuilder::new(100.0)
+            .min_rate(50.0)
+            .max_rate(150.0)
+            .pid_controller(pid)
+            .update_interval(Duration::from_millis(100))
+            .build();
+
+        // Verify single-node mode
+        assert!(!rate_limiter.is_distributed());
+        assert_eq!(rate_limiter.cluster_target(), None);
+        assert_eq!(rate_limiter.num_peers(), 0);
+
+        // PID setpoint should be target_rate in single-node mode
+        assert_eq!(rate_limiter.pid_controller.setpoint(), 100.0);
+
+        // External rates can be set but are used differently (no division by num_nodes)
+        rate_limiter.set_external_accepted_request_rate(50.0);
+        assert_eq!(rate_limiter.external_accepted_request_rate(), 50.0);
+
+        // Existing tests verify single-node PID behavior works correctly
     }
 
     #[test]

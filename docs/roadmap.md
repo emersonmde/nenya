@@ -4,9 +4,11 @@ This document outlines the implementation plan for Nenya distributed rate limiti
 
 ## Current Milestone
 
-**Status**: Milestone 0 - Preparation & Cleanup
+**Status**: Ready for Milestone 1 - Single-Node HTTP Rate Limiter
 
-See the tasks below for what needs to be completed.
+**Library Status**: ✅ Distributed coordination support complete (equal division PID)
+
+See Milestone 1 tasks below for what needs to be completed.
 
 ## Principles
 
@@ -1095,9 +1097,9 @@ cargo clippy -- -D warnings
 
 | Milestone | Key Deliverable | Status |
 |-----------|----------------|--------|
-| 0 | Clean HTTP stack | ⏳ In Progress |
-| 1 | Working HTTP rate limiter | 🔜 Not Started |
-| 2 | Distributed coordination | 🔜 Not Started |
+| 0 | Clean HTTP stack | ✅ Complete (library) |
+| 1 | Working HTTP rate limiter | ⏳ Ready to Start |
+| 2 | Distributed coordination | 🟡 Library Complete, Binary TODO |
 | 3 | Platform integrations | 🔜 Not Started |
 | 4 | Cluster authentication | 🔜 Not Started |
 | 5 | Production-ready release | 🔜 Not Started |
