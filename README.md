@@ -13,11 +13,11 @@
 
 ## Features
 
-- **Adaptive PID Control**: Dynamically adjusts rate limits based on traffic patterns
-- **Token Bucket + Sliding Window Hybrid**: Precise throttling with accurate rate measurement
-- **Timestamp Collision Immunity**: Handles tight-loop scenarios without rate calculation artifacts
-- **Generic Implementation**: Works with any numeric type (f32, f64, etc.)
-- **Distributed Coordination**: Share rate limits across multiple instances (coming soon)
+- **PID-based adaptive control**: Adjusts rate limits in real-time based on measured throughput
+- **Distributed coordination**: Equal division PID algorithm for cluster-wide rate limiting
+- **Token bucket + sliding window hybrid**: Fast per-request decisions with accurate rate measurement
+- **Tuned defaults**: PID parameters that work well across different load patterns (kp=0.8, ki=0.05, kd=0.04)
+- **Generic over numeric types**: Works with f32, f64, or custom numeric types
 
 ## Installation
 
@@ -103,33 +103,53 @@ fn main() {
 }
 ```
 
+Distributed rate limiting across a cluster:
+
+```rust
+use nenya::RateLimiterBuilder;
+use nenya::pid_controller::PIDControllerBuilder;
+
+fn main() {
+    let pid = PIDControllerBuilder::new(0.0)  // Setpoint adjusted automatically
+        .kp(0.8)
+        .ki(0.05)
+        .kd(0.04)
+        .build();
+
+    let mut limiter = RateLimiterBuilder::new(100.0)
+        .cluster_target(1000.0)  // 1000 RPS cluster-wide target
+        .min_rate(50.0)
+        .max_rate(200.0)
+        .pid_controller(pid)
+        .build();
+
+    // Update peer count from gossip protocol
+    limiter.set_num_peers(9);  // 10 nodes total → 100 RPS per node
+
+    // Inject aggregated rates from other nodes
+    limiter.set_external_accepted_request_rate(850.0);
+
+    if limiter.should_throttle() {
+        println!("Request throttled");
+    } else {
+        println!("Request accepted");
+    }
+}
+```
+
 ### Request Simulator
 
-Nenya includes a request simulation example for testing and tuning. You can
-run the simulation with:
+There's a visual simulator for testing PID behavior under different load patterns:
 
 ```sh
 cargo run --example request_simulator_plot -- \
-    --target_tps 80.0 \
-    --min_tps 75.0 \
-    --max_tps 100.0 \
-    --trailing_window 1 \
-    --duration 120 \
-    --base_tps 80.0 \
-    --amplitudes 20.0,7.0,10.0 \
-    --frequencies 0.05,2.8,4.0 \
-    --kp 0.8 \
-    --ki 0.05 \
-    --kd 0.04 \
-    --error_limit 10.0 \
-    --output_limit 3.0 \
-    --update_interval 500 \
-    --error_bias 0.0
-
+    --target_tps 50.0 \
+    --base_tps 60.0 \
+    --amplitudes 30.0 \
+    --frequencies 0.1
 ```
 
-Most of these arguments have sane defaults and can be omitted. For more details
-see:
+The example uses reasonable defaults (kp=0.8, ki=0.05, kd=0.04, output_limit=0.05×target). To experiment with different parameters:
 
 ```sh
 cargo run --example request_simulator_plot -- --help
@@ -157,14 +177,34 @@ cargo fmt -- --check
 cargo audit
 ```
 
-## Adaptive Rate Limiting
+## How It Works
 
-The rate limiter achieves an adaptive rate limit using a
-Proportional–Integral–Derivative (PID) controller which determines the target
-rate limit based on the request rate. This implementation includes error
-bias, accumulated error clamping, anti-windup feedback, and output clamping.
+### Hybrid Architecture
 
-### Overview
+Nenya combines three techniques:
+
+1. **Token Bucket**: Fast per-request decisions, immune to timestamp collisions
+2. **Sliding Window**: Accurate rate measurement for PID feedback
+3. **PID Controller**: Adaptive adjustment based on actual vs target rate
+
+### Single-Node Mode
+
+Standard PID control loop:
+- **Setpoint**: Target rate (e.g., 100 RPS)
+- **Signal**: Measured accepted rate
+- **Output**: Adjustment to token refill rate
+
+### Distributed Mode (Equal Division PID)
+
+For cluster-wide rate limiting:
+- Each node gets an equal share: `cluster_target / num_nodes`
+- Nodes exchange their accepted rates via gossip
+- PID uses total cluster rate (local + remote) as feedback signal
+- Automatically rebalances when nodes join/leave
+
+Example: 1000 RPS cluster target with 10 nodes → each node targets 100 RPS. If a node sees the cluster is accepting 1100 RPS total, it reduces its local target proportionally.
+
+### PID Algorithm
 
 1. **Error Calculation**: The error is calculated by subtracting the request
    rate from the setpoint.
