@@ -32,58 +32,40 @@ See Milestone 1 tasks below for what needs to be completed.
 
 ## Milestone 0: Preparation & Cleanup
 
-- [ ] **MILESTONE COMPLETE**
+- [x] **MILESTONE COMPLETE**
 
-**Goal**: Prepare the codebase for distributed features by removing gRPC and adding HTTP stack.
+**Goal**: Restructure as single-crate with library and binary components, remove gRPC, add HTTP stack.
 
 **Architecture Reference**: See [docs/architecture.md](architecture.md) - HTTP API Server section
 
-### Tasks
+**Completed Work** (commit f0b2889):
+- [x] Restructured as single-crate (library + optional binary)
+- [x] Added HTTP framework (axum, tokio, serde)
+- [x] Added observability crates (tracing, tracing-subscriber)
+- [x] Created server module structure (api/, config/, gossip/, discovery/)
+- [x] Deprecated separate nenya-sentinel crate
+- [x] Implemented token bucket + PID hybrid rate limiter
+- [x] Added distributed coordination support (equal division PID)
 
-- [ ] **Remove gRPC/protobuf from nenya-sentinel**
-  - Remove `tonic`, `tonic-build`, `prost` dependencies
-  - Delete `proto/sentinel.proto`
-  - Delete `build.rs`
-  - Clean up any proto-generated code
-
-- [ ] **Add HTTP framework**
-  - Add `axum` and `tokio` to nenya-sentinel dependencies
-  - Add `serde` and `serde_json` for JSON handling
-
-- [ ] **Add observability crates**
-  - Add `tracing`, `tracing-subscriber`, `tracing-opentelemetry`
-  - Add `metrics`, `metrics-exporter-prometheus`
-
-- [ ] **Project structure**
-  - Create `nenya-sentinel/src/` subdirectories:
-    - `api/` - HTTP API handlers
-    - `manager/` - Rate limit manager
-    - `discovery/` - Discovery implementations
-    - `config/` - Configuration loading
-    - `observability/` - Metrics & tracing setup
-
-**Deliverable**: Clean slate for nenya-sentinel with HTTP stack and project structure ready
+**Deliverable**: ✅ Single-crate structure with library + binary, HTTP stack ready, distributed coordination foundation complete
 
 **Verification**:
 ```bash
 # Compilation
-cargo build -p nenya-sentinel  # Should compile
-cargo test -p nenya-sentinel   # Should pass (no tests yet, but shouldn't error)
+cargo build --features server  # ✅ Passes
+cargo test --lib                # ✅ 51 tests pass
 
 # Library benchmarks (establish performance baseline)
 cargo bench --bench rate_limiter_bench
 cargo bench --bench pid_controller_bench
-
-# Save baseline before binary work
-cargo bench -- --save-baseline milestone-0
 ```
 
-**Performance Baseline** (library only, from benchmarks):
+**Performance Baseline** (library only, verified):
 - Hot path decision: ~40ns (target: <1μs) ✅
 - PID computation: ~1-2ns (target: <100ns) ✅
-- Throughput: 25M decisions/sec single-threaded
+- Throughput: 25M decisions/sec single-threaded ✅
 
-**Commit Message**: `Milestone 0: Prepare HTTP stack for nenya-sentinel`
+**Commit**: f0b2889 "Milestone 0: Restructure as single-crate with library and binary"
 
 ---
 
@@ -290,11 +272,31 @@ cargo fmt --check
 
 - [ ] **MILESTONE COMPLETE**
 
-**Goal**: Add distributed coordination using Chitchat gossip protocol.
+**Goal**: Add distributed coordination using Chitchat gossip protocol with equal division PID.
 
 **Architecture Reference**: See [docs/architecture.md](architecture.md):
 - Gossip Protocol section
 - Distributed Coordination explanation
+
+**Distributed Coordination Design**:
+- **Equal Division PID**: Each node computes `cluster_error / num_nodes` and adjusts locally
+  - Gossip shares: `accepted_rate` per scope (not error signal)
+  - Each node independently computes: `cluster_total = local + sum(peers)`
+  - Target per node: `cluster_target / num_nodes`
+  - Signal per node: `cluster_total / num_nodes`
+  - PID adjusts local refill_rate to converge cluster to target
+
+- **Gossip Topology** (eventual consistency):
+  - Fanout: min(20, cluster_size - 1) random peers per round
+  - Small clusters (≤20): naturally becomes full mesh
+  - Large clusters (>20): random subset of 20 peers
+  - Convergence: ~1-2 rounds (1-2 seconds) even for large clusters
+
+- **Conservative PID Defaults**:
+  - Kp = 0.5 (safe for 1-2s gossip lag)
+  - Ki = 0.05 (moderate integral)
+  - Kd = 0.05 (light damping)
+  - Adaptive tuning deferred to Milestone 6
 
 ### Tasks
 
@@ -308,7 +310,9 @@ cargo fmt --check
   - Create `gossip/mod.rs`
   - Initialize Chitchat cluster
   - Configure gossip address (bind to `0.0.0.0:8081`)
+  - Configure gossip fanout: `min(20, cluster_size - 1)` random peers
   - Handle cluster membership events
+  - Track num_peers for equal division calculation
 
 - [ ] **State schema design**
   - Define gossip state format:
@@ -318,12 +322,12 @@ cargo fmt --check
         scopes: HashMap<String, ScopeRates>,
     }
     struct ScopeRates {
-        request_rate: f64,
-        accepted_rate: f64,
-        timestamp: SystemTime,
+        accepted_rate: f64,  // Used for equal division PID
+        timestamp: SystemTime,  // Optional: for future adaptive tuning
     }
     ```
   - Serialize/deserialize with serde
+  - Note: Only `accepted_rate` needed for Milestone 2; timestamp enables future work
 
 - [ ] **State publication**
   - Periodically publish local scope rates to Chitchat
@@ -1010,6 +1014,15 @@ jobs -p | xargs kill
 
 ### Potential Features
 
+- [ ] **Adaptive PID Tuning**
+  - Measure gossip lag via timestamps in gossip messages
+  - Dynamically adjust Kp based on measured lag: `Kp = stability_margin / gossip_lag`
+  - Prevents oscillation in high-lag environments
+  - Optimizes convergence speed in low-lag environments
+  - Use EWMA smoothing to prevent tuner oscillation
+  - Optional: Full Ziegler-Nichols auto-tuning for Ki, Kd
+  - Feature flag to enable/disable
+
 - [ ] **State persistence**
   - Persist scope state to disk
   - Faster recovery after restart
@@ -1097,13 +1110,13 @@ cargo clippy -- -D warnings
 
 | Milestone | Key Deliverable | Status |
 |-----------|----------------|--------|
-| 0 | Clean HTTP stack | ✅ Complete (library) |
+| 0 | Single-crate + HTTP stack + distributed foundation | ✅ Complete |
 | 1 | Working HTTP rate limiter | ⏳ Ready to Start |
-| 2 | Distributed coordination | 🟡 Library Complete, Binary TODO |
+| 2 | Equal division PID + gossip coordination | 🟡 Library Complete, Binary TODO |
 | 3 | Platform integrations | 🔜 Not Started |
 | 4 | Cluster authentication | 🔜 Not Started |
 | 5 | Production-ready release | 🔜 Not Started |
-| 6 | Advanced features | 🔜 Future |
+| 6 | Advanced features (adaptive PID tuning, etc.) | 🔜 Future |
 
 **Legend**: ✅ Complete | ⏳ In Progress | 🔜 Not Started
 
