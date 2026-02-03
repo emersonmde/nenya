@@ -54,13 +54,13 @@ pub mod pid_controller;
 
 // ===== Server modules (binary only, not part of public API) =====
 #[cfg(feature = "server")]
-pub(crate) mod api;
+pub mod api;
 
 #[cfg(feature = "server")]
-pub(crate) mod config;
+pub mod config;
 
 #[cfg(feature = "server")]
-pub(crate) mod gossip;
+pub mod gossip;
 
 #[cfg(feature = "server")]
 pub(crate) mod discovery;
@@ -269,14 +269,13 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiter<T> {
 
         // Determine target and signal based on coordination mode
         let (setpoint, signal) = if let Some(cluster_target) = self.cluster_target {
-            // Distributed mode: Equal division PID
-            let cluster_total =
-                self.local_accepted_request_rate + self.external_accepted_request_rate;
+            // Distributed mode: Each node tracks toward its fair share
+            // Target: my fair share of cluster target
+            // Signal: my actual local rate
+            // Each node independently converges to cluster_target / num_nodes
             let num_nodes = T::from_usize(1 + self.num_peers).unwrap();
-
-            // Divide cluster target and actual among nodes
             let my_target = cluster_target / num_nodes;
-            let my_signal = cluster_total / num_nodes;
+            let my_signal = self.local_accepted_request_rate;
 
             (my_target, my_signal)
         } else {
@@ -289,8 +288,18 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiter<T> {
         let correction = self.pid_controller.compute_correction(signal);
 
         // Adjust refill_rate (clamped to bounds)
-        self.refill_rate =
-            num_traits::clamp(self.target_rate + correction, self.min_rate, self.max_rate);
+        // In distributed mode, scale baseline and bounds by num_nodes
+        let (baseline, min_bound, max_bound) = if self.cluster_target.is_some() {
+            let num_nodes = T::from_usize(1 + self.num_peers).unwrap();
+            (
+                setpoint,
+                self.min_rate / num_nodes,
+                self.max_rate / num_nodes,
+            )
+        } else {
+            (self.target_rate, self.min_rate, self.max_rate)
+        };
+        self.refill_rate = num_traits::clamp(baseline + correction, min_bound, max_bound);
 
         self.last_updated = now;
     }

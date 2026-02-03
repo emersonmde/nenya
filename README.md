@@ -9,14 +9,14 @@
 
 **Two ways to use it:**
 - **As a library**: Embedded rate limiting in your Rust application
-- **As a binary**: Distributed rate limiting sidecar for microservices (work in progress)
+- **As a binary**: Distributed rate limiting sidecar for microservices
 
 ## Features
 
 - **PID-based adaptive control**: Adjusts rate limits in real-time based on measured throughput
 - **Distributed coordination**: Equal division PID algorithm for cluster-wide rate limiting
 - **Token bucket + sliding window hybrid**: Fast per-request decisions with accurate rate measurement
-- **Tuned defaults**: PID parameters that work well across different load patterns (kp=0.8, ki=0.05, kd=0.04)
+- **AIMD-inspired tuning**: Conservative PID gains optimized for distributed systems (kp=0.5, ki=0.02, kd=0.08)
 - **Generic over numeric types**: Works with f32, f64, or custom numeric types
 
 ## Installation
@@ -36,12 +36,36 @@ nenya = "0.1"
 cargo install nenya
 ```
 
-Then run:
+Run a single node:
 ```bash
+NENYA_CLUSTER_SECRET=your-secret nenya
+```
+
+Run a 3-node cluster:
+```bash
+# Node 0 (seed)
+NENYA_CLUSTER_SECRET=secret \
+NENYA_LISTEN_ADDR=127.0.0.1:8080 \
+NENYA_GOSSIP_ADDR=127.0.0.1:8081 \
+NENYA_ENABLE_GOSSIP=1 \
+nenya
+
+# Node 1
+NENYA_CLUSTER_SECRET=secret \
+NENYA_LISTEN_ADDR=127.0.0.1:8090 \
+NENYA_GOSSIP_ADDR=127.0.0.1:8091 \
+NENYA_SEED_NODES=127.0.0.1:8081 \
+nenya
+
+# Node 2
+NENYA_CLUSTER_SECRET=secret \
+NENYA_LISTEN_ADDR=127.0.0.1:8100 \
+NENYA_GOSSIP_ADDR=127.0.0.1:8101 \
+NENYA_SEED_NODES=127.0.0.1:8081 \
 nenya
 ```
 
-**Note:** The distributed sidecar is under active development. See [docs/roadmap.md](docs/roadmap.md) for progress.
+**Status:** HTTP API and distributed gossip coordination complete. See [docs/roadmap.md](docs/roadmap.md) for upcoming features.
 
 ### Examples
 

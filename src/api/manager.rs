@@ -1,0 +1,553 @@
+//! Multi-scope rate limit manager
+//!
+//! Manages multiple rate limiters with pattern-based configuration and auto-creation.
+
+use crate::pid_controller::PIDControllerBuilder;
+use crate::{RateLimiter, RateLimiterBuilder};
+use std::collections::HashMap;
+use std::time::Instant;
+
+#[cfg(feature = "server")]
+use serde::{Deserialize, Serialize};
+
+/// Pattern configuration for scope matching
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopePattern {
+    /// Pattern to match (exact match or wildcard with `*`)
+    pub pattern: String,
+
+    /// Target rate for this pattern
+    pub target_rate: f64,
+
+    /// Minimum rate bound (defaults to 0.5 * target_rate)
+    pub min_rate: Option<f64>,
+
+    /// Maximum rate bound (defaults to 2.0 * target_rate)
+    pub max_rate: Option<f64>,
+
+    /// PID proportional gain
+    pub kp: Option<f64>,
+
+    /// PID integral gain
+    pub ki: Option<f64>,
+
+    /// PID derivative gain
+    pub kd: Option<f64>,
+
+    /// Whether this is a distributed rate limit (cluster-wide target)
+    pub distributed: bool,
+}
+
+#[cfg(feature = "server")]
+impl ScopePattern {
+    /// Create a default pattern
+    pub fn default_pattern(target_rate: f64) -> Self {
+        ScopePattern {
+            pattern: "*".to_string(),
+            target_rate,
+            min_rate: None,
+            max_rate: None,
+            kp: None,
+            ki: None,
+            kd: None,
+            distributed: false,
+        }
+    }
+
+    /// Check if this pattern matches a scope name
+    fn matches(&self, scope: &str) -> PatternMatch {
+        if self.pattern == scope {
+            PatternMatch::Exact
+        } else if self.pattern.ends_with('*') {
+            let prefix = &self.pattern[..self.pattern.len() - 1];
+            if scope.starts_with(prefix) {
+                PatternMatch::Wildcard
+            } else {
+                PatternMatch::None
+            }
+        } else {
+            PatternMatch::None
+        }
+    }
+
+    /// Get min rate (defaults to 0.5 * target_rate)
+    pub fn get_min_rate(&self) -> f64 {
+        self.min_rate.unwrap_or(self.target_rate * 0.5)
+    }
+
+    /// Get max rate (defaults to 2.0 * target_rate)
+    pub fn get_max_rate(&self) -> f64 {
+        self.max_rate.unwrap_or(self.target_rate * 2.0)
+    }
+
+    /// Get PID Kp (defaults to 0.8)
+    pub fn get_kp(&self) -> f64 {
+        self.kp.unwrap_or(0.8)
+    }
+
+    /// Get PID Ki (defaults to 0.05)
+    pub fn get_ki(&self) -> f64 {
+        self.ki.unwrap_or(0.05)
+    }
+
+    /// Get PID Kd (defaults to 0.04)
+    pub fn get_kd(&self) -> f64 {
+        self.kd.unwrap_or(0.04)
+    }
+}
+
+/// Pattern match type
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PatternMatch {
+    None,
+    Wildcard,
+    Exact,
+}
+
+/// Throttle decision result
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThrottleDecision {
+    /// Whether the request should be throttled
+    pub should_throttle: bool,
+
+    /// Current local accepted rate for this scope
+    pub local_accepted_rate: f64,
+
+    /// Current refill rate (tokens per second)
+    pub refill_rate: f64,
+
+    /// Number of peers in cluster (0 if not distributed)
+    pub num_peers: usize,
+}
+
+/// Scope statistics
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopeStats {
+    /// Scope name
+    pub name: String,
+
+    /// Target rate
+    pub target_rate: f64,
+
+    /// Current local accepted rate
+    pub local_accepted_rate: f64,
+
+    /// Number of peers (0 if not distributed)
+    pub num_peers: usize,
+
+    /// Whether distributed mode is enabled
+    pub distributed: bool,
+}
+
+/// Multi-scope rate limit manager
+#[cfg(feature = "server")]
+pub struct RateLimitManager {
+    /// Active rate limiters by scope name
+    limiters: HashMap<String, RateLimiter<f64>>,
+
+    /// Pattern configurations (ordered by priority)
+    patterns: Vec<ScopePattern>,
+
+    /// Default target rate for new scopes (stored for future use)
+    #[allow(dead_code)]
+    default_target_rate: f64,
+
+    /// Default PID parameters (stored for future use)
+    #[allow(dead_code)]
+    default_kp: f64,
+    #[allow(dead_code)]
+    default_ki: f64,
+    #[allow(dead_code)]
+    default_kd: f64,
+}
+
+#[cfg(feature = "server")]
+impl RateLimitManager {
+    /// Create a new rate limit manager
+    pub fn new(
+        default_target_rate: f64,
+        default_kp: f64,
+        default_ki: f64,
+        default_kd: f64,
+    ) -> Self {
+        RateLimitManager {
+            limiters: HashMap::new(),
+            patterns: vec![ScopePattern::default_pattern(default_target_rate)],
+            default_target_rate,
+            default_kp,
+            default_ki,
+            default_kd,
+        }
+    }
+
+    /// Add a pattern configuration
+    pub fn add_pattern(&mut self, pattern: ScopePattern) {
+        self.patterns.push(pattern);
+        // Sort patterns by specificity (exact > wildcard)
+        self.patterns.sort_by(|a, b| {
+            // Exact matches first
+            let a_exact = !a.pattern.contains('*');
+            let b_exact = !b.pattern.contains('*');
+            match (a_exact, b_exact) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => {
+                    // Among wildcards, longer prefix is more specific
+                    let a_len = a.pattern.trim_end_matches('*').len();
+                    let b_len = b.pattern.trim_end_matches('*').len();
+                    b_len.cmp(&a_len)
+                }
+            }
+        });
+    }
+
+    /// Replace the default catch-all pattern
+    pub fn set_default_pattern(&mut self, pattern: ScopePattern) {
+        // Remove any existing "*" wildcard patterns
+        self.patterns.retain(|p| p.pattern != "*");
+        // Add the new default pattern
+        self.patterns.push(pattern);
+        // Re-sort
+        self.patterns.sort_by(|a, b| {
+            let a_exact = !a.pattern.contains('*');
+            let b_exact = !b.pattern.contains('*');
+            match (a_exact, b_exact) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => {
+                    let a_len = a.pattern.trim_end_matches('*').len();
+                    let b_len = b.pattern.trim_end_matches('*').len();
+                    b_len.cmp(&a_len)
+                }
+            }
+        });
+    }
+
+    /// Find the best matching pattern for a scope
+    fn match_pattern(&self, scope: &str) -> &ScopePattern {
+        for pattern in &self.patterns {
+            if pattern.matches(scope) != PatternMatch::None {
+                return pattern;
+            }
+        }
+        // Should never happen (default * pattern always matches)
+        &self.patterns[self.patterns.len() - 1]
+    }
+
+    /// Create a rate limiter from a pattern
+    fn create_limiter_from_pattern(&self, pattern: &ScopePattern) -> RateLimiter<f64> {
+        let pid = PIDControllerBuilder::new(pattern.target_rate)
+            .kp(pattern.get_kp())
+            .ki(pattern.get_ki())
+            .kd(pattern.get_kd())
+            .build();
+
+        let mut builder = RateLimiterBuilder::new(pattern.target_rate)
+            .min_rate(pattern.get_min_rate())
+            .max_rate(pattern.get_max_rate())
+            .pid_controller(pid);
+
+        // If distributed mode, set cluster target
+        if pattern.distributed {
+            builder = builder.cluster_target(pattern.target_rate);
+        }
+
+        builder.build()
+    }
+
+    /// Check if a request should be throttled
+    ///
+    /// Auto-creates the scope if it doesn't exist.
+    pub fn should_throttle(&mut self, scope: &str) -> ThrottleDecision {
+        // Check if limiter exists, if not create it
+        if !self.limiters.contains_key(scope) {
+            let pattern = self.match_pattern(scope);
+            let limiter = self.create_limiter_from_pattern(pattern);
+            self.limiters.insert(scope.to_string(), limiter);
+        }
+
+        // Now we can borrow the limiter mutably
+        let limiter = self.limiters.get_mut(scope).unwrap();
+
+        let should_throttle = limiter.should_throttle();
+        let local_accepted_rate = limiter.local_accepted_request_rate();
+
+        ThrottleDecision {
+            should_throttle,
+            local_accepted_rate,
+            refill_rate: limiter.refill_rate(),
+            num_peers: limiter.num_peers(),
+        }
+    }
+
+    /// Check if a request should be throttled at a specific time
+    pub fn should_throttle_at(&mut self, scope: &str, now: Instant) -> ThrottleDecision {
+        // Check if limiter exists, if not create it
+        if !self.limiters.contains_key(scope) {
+            let pattern = self.match_pattern(scope);
+            let limiter = self.create_limiter_from_pattern(pattern);
+            self.limiters.insert(scope.to_string(), limiter);
+        }
+
+        // Now we can borrow the limiter mutably
+        let limiter = self.limiters.get_mut(scope).unwrap();
+
+        let should_throttle = limiter.should_throttle_at(now);
+        let local_accepted_rate = limiter.local_accepted_request_rate();
+
+        ThrottleDecision {
+            should_throttle,
+            local_accepted_rate,
+            refill_rate: limiter.refill_rate(),
+            num_peers: limiter.num_peers(),
+        }
+    }
+
+    /// Get all active scopes
+    pub fn get_all_scopes(&self) -> Vec<(String, ScopeStats)> {
+        self.limiters
+            .iter()
+            .map(|(name, limiter)| {
+                let pattern = self.match_pattern(name);
+                (
+                    name.clone(),
+                    ScopeStats {
+                        name: name.clone(),
+                        target_rate: pattern.target_rate,
+                        local_accepted_rate: limiter.local_accepted_request_rate(),
+                        num_peers: limiter.num_peers(),
+                        distributed: pattern.distributed,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Get read-only reference to a limiter (for stats queries)
+    pub fn get_limiter(&self, scope: &str) -> Option<&RateLimiter<f64>> {
+        self.limiters.get(scope)
+    }
+
+    /// Get mutable reference to a limiter (for gossip updates)
+    pub fn get_limiter_mut(&mut self, scope: &str) -> Option<&mut RateLimiter<f64>> {
+        self.limiters.get_mut(scope)
+    }
+
+    /// Get the number of active scopes
+    pub fn num_scopes(&self) -> usize {
+        self.limiters.len()
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn test_pattern_exact_match() {
+        let pattern = ScopePattern {
+            pattern: "api#premium".to_string(),
+            target_rate: 1000.0,
+            min_rate: None,
+            max_rate: None,
+            kp: None,
+            ki: None,
+            kd: None,
+            distributed: false,
+        };
+
+        assert_eq!(pattern.matches("api#premium"), PatternMatch::Exact);
+        assert_eq!(pattern.matches("api#basic"), PatternMatch::None);
+        assert_eq!(pattern.matches("api#premium_123"), PatternMatch::None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_pattern_wildcard_match() {
+        let pattern = ScopePattern {
+            pattern: "api#*".to_string(),
+            target_rate: 100.0,
+            min_rate: None,
+            max_rate: None,
+            kp: None,
+            ki: None,
+            kd: None,
+            distributed: false,
+        };
+
+        assert_eq!(pattern.matches("api#premium"), PatternMatch::Wildcard);
+        assert_eq!(pattern.matches("api#basic"), PatternMatch::Wildcard);
+        assert_eq!(pattern.matches("api#"), PatternMatch::Wildcard);
+        assert_eq!(pattern.matches("web#page"), PatternMatch::None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_pattern_defaults() {
+        let pattern = ScopePattern::default_pattern(100.0);
+
+        assert_eq!(pattern.get_min_rate(), 50.0);
+        assert_eq!(pattern.get_max_rate(), 200.0);
+        assert_eq!(pattern.get_kp(), 0.8);
+        assert_eq!(pattern.get_ki(), 0.05);
+        assert_eq!(pattern.get_kd(), 0.04);
+    }
+
+    #[test]
+    #[serial]
+    fn test_manager_default_scope() {
+        let mut manager = RateLimitManager::new(100.0, 0.8, 0.05, 0.04);
+
+        // First request should not throttle
+        let decision = manager.should_throttle("test-scope");
+        assert!(!decision.should_throttle);
+        assert_eq!(manager.num_scopes(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn test_manager_auto_creation() {
+        let mut manager = RateLimitManager::new(100.0, 0.8, 0.05, 0.04);
+
+        // Create multiple scopes
+        manager.should_throttle("scope-1");
+        manager.should_throttle("scope-2");
+        manager.should_throttle("scope-3");
+
+        assert_eq!(manager.num_scopes(), 3);
+    }
+
+    #[test]
+    #[serial]
+    fn test_manager_pattern_priority_exact_match() {
+        let mut manager = RateLimitManager::new(10.0, 0.8, 0.05, 0.04);
+
+        // Add patterns (order doesn't matter, they'll be sorted)
+        manager.add_pattern(ScopePattern {
+            pattern: "api#*".to_string(),
+            target_rate: 100.0,
+            min_rate: None,
+            max_rate: None,
+            kp: None,
+            ki: None,
+            kd: None,
+            distributed: false,
+        });
+
+        manager.add_pattern(ScopePattern {
+            pattern: "api#premium".to_string(),
+            target_rate: 1000.0,
+            min_rate: None,
+            max_rate: None,
+            kp: None,
+            ki: None,
+            kd: None,
+            distributed: false,
+        });
+
+        // Exact match should take priority
+        manager.should_throttle("api#premium");
+        let limiter = manager.limiters.get("api#premium").unwrap();
+        assert_eq!(limiter.target_rate(), 1000.0);
+
+        // Wildcard match
+        manager.should_throttle("api#basic");
+        let limiter = manager.limiters.get("api#basic").unwrap();
+        assert_eq!(limiter.target_rate(), 100.0);
+
+        // Default pattern
+        manager.should_throttle("web#page");
+        let limiter = manager.limiters.get("web#page").unwrap();
+        assert_eq!(limiter.target_rate(), 10.0);
+    }
+
+    #[test]
+    #[serial]
+    fn test_manager_pattern_priority_most_specific() {
+        let mut manager = RateLimitManager::new(10.0, 0.8, 0.05, 0.04);
+
+        manager.add_pattern(ScopePattern {
+            pattern: "api#*".to_string(),
+            target_rate: 100.0,
+            min_rate: None,
+            max_rate: None,
+            kp: None,
+            ki: None,
+            kd: None,
+            distributed: false,
+        });
+
+        manager.add_pattern(ScopePattern {
+            pattern: "api#premium_*".to_string(),
+            target_rate: 500.0,
+            min_rate: None,
+            max_rate: None,
+            kp: None,
+            ki: None,
+            kd: None,
+            distributed: false,
+        });
+
+        // Most specific wildcard should match
+        manager.should_throttle("api#premium_user123");
+        let limiter = manager.limiters.get("api#premium_user123").unwrap();
+        assert_eq!(limiter.target_rate(), 500.0);
+
+        // Less specific wildcard
+        manager.should_throttle("api#basic");
+        let limiter = manager.limiters.get("api#basic").unwrap();
+        assert_eq!(limiter.target_rate(), 100.0);
+    }
+
+    #[test]
+    #[serial]
+    fn test_manager_get_all_scopes() {
+        let mut manager = RateLimitManager::new(100.0, 0.8, 0.05, 0.04);
+
+        manager.should_throttle("scope-1");
+        manager.should_throttle("scope-2");
+        manager.should_throttle("scope-3");
+
+        let scopes = manager.get_all_scopes();
+        assert_eq!(scopes.len(), 3);
+
+        let names: Vec<String> = scopes.iter().map(|(name, _)| name.clone()).collect();
+        assert!(names.contains(&"scope-1".to_string()));
+        assert!(names.contains(&"scope-2".to_string()));
+        assert!(names.contains(&"scope-3".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_manager_get_limiter_mut() {
+        let mut manager = RateLimitManager::new(100.0, 0.8, 0.05, 0.04);
+
+        manager.should_throttle("test-scope");
+
+        // Get mutable reference and update external rate
+        if let Some(limiter) = manager.get_limiter_mut("test-scope") {
+            limiter.set_external_accepted_request_rate(50.0);
+            limiter.set_num_peers(2);
+        }
+
+        let decision = manager.should_throttle("test-scope");
+        assert_eq!(decision.num_peers, 2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_manager_throttle_decision_fields() {
+        let mut manager = RateLimitManager::new(100.0, 0.8, 0.05, 0.04);
+
+        let decision = manager.should_throttle("test");
+        assert!(!decision.should_throttle);
+        assert!(decision.local_accepted_rate >= 0.0);
+        assert!(decision.refill_rate > 0.0);
+        assert_eq!(decision.num_peers, 0);
+    }
+}

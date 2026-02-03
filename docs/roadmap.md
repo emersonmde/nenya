@@ -4,11 +4,14 @@ This document outlines the implementation plan for Nenya distributed rate limiti
 
 ## Current Milestone
 
-**Status**: Ready for Milestone 1 - Single-Node HTTP Rate Limiter
+**Status**: Milestones 1-2 Complete - Ready for Milestone 3 (Platform Discovery)
 
-**Library Status**: ✅ Distributed coordination support complete (equal division PID)
+**Completed**:
+- ✅ Milestone 0: HTTP stack and distributed coordination foundation
+- ✅ Milestone 1: Single-node HTTP rate limiter with scope management
+- ✅ Milestone 2: Distributed gossip coordination with equal division PID
 
-See Milestone 1 tasks below for what needs to be completed.
+See Milestone 3 tasks below for next steps.
 
 ## Principles
 
@@ -71,7 +74,7 @@ cargo bench --bench pid_controller_bench
 
 ## Milestone 1: Single-Node Foundation
 
-- [ ] **MILESTONE COMPLETE**
+- [x] **MILESTONE COMPLETE**
 
 **Goal**: Build a working single-node HTTP rate limiter (no distribution yet).
 
@@ -270,7 +273,7 @@ cargo fmt --check
 
 ## Milestone 2: Gossip Integration
 
-- [ ] **MILESTONE COMPLETE**
+- [x] **MILESTONE COMPLETE**
 
 **Goal**: Add distributed coordination using Chitchat gossip protocol with equal division PID.
 

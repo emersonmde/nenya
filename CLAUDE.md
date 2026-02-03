@@ -206,7 +206,7 @@ src/
 
 ## Development Workflow
 
-**Current Status**: Architecture and planning complete
+**Current Status**: Milestones 1-2 complete (HTTP API + Distributed Gossip)
 
 **Roadmap**: See [`docs/roadmap.md`](docs/roadmap.md) for the complete implementation plan
 
@@ -231,11 +231,11 @@ src/
 
 | Milestone | Status | Deliverable |
 |-----------|--------|-------------|
-| 0 | ⏳ Current | Clean HTTP stack |
-| 1 | 🔜 Next | Working HTTP rate limiter |
-| 2 | 🔜 Future | Distributed coordination |
-| 3 | 🔜 Future | Platform integrations |
-| 4 | 🔜 Future | Cluster authentication |
+| 0 | ✅ Complete | Clean HTTP stack |
+| 1 | ✅ Complete | Working HTTP rate limiter |
+| 2 | ✅ Complete | Distributed coordination |
+| 3 | ⏳ Current | Platform integrations |
+| 4 | 🔜 Next | Cluster authentication |
 | 5 | 🔜 Future | Production-ready v1.0.0 |
 
 See `docs/roadmap.md` for complete details on each milestone.
