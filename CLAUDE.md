@@ -28,11 +28,10 @@ no coordinator.
 2. **[`docs/architecture.md`](docs/architecture.md)** — design details; each section is marked Implemented or Planned
 3. This file — commands, structure, conventions
 
-**Current milestone: 6 — Per-User Scale (Two-Tier Coordination).**
-Gossip only scopes near their limit (promotion via `local_rate × num_peers`
-estimate); the heavy-tailed remainder is enforced locally at
-`limit / num_peers` with compact state. See the roadmap's Milestone 6
-section for the task list.
+**Current milestone: 7 — Client SDKs & API Stabilization.**
+Stabilize the HTTP API (OpenAPI spec, versioning), then thin fail-open SDKs
+for Rust/Python/Node/Go and cost-weighted rates (7.3). See the roadmap's
+Milestone 7 section for the task list.
 
 ## Milestone Overview
 
@@ -42,8 +41,8 @@ section for the task list.
 | 3 | ✅ Complete | Gossip correctness fixes (stale decay, locking) |
 | 4 | ✅ Complete | Deterministic multi-node simulator + scenario/benchmark suite |
 | 5 | ✅ Complete | Pluggable engines (PID/Bayesian/hybrid) benchmarked; estimator-floor + cold-start fixes |
-| 6 | ⏳ Current | Two-tier coordination for per-user scale (millions of scopes) |
-| 7 | 🔜 Future | Client SDKs (Rust, Python, Node, Go) |
+| 6 | ✅ Complete | Two-tier coordination for per-user scale (1M scopes at ~360 B each; sweep-derived promotion policy) |
+| 7 | ⏳ Current | Client SDKs (Rust, Python, Node, Go) |
 | 8 | 🔜 Future | Platform deployment + discovery + AgentCore quota arbitration |
 | 9 | 🔜 Future | Cluster authentication |
 | 10 | 🔜 Future | Production-ready v1.0.0 |
@@ -109,9 +108,11 @@ src/
 ├── main.rs             # Binary entry (compile_error! without `server` feature)
 ├── api/                # HTTP API: handlers, RateLimitManager, metrics, errors
 ├── config/             # Env-var config (Config::from_env) — TOML is planned, NOT yet implemented
-├── gossip/             # Chitchat integration: manager, state schema, sync loop,
-│                       #   age-weighted staleness decay (aggregate.rs — also
-│                       #   compiled under `sim` so the simulator runs real code)
+├── gossip/             # Chitchat integration: manager (per-scope keys, compact
+│                       #   encoding), sync loop, age-weighted staleness decay
+│                       #   (aggregate.rs) and two-tier promotion/demotion policy
+│                       #   (tier.rs) — both also compiled under `sim` so the
+│                       #   simulator runs real code
 ├── sim/                # Deterministic multi-node simulator (feature `sim`):
 │                       #   virtual clock, message-bus gossip model, seeded
 │                       #   workloads, scenario library, metrics/artifacts
@@ -137,11 +138,14 @@ nenya-sentinel/         # Deprecation stub only — the binary is now `nenya` it
   `cluster_target()` — this is the entire library-side coordination surface
 
 **Server** (feature `server`):
-- `api::RateLimitManager`: `HashMap<String, RateLimiter<f64>>`, scopes auto-created
-  via pattern match (exact > most specific wildcard > `*` default)
-- `gossip::gossip_sync_loop`: every 500ms — publish local per-scope accepted
-  rates, pass per-peer observations via `set_peer_observations` (plus the
-  aggregated rate/live-peer count as reporting metrics)
+- `api::RateLimitManager`: tiered scope map (`local` non-distributed /
+  `tail` compact equal-share / `hot` full limiter + gossip), scopes
+  auto-created via pattern match (exact > most specific wildcard > `*`
+  default); distributed scopes start tail and promote per `gossip::tier`
+- `gossip::gossip_sync_loop`: every 500ms — aggregate peer observations,
+  run tier maintenance (peer-triggered promotion, demotion hysteresis,
+  budget eviction, TTL sweep), publish hot-scope keys + per-pattern tail
+  aggregates
 - Default engine (equal-division PID): each node targets
   `cluster_target / live_nodes` with its *local* accepted rate as the
   feedback signal; peer observations contribute liveness only
@@ -161,11 +165,13 @@ nenya-sentinel/         # Deprecation stub only — the binary is now `nenya` it
 - **Simulation before tuning**: control-loop changes (gains, engines, gossip
   parameters) must be evaluated in the deterministic simulator (Milestone 4)
   before shipping; don't hand-tune against real clusters
-- **Two-tier coordination for per-user scale (Milestone 6)**: gossip only
-  scopes near their limit (promotion at ~50% estimated cluster utilization via
-  `local_rate × num_peers`); the heavy-tailed remainder is enforced locally at
-  `limit / num_peers` with compact state. Per-user throttling at millions of
-  users is the primary use case — never assume all scopes gossip
+- **Two-tier coordination for per-user scale (Milestone 6, implemented)**:
+  gossip only scopes near their limit (promotion at sweep-derived 50%
+  estimated cluster utilization via `local_rate × num_peers` over an 8s
+  estimator window); the heavy-tailed remainder is enforced locally at
+  `limit / num_peers` with compact state (~360 B/scope measured at 1M).
+  Per-user throttling at millions of users is the primary use case — never
+  assume all scopes gossip
 - **Transport-agnostic coordination**: gossip is one transport for the core
   loop (local enforcement + periodic rate sharing + feedback control). The
   serverless analog is a blackboard store (DynamoDB/ElastiCache/Durable

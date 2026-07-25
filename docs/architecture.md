@@ -146,27 +146,23 @@ anti-entropy with phi accrual failure detection. Chosen over SWIM-style
 libraries because state propagation (not just membership) is the payload, and
 anti-entropy doesn't miss updates.
 
-**Gossip state** (actual schema, `src/gossip/state.rs`):
-
-```rust
-struct GossipState {
-    node_id: String,
-    scopes: HashMap<String, ScopeState>,
-    timestamp: SystemTime,
-}
-struct ScopeState {
-    accepted_rate: f64,      // the only value coordination needs
-    timestamp: SystemTime,   // opaque change marker for age-at-receipt tracking
-}
-```
+**Gossip state** (actual wire format, `src/gossip/manager.rs`, Milestone 6):
+one chitchat key per gossiped (hot-tier) scope — `s:<scope>` → accepted
+rate as a 3-decimal string, re-set only when the rounded value changes so
+anti-entropy ships per-key deltas — plus `t:<pattern>` per-pattern tail
+aggregates and a `nenya_v` publish counter used purely as an equality-
+compared change marker for age-at-receipt tracking (no wall-clock values
+on the wire).
 
 **Sync loop** (`src/gossip/sync.rs`, every `sync_interval`, default 500ms):
-1. Refresh and publish local per-scope accepted rates
-2. Aggregate peer rates per scope with age-weighted staleness decay
-   (`src/gossip/aggregate.rs`)
-3. `set_external_accepted_request_rate(weighted_sum)` + `set_num_peers(live)`
-   on every limiter in one pass; scopes with no live peer data are reset to
-   zero so vanished peers leave no phantom load
+1. Read peer observations and aggregate per scope with age-weighted
+   staleness decay (`src/gossip/aggregate.rs`)
+2. Under one manager lock: apply per-peer observations to hot limiters
+   (scopes with no live peer data are reset to zero so vanished peers
+   leave no phantom load), run tier maintenance (peer-triggered promotion,
+   demotion hysteresis, gossip-budget eviction, idle-scope TTL sweep),
+   then collect the hot-scope rates + tail aggregates to publish
+3. Publish the changed keys (no lock held)
 
 **Equal division PID**: each node independently computes
 `cluster_total = local + sum(peers)` and adjusts its local refill rate so the
@@ -179,9 +175,8 @@ Peer contributions are weighted by freshness: full weight up to
 `2 × sync_interval`, linear decay to zero at `stale_timeout` (default 10s,
 `NENYA_STALE_TIMEOUT_MS`), dropped past it. Age is **age-at-receipt**: the
 `GossipManager` records the local monotonic `Instant` whenever a peer's
-gossiped timestamp changes, and never compares peer wall-clock times against
-local time — so cross-node clock skew (including future-dated timestamps)
-cannot affect decay. A silent peer also stops counting toward `num_peers` at
+gossiped `nenya_v` counter changes, and never compares anything against
+another node's clock — so cross-node clock skew cannot affect decay. A silent peer also stops counting toward `num_peers` at
 `stale_timeout`, before Chitchat's failure detector evicts it. The decay and
 aggregation logic (`src/gossip/aggregate.rs`) is transport-agnostic — it
 consumes `(rate, age)` observations — so the simulator (Milestone 4) and a
@@ -225,7 +220,7 @@ bounding cost). Tradeoff: ElastiCache is cheap per-op but needs VPC + cluster
 (ops burden ≈ service mode); DynamoDB is serverless-native but pay-per-op,
 so sync intervals stretch to 2–5s.
 
-## Two-Tier Coordination for Per-User Scale — [Planned — Milestone 6]
+## Two-Tier Coordination for Per-User Scale — [Implemented — Milestone 6]
 
 Per-user distributed throttling at large cardinality (10⁵–10⁶+ users) cannot
 gossip every scope. The design exploits two facts: load balancers spread a
@@ -233,22 +228,61 @@ user's traffic roughly uniformly (so `local_rate × num_nodes` is a good local
 estimate of that user's cluster rate), and usage is heavy-tailed — only a small
 fraction of users are near their limit at any instant.
 
-- **Tail tier (default)**: local-only enforcement of the equal share
-  `limit / num_peers`; compact state (token bucket only, no engine), no gossip
-- **Hot tier**: full gossip coordination, entered when estimated cluster
-  utilization crosses `promote_utilization` (per-pattern config; shipped
-  default derived from a simulator sweep — knee of promoted-set-size vs.
-  worst-case-overage — not hand-picked); demotion below `demote_utilization`
-  with hysteresis; hard per-node budget K on gossiped scopes
-  (lowest-utilization evicted, logged — no silent truncation)
-- **Tail visibility**: one aggregate tail rate per pattern per node keeps
-  service-level totals accurate; a fixed-size mergeable count-min sketch of
-  tail rates is a candidate if per-user tail estimates prove necessary
-  (one-sided error → throttles conservatively)
-- **Error bound**: an unpromoted user can exceed their limit only via routing
-  skew or promotion lag — and skew itself triggers promotion on the hot node,
-  so exposure is transient. Bounds are quantified in the simulator
-  (Pareto-traffic and sticky-routing scenarios) and documented, not assumed.
+The policy lives in `src/gossip/tier.rs` — transport-agnostic like
+`gossip::aggregate`, compiled under both `server` and `sim` so the
+simulator, the stateright model, and production run the same code.
+
+- **Tail tier (default for distributed patterns)**: local-only enforcement
+  of the equal share `limit / (1 + live_peers)`; compact state (`TailScope`:
+  token bucket + a two-bucket sliding-window rate estimator, 48 bytes, no
+  engine), no gossip. Measured ~360 B/scope all-in at 1M scopes. Idle
+  scopes are TTL-evicted (default 60 s — behaviorally lossless once idle
+  past the estimator window, so the knob only trades recreation churn
+  against idle-set memory).
+- **Hot tier**: full `RateLimiter` + engine, gossiped exactly as every
+  scope was pre-Milestone-6. Entered when
+  `local_rate × num_nodes ≥ promote_utilization × limit` (measured over an
+  8 s estimator window — shorter windows read Poisson clumps at sparse
+  rates as sustained load and promote spuriously), or when a live peer
+  gossips the scope (all holders must publish for coordination to work;
+  gated on the demote threshold so a dying scope's lingering key cannot
+  re-promote it during staggered demotion). A promoted limiter starts at
+  its already-enforced share (`initial_refill_rate`) with the tail
+  bucket's tokens carried over, so admission is continuous across the
+  switch. Demotion: observed cluster rate (local + decayed peer sum)
+  below `demote_utilization × limit` for `demote_hold` (hysteresis).
+  All thresholds are per-pattern config with sweep-derived defaults
+  (0.5 / 0.25 / 10 s / 8 s — tables in
+  [capacity-model.md](capacity-model.md)).
+- **Gossip budget**: hard per-node cap K (default 1000) on gossiped
+  scopes; lowest-utilization hot scopes are evicted back to the tail on
+  overflow, logged at warn (no silent truncation). While at the budget, a
+  promotion admission floor (current minimum hot utilization) prevents
+  evict/promote thrash.
+- **Wire format**: one chitchat key per hot scope (`s:<scope>`, compact
+  decimal value, re-set only on change so anti-entropy ships deltas), one
+  `t:<pattern>` key per pattern for the tail aggregate, and a `nenya_v`
+  publish counter replacing the old wall-clock timestamp as the change
+  marker for age tracking. The old single-blob `GossipState` is gone.
+- **Tail visibility**: each node gossips one aggregate tail rate per
+  pattern (sum of its unpromoted scopes' accepted rates, maintained
+  incrementally on the admit path) so service-level totals stay visible.
+  A count-min sketch of per-user tail rates was evaluated against
+  simulator data and rejected: promotion + the aggregate already yield
+  zero unpromoted overage in both uniform and sticky routing, and the
+  remaining sticky mid-band under-service is an equal-division property a
+  sketch cannot address (see capacity-model.md).
+- **Error bound (measured, not assumed)**: an unpromoted user cannot
+  exceed its limit — each node caps it at `limit / n`, and routing skew
+  raises the hot node's local estimate so skew promotes *earlier*, not
+  later. Simulator scenarios (`pareto_users`, `sticky_users`,
+  `user_ramp`) assert this; the worst transient is the promotion-lag
+  window on a ramping user (~1.6–2.2 × limit for one second: the tail
+  burst allowances plus one second of refill), bounded thereafter by the
+  engine's `max_rate` (2 × limit default). The promotion/demotion state
+  machine itself is model-checked (`tests/model_checking.rs`): hysteresis
+  hold respected and no flapping under constant input, over all
+  interleavings.
 
 ## Deterministic Simulator — [Implemented, Milestone 4]
 

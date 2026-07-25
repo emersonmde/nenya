@@ -4,7 +4,7 @@ This document outlines the implementation plan for Nenya distributed rate limiti
 
 ## Current Milestone
 
-**Status**: Milestones 0-5 Complete - Ready for Milestone 6 (Per-User Scale — Two-Tier Coordination)
+**Status**: Milestones 0-6 Complete - Ready for Milestone 7 (Client SDKs & API Stabilization)
 
 **Completed**:
 - ✅ Milestone 0: Single-crate restructure, HTTP stack, distributed coordination foundation
@@ -19,8 +19,14 @@ This document outlines the implementation plan for Nenya distributed rate limiti
   three simulator-derived control fixes (adaptive-window rate estimator,
   adaptive burst allowance — which flattened the fleet-convergence law —
   and a documented negative result on gain scheduling)
+- ✅ Milestone 6: Two-tier coordination for per-user scale — compact tail
+  tier (~360 B/scope at 1M scopes) with local equal-share enforcement,
+  sweep-derived promotion/demotion policy, per-scope gossip keys with
+  compact encoding (real-UDP verified at 10k scopes), per-pattern tail
+  aggregates, idle-scope TTL eviction, and model-checked tier state
+  machine; count-min sketch evaluated and rejected from data
 
-See Milestone 6 below for next steps.
+See Milestone 7 below for next steps.
 
 ## Principles
 
@@ -520,7 +526,7 @@ cargo fmt -- --check && cargo clippy --all-targets --all-features -- -D warnings
 
 ## Milestone 6: Per-User Scale — Two-Tier Coordination
 
-- [ ] **MILESTONE COMPLETE**
+- [x] **MILESTONE COMPLETE**
 
 **Goal**: Support millions of per-user scopes per cluster. Per-user distributed
 throttling is the core value proposition — per-client/service limits can often
@@ -543,27 +549,27 @@ Two-Tier Coordination section
 
 #### 6.1 Two-Tier Enforcement
 
-- [ ] **Tail tier (default)**: local-only enforcement of the user's equal share
+- [x] **Tail tier (default)**: local-only enforcement of the user's equal share
   (`limit / num_peers`); no gossip state; compact limiter representation
   (token bucket only — full engine state allocated on promotion)
-- [ ] **Hot tier**: scopes promoted into full gossip coordination exactly as
+- [x] **Hot tier**: scopes promoted into full gossip coordination exactly as
   today
-- [ ] **Promotion**: when estimated cluster utilization crosses a threshold —
+- [x] **Promotion**: when estimated cluster utilization crosses a threshold —
   `local_rate ≥ promote_utilization × limit / num_peers`. `promote_utilization`
   is per-pattern config; the shipped default is **derived, not invented**: the
   safe value is roughly `1 − (max ramp during promotion lag + routing-estimate
   error margin)`, so run a benchmark-harness sweep across Pareto workloads and
   pick the knee of the promoted-set-size vs. worst-case-overage curve. Publish
   the curve in the docs so users tuning the knob can see the tradeoff
-- [ ] **Demotion with hysteresis**: sustained estimated utilization below
+- [x] **Demotion with hysteresis**: sustained estimated utilization below
   `demote_utilization` (per-pattern config, default derived from the same
   sweep — wide enough below promotion to prevent flapping) for M seconds
-- [ ] **Transport-agnostic sync logic**: keep promotion/aggregation/decay
+- [x] **Transport-agnostic sync logic**: keep promotion/aggregation/decay
   separable from Chitchat specifics — the same loop must later run against a
   blackboard store (see Future Work: alternative coordination transports)
-- [ ] **Per-node gossip budget**: hard cap K on gossiped scopes; evict
+- [x] **Per-node gossip budget**: hard cap K on gossiped scopes; evict
   lowest-utilization on overflow and log it (no silent truncation)
-- [ ] **Per-scope gossip keys + compact encoding**: today the whole
+- [x] **Per-scope gossip keys + compact encoding**: today the whole
   `GossipState` is one JSON blob under a single chitchat key, so any change
   retransmits everything — defeating Scuttlebutt's per-key delta sync.
   Measured baseline (Milestone 4): ~115 bytes/scope, dominated by the
@@ -580,10 +586,10 @@ Two-Tier Coordination section
 
 #### 6.2 Tail Visibility
 
-- [ ] **Per-pattern tail aggregate**: each node gossips one number per pattern
+- [x] **Per-pattern tail aggregate**: each node gossips one number per pattern
   (sum of unpromoted scope rates) so service-level/global limits still see
   total cluster volume
-- [ ] **Evaluate (don't assume) a tail sketch**: a count-min sketch of tail
+- [x] **Evaluate (don't assume) a tail sketch**: a count-min sketch of tail
   rates gossips at fixed size regardless of user count, merges by addition,
   and answers "approximate cluster rate for ANY user" with one-sided error
   (overestimates → conservative throttling). Decide from simulator data
@@ -591,19 +597,19 @@ Two-Tier Coordination section
 
 #### 6.3 Memory at Cardinality
 
-- [ ] Compact tail-scope state; measure bytes/scope (target: ~10⁶ tail scopes
+- [x] Compact tail-scope state; measure bytes/scope (target: ~10⁶ tail scopes
   in the low hundreds of MB)
-- [ ] TTL eviction of idle scopes (pulled forward from production hardening)
-- [ ] Stress benchmark: 1M+ scopes with churn
+- [x] TTL eviction of idle scopes (pulled forward from production hardening)
+- [x] Stress benchmark: 1M+ scopes with churn
 
 #### 6.4 Simulator Validation
 
-- [ ] New scenarios: Pareto-distributed user traffic (10⁵–10⁶ users), a user
+- [x] New scenarios: Pareto-distributed user traffic (10⁵–10⁶ users), a user
   ramping tail → hot → tail, sticky-routing skew (session affinity breaks the
   uniform-routing estimate — quantify worst-case overage)
-- [ ] Assertions: no unpromoted user exceeds their limit beyond the documented
+- [x] Assertions: no unpromoted user exceeds their limit beyond the documented
   bound; promoted set size ≪ user count; gossip payload bounded by K
-- [ ] Model/property checks: promotion/demotion state machine — no flapping
+- [x] Model/property checks: promotion/demotion state machine — no flapping
   under hysteresis, no scope counted in both the tail aggregate and the hot
   tier (double count)
 
@@ -613,14 +619,56 @@ propagation). Heavy routing skew itself triggers promotion — the hot node sees
 the elevated local rate — so the exposure is transient. Quantify both in the
 simulator and publish the numbers.
 
+**Implementation notes** (measurements and derivations in
+[docs/capacity-model.md](capacity-model.md); architecture in
+[docs/architecture.md](architecture.md)):
+- `src/gossip/tier.rs`: transport-agnostic policy (compiled under `server`
+  and `sim`) — `TailScope` (48 B: token bucket + two-bucket rate
+  estimator), promotion test, `DemotionTracker` hysteresis, budget
+  eviction. Server (`RateLimitManager` tiered `ScopeEntry`) and simulator
+  run the same code; the stateright model checks the same functions.
+- **Derived defaults** (`tier_threshold_sweep`, seed 42):
+  `promote_utilization = 0.5`, `demote_utilization = 0.25` (highest
+  flap-free value), `demote_hold = 10 s`, `estimator_window = 8 s` (first
+  window where sparse-rate Poisson clumping stops promoting sub-threshold
+  users — a 1 s window promoted 78 scopes per 100k where ~10 were real).
+  Key negative result: the anticipated promoted-set-size vs. worst-case-
+  overage knee does not exist — unpromoted overage is structurally zero at
+  every threshold (per-node cap `limit/n`; skew promotes earlier, not
+  later), so the threshold trades hot-set size against coordination
+  headroom only.
+- **Wire**: per-scope chitchat keys (`s:<scope>`, ~21 B payload vs. ~115 B
+  in the old monolithic JSON blob), `t:<pattern>` tail aggregates,
+  `nenya_v` counter replacing the wall-clock change marker; change-
+  suppressed publishes so anti-entropy ships deltas; `GossipState`
+  deleted. Real 2-node UDP at 10k scopes: incremental propagation keeps
+  pace; found and documented a chitchat/macOS datagram-size stall
+  (hardcoded 65 507 B deltas vs. `net.inet.udp.maxdgram=9216`).
+- **Peer-triggered promotion** is gated on the demotion threshold —
+  without the gate, staggered demotion flaps (a dying scope's lingering
+  peer key re-promotes it around the ring).
+- **Memory**: 1M tail scopes = 356 B/scope RSS, 244 ns/create; TTL
+  eviction (default 60 s, lossless past the estimator window) bounds the
+  resident set by the active window (2M-user churn test).
+- **Promotion continuity**: `RateLimiterBuilder::initial_refill_rate` —
+  promoted limiters start at the enforced share with tail tokens carried
+  over; worst ramp transient measured 1.6–2.2 × limit for one second.
+- Count-min sketch: **rejected** — zero unpromoted overage under uniform
+  and sticky routing leaves it nothing to protect; sticky mid-band
+  under-service (0.40 worst served/offered) is equal-division behavior,
+  addressable by demand-weighted engines, not a sketch.
+
 **Deliverable**: millions of per-user scopes with bounded gossip payload,
 bounded memory, and a documented worst-case overage bound
 
-**Verification**:
+**Verification** (all run at completion):
 ```bash
-cargo test --all-features
-cargo run --example cluster_sim -- --scenario pareto_users --seed 42
-# 1M-scope stress results recorded; promoted-set and payload assertions pass
+cargo test --all-features                                    # 20 suites green
+cargo test --all-features --release -- --ignored             # matrix, sweeps, stress
+cargo test --all-features --release --test scale_stress -- --ignored --nocapture
+cargo test --all-features --test gossip_wire -- --ignored    # real 2-node UDP
+cargo run --features sim --example cluster_sim -- --scenario pareto_users --seed 42
+cargo fmt -- --check && cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 **Commit Message**: `Milestone 6: Two-tier coordination for per-user scale`
