@@ -16,9 +16,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
+use crate::engine::{BayesianEngine, EngineKind, HybridEngine, PeerRate, PidEngine};
 use crate::gossip::aggregate::{aggregate_peer_rates, PeerObservation};
 use crate::pid_controller::PIDControllerBuilder;
 use crate::{RateLimiter, RateLimiterBuilder};
+
+pub use crate::engine::BayesianParams;
 
 use super::rng::SplitMix64;
 use super::workload::{ArrivalProcess, Workload};
@@ -72,6 +75,15 @@ pub struct SimConfig {
     /// (`None` = unbounded accumulation)
     pub error_limit_frac: Option<f64>,
 
+    /// Control engine to run on every node (explicit config, as in
+    /// production)
+    pub engine: EngineKind,
+
+    /// Estimator parameters for the bayesian/hybrid engines (the
+    /// `stale_timeout` field is overridden with this config's
+    /// `stale_timeout` at limiter construction so the two horizons agree)
+    pub bayesian: BayesianParams,
+
     /// Simulation tick; all activity is quantized to this
     pub tick: Duration,
 
@@ -98,6 +110,8 @@ impl Default for SimConfig {
             // Production default (see ScopePattern::get_error_limit);
             // derived from the Milestone 4 scenario-matrix sweep
             error_limit_frac: Some(0.2),
+            engine: EngineKind::Pid,
+            bayesian: BayesianParams::default(),
             tick: Duration::from_millis(10),
             gossip: GossipModel::default(),
             initially_down: Vec::new(),
@@ -470,13 +484,26 @@ impl SimCluster {
             self.cfg.stale_timeout,
         );
 
-        // Step 4: apply external rates + live peer count in one pass;
-        // scopes absent from the aggregate are explicitly zeroed
+        // Step 4: apply external rates, live peer count, and per-peer
+        // observations in one pass; scopes absent from the aggregate are
+        // explicitly zeroed. The aggregated values remain the transport's
+        // reporting metrics; the engine consumes the raw observations.
         let node = &mut self.nodes[i];
         for (scope, limiter) in node.limiters.iter_mut() {
             let external = aggregated.scope_rates.get(scope).copied().unwrap_or(0.0);
             limiter.set_external_accepted_request_rate(external);
             limiter.set_num_peers(aggregated.live_peers);
+            let obs: Vec<PeerRate<f64>> = observations
+                .iter()
+                .filter_map(|o| {
+                    o.scope_rates.get(scope).map(|rate| PeerRate {
+                        id: o.node_id.clone(),
+                        rate: *rate,
+                        age: o.age,
+                    })
+                })
+                .collect();
+            limiter.set_peer_observations(obs);
         }
     }
 }
@@ -494,14 +521,26 @@ fn make_limiter(cfg: &SimConfig, now: Instant) -> RateLimiter<f64> {
     }
     let pid = pid_builder.build();
 
-    RateLimiterBuilder::new(cfg.cluster_target)
+    let estimator_params = BayesianParams {
+        stale_timeout: cfg.stale_timeout,
+        ..cfg.bayesian
+    };
+
+    let builder = RateLimiterBuilder::new(cfg.cluster_target)
         .cluster_target(cfg.cluster_target)
         .min_rate(cfg.min_rate)
         .max_rate(cfg.max_rate)
-        .pid_controller(pid)
         .update_interval(cfg.pid_update_interval)
-        .initial_timestamp(now)
-        .build()
+        .initial_timestamp(now);
+
+    match cfg.engine {
+        EngineKind::Pid => {
+            builder.engine(PidEngine::new(pid).with_staleness(cfg.sync_interval, cfg.stale_timeout))
+        }
+        EngineKind::Bayesian => builder.engine(BayesianEngine::new(estimator_params)),
+        EngineKind::Hybrid => builder.engine(HybridEngine::new(pid, estimator_params)),
+    }
+    .build()
 }
 
 #[cfg(test)]

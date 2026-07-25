@@ -47,9 +47,11 @@ use num_traits::{Float, FromPrimitive, Signed};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::engine::{ControlInput, PeerRate, PidEngine, RateController};
 use crate::pid_controller::PIDController;
 
 // ===== Public Library API =====
+pub mod engine;
 pub mod pid_controller;
 
 // ===== Server modules (binary only, not part of public API) =====
@@ -98,8 +100,8 @@ pub struct RateLimiter<T> {
     accepted_request_timestamps: VecDeque<Instant>,
     local_accepted_request_rate: T,
 
-    // PID Control state (adaptive coordination)
-    pid_controller: PIDController<T>,
+    // Control engine (adaptive coordination; PID by default)
+    engine: Box<dyn RateController<T>>,
     target_rate: T,            // Base rate for this node (single-node mode)
     cluster_target: Option<T>, // Cluster-wide target (distributed mode)
     min_rate: T,
@@ -110,9 +112,17 @@ pub struct RateLimiter<T> {
     // Distributed coordination
     external_accepted_request_rate: T,
     num_peers: usize, // Number of peer nodes (0 = single-node mode)
+
+    /// Per-peer `(rate, age)` observations for this scope, consumed by the
+    /// control engine. When empty, the legacy `set_num_peers` /
+    /// `set_external_accepted_request_rate` values are synthesized into
+    /// observations so existing callers keep working.
+    peer_observations: Vec<PeerRate<T>>,
 }
 
-impl<T: Float + Signed + FromPrimitive + Copy> RateLimiter<T> {
+impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 'static>
+    RateLimiter<T>
+{
     /// Creates a new `RateLimiter` instance.
     ///
     /// For single-node mode, use `target_rate` as the local rate target.
@@ -137,8 +147,8 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiter<T> {
             accepted_request_timestamps: VecDeque::new(),
             local_accepted_request_rate: T::zero(),
 
-            // PID control
-            pid_controller,
+            // Control engine: the provided PID behind the trait
+            engine: Box::new(PidEngine::new(pid_controller)),
             target_rate,
             cluster_target: None, // Single-node by default
             min_rate,
@@ -149,6 +159,7 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiter<T> {
             // Distributed coordination
             external_accepted_request_rate: T::zero(),
             num_peers: 0, // Single-node by default
+            peer_observations: Vec::new(),
         }
     }
 
@@ -213,9 +224,9 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiter<T> {
         // 1. Refill tokens based on elapsed time
         self.refill_tokens(now);
 
-        // 2. Periodically update PID control (regardless of accept/throttle decision)
+        // 2. Periodically update the control engine (regardless of accept/throttle decision)
         if now.duration_since(self.last_updated) >= self.update_interval {
-            self.update_pid_control(now);
+            self.update_control(now);
         }
 
         // 3. Make throttle decision (token bucket)
@@ -246,64 +257,58 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiter<T> {
         self.trim_accepted_timestamps(now);
         self.calculate_local_accepted_rate(now);
 
-        // Update PID controller periodically
+        // Update the control engine periodically
         if now.duration_since(self.last_updated) >= self.update_interval {
-            self.update_pid_control(now);
+            self.update_control(now);
         }
     }
 
-    /// Updates PID control by measuring rate and adjusting refill_rate.
+    /// Runs one control-engine update: measures the local rate, hands the
+    /// engine the current observations, and applies the returned refill rate.
     ///
-    /// # Coordination Modes
+    /// The engine owns the meaningful clamping (in distributed mode the
+    /// bounds scale with the live node count, which only the engine knows);
+    /// this caller just sanitizes the output to a non-negative finite value.
     ///
-    /// **Single-Node Mode** (`cluster_target = None`):
-    /// 1. Measures local accepted rate
-    /// 2. PID tracks toward `target_rate`
-    /// 3. Adjusts refill_rate based on local performance
-    ///
-    /// **Distributed Mode** (`cluster_target = Some(...)`):
-    /// 1. Measures cluster total rate (local + external from gossip)
-    /// 2. Computes cluster error: `cluster_target - cluster_total`
-    /// 3. Divides error equally: `my_error_share = cluster_error / num_nodes`
-    /// 4. PID adjusts refill_rate based on proportional share
-    /// 5. All nodes converge to distribute cluster target fairly
-    fn update_pid_control(&mut self, now: Instant) {
+    /// When no per-peer observations were provided (legacy callers using
+    /// `set_num_peers` + `set_external_accepted_request_rate`), equivalent
+    /// observations are synthesized: `num_peers` fresh peers splitting the
+    /// external rate evenly.
+    fn update_control(&mut self, now: Instant) {
         // Measure local accepted rate (sliding window)
         self.calculate_local_accepted_rate(now);
 
-        // Determine target and signal based on coordination mode
-        let (setpoint, signal) = if let Some(cluster_target) = self.cluster_target {
-            // Distributed mode: Each node tracks toward its fair share
-            // Target: my fair share of cluster target
-            // Signal: my actual local rate
-            // Each node independently converges to cluster_target / num_nodes
-            let num_nodes = T::from_usize(1 + self.num_peers).unwrap();
-            let my_target = cluster_target / num_nodes;
-            let my_signal = self.local_accepted_request_rate;
-
-            (my_target, my_signal)
+        let synthesized: Vec<PeerRate<T>>;
+        let peers: &[PeerRate<T>] = if !self.peer_observations.is_empty() {
+            &self.peer_observations
+        } else if self.num_peers > 0 {
+            let per_peer =
+                self.external_accepted_request_rate / T::from_usize(self.num_peers).unwrap();
+            synthesized = (0..self.num_peers)
+                .map(|i| PeerRate {
+                    id: i.to_string(),
+                    rate: per_peer,
+                    age: Duration::ZERO,
+                })
+                .collect();
+            &synthesized
         } else {
-            // Single-node mode: Track local target
-            (self.target_rate, self.local_accepted_request_rate)
+            &[]
         };
 
-        // Update PID setpoint and compute correction
-        self.pid_controller.set_setpoint(setpoint);
-        let correction = self.pid_controller.compute_correction(signal);
-
-        // Adjust refill_rate (clamped to bounds)
-        // In distributed mode, scale baseline and bounds by num_nodes
-        let (baseline, min_bound, max_bound) = if self.cluster_target.is_some() {
-            let num_nodes = T::from_usize(1 + self.num_peers).unwrap();
-            (
-                setpoint,
-                self.min_rate / num_nodes,
-                self.max_rate / num_nodes,
-            )
-        } else {
-            (self.target_rate, self.min_rate, self.max_rate)
+        let input = ControlInput {
+            local_rate: self.local_accepted_request_rate,
+            peers,
+            target_rate: self.target_rate,
+            cluster_target: self.cluster_target,
+            min_rate: self.min_rate,
+            max_rate: self.max_rate,
+            dt: now.duration_since(self.last_updated),
         };
-        self.refill_rate = num_traits::clamp(baseline + correction, min_bound, max_bound);
+        let refill = self.engine.update(&input);
+        if refill.is_finite() {
+            self.refill_rate = refill.max(T::zero());
+        }
 
         self.last_updated = now;
     }
@@ -338,9 +343,10 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiter<T> {
         }
     }
 
-    /// Returns the current setpoint of the PID controller.
+    /// Returns the control engine's current effective local target (its
+    /// share of the cluster target in distributed mode).
     pub fn setpoint(&self) -> T {
-        self.pid_controller.setpoint()
+        self.engine.setpoint()
     }
 
     /// Returns the current target rate of the rate limiter.
@@ -399,6 +405,25 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiter<T> {
         self.num_peers
     }
 
+    /// Sets the per-peer `(rate, age)` observations for this scope.
+    ///
+    /// This is the full-fidelity coordination input: the control engine
+    /// consumes the raw observations at its next update (staleness
+    /// weighting, liveness, and share division are engine concerns). The
+    /// transport should refresh these every sync interval. When set,
+    /// these take precedence over the aggregated
+    /// [`set_external_accepted_request_rate`](Self::set_external_accepted_request_rate) /
+    /// [`set_num_peers`](Self::set_num_peers) values, which remain useful
+    /// as reporting metrics and as a simpler legacy input path.
+    pub fn set_peer_observations(&mut self, observations: Vec<PeerRate<T>>) {
+        self.peer_observations = observations;
+    }
+
+    /// Returns the current per-peer observations.
+    pub fn peer_observations(&self) -> &[PeerRate<T>] {
+        &self.peer_observations
+    }
+
     /// Returns the cluster target rate (if in distributed mode).
     pub fn cluster_target(&self) -> Option<T> {
         self.cluster_target
@@ -420,13 +445,16 @@ pub struct RateLimiterBuilder<T> {
     max_rate: T,
     bucket_capacity: Option<T>,
     pid_controller: Option<PIDController<T>>,
+    engine: Option<Box<dyn RateController<T>>>,
     update_interval: Duration,
     external_accepted_request_rate: T,
     num_peers: usize,
     initial_timestamp: Option<Instant>,
 }
 
-impl<T: Float + Signed + FromPrimitive + Copy> RateLimiterBuilder<T> {
+impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 'static>
+    RateLimiterBuilder<T>
+{
     /// Creates a new `RateLimiterBuilder` with default values.
     ///
     /// By default, creates a single-node rate limiter. Use `cluster_target()` for distributed mode.
@@ -438,6 +466,7 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiterBuilder<T> {
             max_rate: target_rate,
             bucket_capacity: None,
             pid_controller: None,
+            engine: None,
             update_interval: Duration::from_secs(1),
             external_accepted_request_rate: T::zero(),
             num_peers: 0,
@@ -476,9 +505,18 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiterBuilder<T> {
         self
     }
 
-    /// Sets the PID controller for the rate limiter.
+    /// Sets the PID controller for the rate limiter (shorthand for
+    /// `engine(PidEngine::new(pid))` with default staleness parameters).
     pub fn pid_controller(mut self, pid_controller: PIDController<T>) -> Self {
         self.pid_controller = Some(pid_controller);
+        self
+    }
+
+    /// Sets the control engine explicitly (PID, Bayesian, hybrid, or a
+    /// custom [`RateController`] implementation). Takes precedence over
+    /// [`pid_controller`](Self::pid_controller).
+    pub fn engine(mut self, engine: impl RateController<T> + 'static) -> Self {
+        self.engine = Some(Box::new(engine));
         self
     }
 
@@ -559,9 +597,18 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiterBuilder<T> {
 
         // For distributed mode with PID, setpoint will be adjusted dynamically per update
         let initial_setpoint = if self.cluster_target.is_some() {
-            T::zero() // Will be set in update_pid_control()
+            T::zero() // Will be set on the first engine update
         } else {
             self.target_rate
+        };
+
+        // Engine precedence: explicit engine > provided PID > static PID
+        let engine: Box<dyn RateController<T>> = match (self.engine, self.pid_controller) {
+            (Some(engine), _) => engine,
+            (None, Some(pid)) => Box::new(PidEngine::new(pid)),
+            (None, None) => Box::new(PidEngine::new(PIDController::new_static_controller(
+                initial_setpoint,
+            ))),
         };
 
         RateLimiter {
@@ -575,10 +622,8 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiterBuilder<T> {
             accepted_request_timestamps: VecDeque::new(),
             local_accepted_request_rate: T::zero(),
 
-            // PID control
-            pid_controller: self
-                .pid_controller
-                .unwrap_or_else(|| PIDController::new_static_controller(initial_setpoint)),
+            // Control engine
+            engine,
             target_rate: self.target_rate,
             cluster_target: self.cluster_target,
             min_rate: self.min_rate,
@@ -589,6 +634,7 @@ impl<T: Float + Signed + FromPrimitive + Copy> RateLimiterBuilder<T> {
             // Distributed coordination
             external_accepted_request_rate: self.external_accepted_request_rate,
             num_peers: self.num_peers,
+            peer_observations: Vec::new(),
         }
     }
 }
@@ -602,7 +648,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     /// Utility function to create a RateLimiter with defaults
-    fn create_rate_limiter<T: Float + Signed + FromPrimitive + Copy>(
+    fn create_rate_limiter<
+        T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 'static,
+    >(
         target_rate: T,
         min_rate: T,
         max_rate: T,
@@ -1267,8 +1315,8 @@ mod tests {
         assert_eq!(rate_limiter.cluster_target(), None);
         assert_eq!(rate_limiter.num_peers(), 0);
 
-        // PID setpoint should be target_rate in single-node mode
-        assert_eq!(rate_limiter.pid_controller.setpoint(), 100.0);
+        // Engine setpoint should be target_rate in single-node mode
+        assert_eq!(rate_limiter.setpoint(), 100.0);
 
         // External rates can be set but are used differently (no division by num_nodes)
         rate_limiter.set_external_accepted_request_rate(50.0);

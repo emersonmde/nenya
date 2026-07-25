@@ -2,10 +2,11 @@
 //!
 //! Manages multiple rate limiters with pattern-based configuration and auto-creation.
 
+use crate::engine::{BayesianEngine, BayesianParams, EngineKind, HybridEngine, PidEngine};
 use crate::pid_controller::PIDControllerBuilder;
 use crate::{RateLimiter, RateLimiterBuilder};
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "server")]
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,20 @@ pub struct ScopePattern {
 
     /// Whether this is a distributed rate limit (cluster-wide target)
     pub distributed: bool,
+
+    /// Control engine for scopes matching this pattern. Always explicit
+    /// config (`pid` | `bayesian` | `hybrid`); never selected at runtime.
+    #[serde(default)]
+    pub engine: EngineKind,
+
+    /// Estimator process noise `q` (rps²/s) for bayesian/hybrid
+    pub process_noise: Option<f64>,
+
+    /// Estimator measurement noise `r` (rps²) for bayesian/hybrid
+    pub measurement_noise: Option<f64>,
+
+    /// Admission confidence multiplier `z` for the bayesian engine
+    pub confidence_z: Option<f64>,
 }
 
 #[cfg(feature = "server")]
@@ -57,6 +72,22 @@ impl ScopePattern {
             kd: None,
             error_limit_frac: None,
             distributed: false,
+            engine: EngineKind::Pid,
+            process_noise: None,
+            measurement_noise: None,
+            confidence_z: None,
+        }
+    }
+
+    /// Estimator parameters for the bayesian/hybrid engines, with the
+    /// membership horizon aligned to the transport's stale timeout.
+    fn estimator_params(&self, stale_timeout: Duration) -> BayesianParams {
+        let defaults = BayesianParams::default();
+        BayesianParams {
+            process_noise: self.process_noise.unwrap_or(defaults.process_noise),
+            measurement_noise: self.measurement_noise.unwrap_or(defaults.measurement_noise),
+            confidence_z: self.confidence_z.unwrap_or(defaults.confidence_z),
+            stale_timeout,
         }
     }
 
@@ -182,6 +213,12 @@ pub struct RateLimitManager {
     default_ki: f64,
     #[allow(dead_code)]
     default_kd: f64,
+
+    /// Gossip timing used to parameterize engine staleness/liveness;
+    /// defaults to the production defaults, overridden from `Config` at
+    /// startup via `set_gossip_timing`
+    sync_interval: Duration,
+    stale_timeout: Duration,
 }
 
 #[cfg(feature = "server")]
@@ -200,7 +237,17 @@ impl RateLimitManager {
             default_kp,
             default_ki,
             default_kd,
+            // Production defaults (Config::from_env); see set_gossip_timing
+            sync_interval: Duration::from_millis(500),
+            stale_timeout: Duration::from_secs(10),
         }
+    }
+
+    /// Align engine staleness/liveness horizons with the configured gossip
+    /// timing. Call once at startup, before any scopes are created.
+    pub fn set_gossip_timing(&mut self, sync_interval: Duration, stale_timeout: Duration) {
+        self.sync_interval = sync_interval;
+        self.stale_timeout = stale_timeout;
     }
 
     /// Add a pattern configuration
@@ -268,8 +315,19 @@ impl RateLimitManager {
 
         let mut builder = RateLimiterBuilder::new(pattern.target_rate)
             .min_rate(pattern.get_min_rate())
-            .max_rate(pattern.get_max_rate())
-            .pid_controller(pid);
+            .max_rate(pattern.get_max_rate());
+
+        builder = match pattern.engine {
+            EngineKind::Pid => builder
+                .engine(PidEngine::new(pid).with_staleness(self.sync_interval, self.stale_timeout)),
+            EngineKind::Bayesian => builder.engine(BayesianEngine::new(
+                pattern.estimator_params(self.stale_timeout),
+            )),
+            EngineKind::Hybrid => builder.engine(HybridEngine::new(
+                pid,
+                pattern.estimator_params(self.stale_timeout),
+            )),
+        };
 
         // If distributed mode, set cluster target
         if pattern.distributed {
@@ -389,6 +447,10 @@ mod tests {
             kd: None,
             error_limit_frac: None,
             distributed: false,
+            engine: EngineKind::Pid,
+            process_noise: None,
+            measurement_noise: None,
+            confidence_z: None,
         };
 
         assert_eq!(pattern.matches("api#premium"), PatternMatch::Exact);
@@ -409,6 +471,10 @@ mod tests {
             kd: None,
             error_limit_frac: None,
             distributed: false,
+            engine: EngineKind::Pid,
+            process_noise: None,
+            measurement_noise: None,
+            confidence_z: None,
         };
 
         assert_eq!(pattern.matches("api#premium"), PatternMatch::Wildcard);
@@ -469,6 +535,10 @@ mod tests {
             kd: None,
             error_limit_frac: None,
             distributed: false,
+            engine: EngineKind::Pid,
+            process_noise: None,
+            measurement_noise: None,
+            confidence_z: None,
         });
 
         manager.add_pattern(ScopePattern {
@@ -481,6 +551,10 @@ mod tests {
             kd: None,
             error_limit_frac: None,
             distributed: false,
+            engine: EngineKind::Pid,
+            process_noise: None,
+            measurement_noise: None,
+            confidence_z: None,
         });
 
         // Exact match should take priority
@@ -514,6 +588,10 @@ mod tests {
             kd: None,
             error_limit_frac: None,
             distributed: false,
+            engine: EngineKind::Pid,
+            process_noise: None,
+            measurement_noise: None,
+            confidence_z: None,
         });
 
         manager.add_pattern(ScopePattern {
@@ -526,6 +604,10 @@ mod tests {
             kd: None,
             error_limit_frac: None,
             distributed: false,
+            engine: EngineKind::Pid,
+            process_noise: None,
+            measurement_noise: None,
+            confidence_z: None,
         });
 
         // Most specific wildcard should match

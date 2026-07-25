@@ -12,6 +12,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// Staleness weighting now lives in the always-compiled engine module (the
+/// PID engine's liveness test uses the same curve); re-exported here for
+/// existing callers.
+pub use crate::engine::staleness_weight;
+
 /// A single peer's most recent per-scope rates, with the locally measured age
 /// of that observation.
 #[derive(Debug, Clone)]
@@ -35,38 +40,6 @@ pub struct AggregatedRates {
 
     /// Number of peers considered live (staleness weight > 0)
     pub live_peers: usize,
-}
-
-/// Compute the staleness weight for an observation of the given age.
-///
-/// - Full weight (1.0) for ages up to `2 × sync_interval` — a healthy peer
-///   publishes every `sync_interval`, so anything fresher than two intervals
-///   is just normal propagation delay, not staleness
-/// - Linear decay from 1.0 to 0.0 between `2 × sync_interval` and
-///   `stale_timeout`
-/// - Zero at and beyond `stale_timeout` — the peer is presumed dead or
-///   partitioned and its last known rate is phantom load
-///
-/// Degenerate configurations (`stale_timeout <= 2 × sync_interval`) collapse
-/// to a hard cutoff at `stale_timeout`.
-pub fn staleness_weight(age: Duration, sync_interval: Duration, stale_timeout: Duration) -> f64 {
-    if age >= stale_timeout {
-        return 0.0;
-    }
-
-    let full_weight_window = 2 * sync_interval;
-    if age <= full_weight_window {
-        return 1.0;
-    }
-
-    let decay_span = stale_timeout.saturating_sub(full_weight_window);
-    if decay_span.is_zero() {
-        // Degenerate config: no decay span, hard cutoff at stale_timeout
-        return 1.0;
-    }
-
-    let into_decay = age - full_weight_window;
-    1.0 - into_decay.as_secs_f64() / decay_span.as_secs_f64()
 }
 
 /// Aggregate peer observations into per-scope external rates, weighting each

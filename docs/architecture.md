@@ -298,40 +298,66 @@ heal. Production scope limiters now ship with an anti-windup clamp
 derived from a simulator sweep of {0.1, 0.2, 0.5}: post-heal re-convergence
 dropped to ~5s with marginal trade-offs between the three values.
 
-## Control Engines — [Planned — Milestone 5]
+## Control Engines — [Implemented — Milestone 5]
 
-The controller becomes swappable behind a narrow trait:
+The controller is swappable behind a narrow trait (`src/engine/`, library
+core, no server deps):
 
 ```rust
-trait RateController {
-    /// observations: per-peer (accepted_rate, age) — NOT a pre-aggregated sum.
-    /// Aggregation strategy is part of what engines compete on.
-    fn update(&mut self, local_rate: f64, observations: &[(f64, Duration)],
-              num_peers: usize, cluster_target: f64, dt: Duration) -> f64;
+pub trait RateController<T>: Debug + Send + Sync {
+    /// input: local rate, per-peer PeerRate { id, rate, age } observations
+    /// (NOT a pre-aggregated sum — aggregation strategy is part of what
+    /// engines compete on), single-node target, optional cluster target,
+    /// configured min/max bounds, and elapsed time. Returns the new local
+    /// token refill rate; engines own the meaningful clamping (distributed
+    /// bounds scale with the live node count, which only the engine knows),
+    /// the caller sanitizes to non-negative finite.
+    fn update(&mut self, input: &ControlInput<'_, T>) -> T;
+    fn setpoint(&self) -> T;
 }
 ```
 
-Three candidate engines, all first-class:
+The transport feeds limiters raw per-peer observations
+(`RateLimiter::set_peer_observations`); the aggregated external rate and
+live-peer count remain as reporting metrics and as a legacy input path
+(synthesized into observations when no real ones are provided). Peer ids are
+stable opaque strings so per-peer estimators can key on them.
 
-- **PidEngine**: the existing controller ported unchanged
+Three engines, all first-class:
+
+- **PidEngine**: the original equal-division controller ported unchanged
+  (verified byte-identical against the Milestone 4 scenario matrix at seed
+  42). Peer observations contribute liveness (via the shared
+  `staleness_weight` curve, which moved into the engine module) but no
+  feedback term.
 - **BayesianEngine** (estimate-and-set): each peer's true rate is a latent
   variable observed through delayed gossip samples. Scalar Kalman filter per
-  (peer, scope); process noise grows variance between samples, so
-  **staleness = uncertainty** (subsuming the Milestone 3 decay heuristic).
-  Admission is computed against an upper confidence bound of the cluster-rate
-  estimate: automatically conservative during partitions/churn, aggressive when
-  the estimate is tight.
-- **HybridEngine**: Kalman-filtered estimate feeding PID. The separation
-  principle would make this provably optimal for a linear-Gaussian, delay-free
+  (peer, scope) with random-walk dynamics (Welch & Bishop TR 95-041);
+  process noise grows variance between samples, so **staleness =
+  uncertainty** (subsuming the Milestone 3 decay heuristic — a stale peer's
+  mean persists with widening error bars; a hard membership drop at
+  `stale_timeout` frees a dead peer's headroom). Admission takes the
+  headroom under an upper confidence bound of the peer-total estimate
+  (`refill = target − (Σmean + z·σ)`): automatically conservative during
+  partitions/churn, aggressive when the estimate is tight, and implicitly
+  demand-weighted — cold nodes' low observed rates leave headroom hot nodes
+  claim (see the skew scenario results).
+- **HybridEngine**: the same Kalman filter bank feeding a *cluster-level*
+  PID — signal is `local + Σ peer means`, setpoint the cluster target, and
+  each node applies `correction / n` around its `target / n` share, making
+  aggregate loop gain independent of fleet size. The separation principle
+  would make this provably optimal for a linear-Gaussian, delay-free
   plant — assumptions gossip coordination violates (variable delay, clamping
   nonlinearity, non-Gaussian noise, churn), and LQG-style designs carry no
   guaranteed stability margins even when they hold. So it is a benchmark
   candidate like the others, not a presumed winner.
 
-The engine is an **explicit config option** (`engine = "pid" | "bayesian" |
-"hybrid"` per scope) — never selected at runtime. The Milestone 4 benchmark
-matrix (convergence, overshoot, oscillation, partition behavior, parameter
-sensitivity) decides only which value ships as the documented default,
+The engine is an **explicit config option** — never selected at runtime:
+`NENYA_DEFAULT_ENGINE` (and per-pattern `ScopePattern::engine` +
+estimator-parameter fields, which the planned TOML `[[rate_limits]]` tables
+will expose) in the server, `SimConfig::engine` / `cluster_sim --engine` in
+the simulator, `RateLimiterBuilder::engine(...)` in the library. The
+benchmark matrix decides only which value ships as the documented default,
 recorded in `docs/engine-comparison.md`. Engines run in the sync loop (per
 second per scope), never on the per-request hot path.
 

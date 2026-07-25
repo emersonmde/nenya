@@ -14,6 +14,11 @@
 //! - `NENYA_SYNC_INTERVAL_MS`: Gossip sync loop interval in ms (default: 500)
 //! - `NENYA_STALE_TIMEOUT_MS`: Age at which a silent peer's rate contribution
 //!   decays to zero and it stops counting as live (default: 10000)
+//! - `NENYA_DEFAULT_ENGINE`: Control engine: `pid` | `bayesian` | `hybrid`
+//!   (default: pid). Always explicit — never selected at runtime.
+//! - `NENYA_BAYESIAN_PROCESS_NOISE`: Estimator process noise `q` (rps²/s)
+//! - `NENYA_BAYESIAN_MEASUREMENT_NOISE`: Estimator measurement noise `r` (rps²)
+//! - `NENYA_BAYESIAN_CONFIDENCE_Z`: Admission confidence multiplier `z`
 
 use std::env;
 use std::net::SocketAddr;
@@ -94,6 +99,18 @@ pub struct Config {
 
     /// Age past which a silent peer's gossiped rate is fully discounted
     pub stale_timeout: Duration,
+
+    /// Control engine for the default scope pattern
+    pub default_engine: crate::engine::EngineKind,
+
+    /// Estimator process noise `q` override (bayesian/hybrid engines)
+    pub bayesian_process_noise: Option<f64>,
+
+    /// Estimator measurement noise `r` override (bayesian/hybrid engines)
+    pub bayesian_measurement_noise: Option<f64>,
+
+    /// Admission confidence multiplier `z` override (bayesian engine)
+    pub bayesian_confidence_z: Option<f64>,
 }
 
 #[cfg(feature = "server")]
@@ -229,6 +246,43 @@ impl Config {
             ));
         }
 
+        let default_engine = match env::var("NENYA_DEFAULT_ENGINE") {
+            Ok(s) => s.parse().map_err(|e: String| {
+                ConfigError::InvalidValue("NENYA_DEFAULT_ENGINE".to_string(), e)
+            })?,
+            Err(_) => crate::engine::EngineKind::Pid,
+        };
+
+        let parse_positive = |name: &str| -> Result<Option<f64>, ConfigError> {
+            match env::var(name) {
+                Ok(s) => {
+                    let v: f64 = s.parse().map_err(|_| {
+                        ConfigError::InvalidValue(name.to_string(), "not a number".to_string())
+                    })?;
+                    if v <= 0.0 {
+                        return Err(ConfigError::InvalidValue(
+                            name.to_string(),
+                            "must be positive".to_string(),
+                        ));
+                    }
+                    Ok(Some(v))
+                }
+                Err(_) => Ok(None),
+            }
+        };
+        let bayesian_process_noise = parse_positive("NENYA_BAYESIAN_PROCESS_NOISE")?;
+        let bayesian_measurement_noise = parse_positive("NENYA_BAYESIAN_MEASUREMENT_NOISE")?;
+        // z = 0 (admit against the raw mean) is legitimate
+        let bayesian_confidence_z = match env::var("NENYA_BAYESIAN_CONFIDENCE_Z") {
+            Ok(s) => Some(s.parse::<f64>().map_err(|_| {
+                ConfigError::InvalidValue(
+                    "NENYA_BAYESIAN_CONFIDENCE_Z".to_string(),
+                    "not a number".to_string(),
+                )
+            })?),
+            Err(_) => None,
+        };
+
         Ok(Config {
             cluster_secret,
             listen_addr,
@@ -244,6 +298,10 @@ impl Config {
             default_kd,
             sync_interval: Duration::from_millis(sync_interval_ms),
             stale_timeout: Duration::from_millis(stale_timeout_ms),
+            default_engine,
+            bayesian_process_noise,
+            bayesian_measurement_noise,
+            bayesian_confidence_z,
         })
     }
 
@@ -269,6 +327,10 @@ impl Config {
             default_kd: 0.08,
             sync_interval: Duration::from_millis(500),
             stale_timeout: Duration::from_secs(10),
+            default_engine: crate::engine::EngineKind::Pid,
+            bayesian_process_noise: None,
+            bayesian_measurement_noise: None,
+            bayesian_confidence_z: None,
         }
     }
 }
@@ -294,6 +356,31 @@ mod tests {
         env::remove_var("NENYA_DEFAULT_KD");
         env::remove_var("NENYA_SYNC_INTERVAL_MS");
         env::remove_var("NENYA_STALE_TIMEOUT_MS");
+        env::remove_var("NENYA_DEFAULT_ENGINE");
+        env::remove_var("NENYA_BAYESIAN_PROCESS_NOISE");
+        env::remove_var("NENYA_BAYESIAN_MEASUREMENT_NOISE");
+        env::remove_var("NENYA_BAYESIAN_CONFIDENCE_Z");
+    }
+
+    #[test]
+    #[serial]
+    fn test_engine_selection() {
+        clean_env();
+        env::set_var("NENYA_CLUSTER_SECRET", "test");
+        assert_eq!(
+            Config::from_env().unwrap().default_engine,
+            crate::engine::EngineKind::Pid
+        );
+
+        env::set_var("NENYA_DEFAULT_ENGINE", "bayesian");
+        env::set_var("NENYA_BAYESIAN_PROCESS_NOISE", "5.0");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.default_engine, crate::engine::EngineKind::Bayesian);
+        assert_eq!(config.bayesian_process_noise, Some(5.0));
+
+        env::set_var("NENYA_DEFAULT_ENGINE", "nonsense");
+        assert!(Config::from_env().is_err());
+        clean_env();
     }
 
     #[test]

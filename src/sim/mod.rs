@@ -34,6 +34,7 @@ pub mod rng;
 pub mod scenario;
 pub mod workload;
 
+pub use crate::engine::{BayesianParams, EngineKind};
 pub use cluster::{GossipModel, SimCluster, SimConfig, SimEvent, TickCounts};
 pub use metrics::{Convergence, RunResult, Sample, Summary};
 pub use rng::SplitMix64;

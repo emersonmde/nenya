@@ -3,6 +3,7 @@
 use super::aggregate::aggregate_peer_rates;
 use super::{GossipManager, GossipState};
 use crate::api::RateLimitManager;
+use crate::engine::PeerRate;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -72,8 +73,10 @@ pub async fn gossip_sync_loop(
         let observations = gossip.get_peer_observations().await;
         let aggregated = aggregate_peer_rates(&observations, sync_interval, stale_timeout);
 
-        // 4. Apply external rates and live peer count in one pass. Scopes
-        // absent from the aggregate get an explicit zero.
+        // 4. Apply external rates, live peer count, and per-peer
+        // observations in one pass. Scopes absent from the aggregate get an
+        // explicit zero. The aggregated values are the transport's reporting
+        // metrics; the control engine consumes the raw observations.
         let mut mgr = manager.write().await;
         for (scope_name, limiter) in mgr.limiters_mut() {
             let external_rate = aggregated
@@ -83,6 +86,17 @@ pub async fn gossip_sync_loop(
                 .unwrap_or(0.0);
             limiter.set_external_accepted_request_rate(external_rate);
             limiter.set_num_peers(aggregated.live_peers);
+            let obs: Vec<PeerRate<f64>> = observations
+                .iter()
+                .filter_map(|o| {
+                    o.scope_rates.get(scope_name).map(|rate| PeerRate {
+                        id: o.node_id.clone(),
+                        rate: *rate,
+                        age: o.age,
+                    })
+                })
+                .collect();
+            limiter.set_peer_observations(obs);
         }
 
         tracing::debug!(

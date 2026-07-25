@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use plotters::prelude::*;
 
-use nenya::sim::{scenario, RunResult, Scenario};
+use nenya::sim::{scenario, EngineKind, RunResult, Scenario};
 
 #[derive(Parser)]
 #[command(about = "Deterministic multi-node rate limiter simulator")]
@@ -62,9 +62,27 @@ struct Args {
     /// negative disables the clamp
     #[arg(long)]
     error_limit_frac: Option<f64>,
+
+    /// Control engine: pid | bayesian | hybrid. For --matrix, omit to run
+    /// all three (one table per engine).
+    #[arg(long)]
+    engine: Option<String>,
+
+    /// Override estimator process noise q (bayesian/hybrid)
+    #[arg(long)]
+    process_noise: Option<f64>,
+
+    /// Override estimator measurement noise r (bayesian/hybrid)
+    #[arg(long)]
+    measurement_noise: Option<f64>,
+
+    /// Override admission confidence z (bayesian)
+    #[arg(long)]
+    confidence_z: Option<f64>,
 }
 
-fn apply_overrides(mut s: Scenario, args: &Args) -> Scenario {
+fn apply_overrides(mut s: Scenario, args: &Args, engine: EngineKind) -> Scenario {
+    s.cfg.engine = engine;
     if let Some(kp) = args.kp {
         s.cfg.kp = kp;
     }
@@ -77,7 +95,31 @@ fn apply_overrides(mut s: Scenario, args: &Args) -> Scenario {
     if let Some(frac) = args.error_limit_frac {
         s.cfg.error_limit_frac = if frac < 0.0 { None } else { Some(frac) };
     }
+    if let Some(q) = args.process_noise {
+        s.cfg.bayesian.process_noise = q;
+    }
+    if let Some(r) = args.measurement_noise {
+        s.cfg.bayesian.measurement_noise = r;
+    }
+    if let Some(z) = args.confidence_z {
+        s.cfg.bayesian.confidence_z = z;
+    }
     s
+}
+
+/// Engines this invocation runs: the explicit one, or (matrix mode) all.
+fn selected_engines(args: &Args) -> Vec<EngineKind> {
+    match args.engine.as_deref() {
+        Some(s) => match s.parse() {
+            Ok(kind) => vec![kind],
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(2);
+            }
+        },
+        None if args.matrix => vec![EngineKind::Pid, EngineKind::Bayesian, EngineKind::Hybrid],
+        None => vec![EngineKind::Pid],
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -110,14 +152,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("unknown scenario '{}'; use --list", name);
         std::process::exit(2);
     };
-    let s = apply_overrides(s, &args);
+    let engine = selected_engines(&args)[0];
+    let s = apply_overrides(s, &args, engine);
 
     let result = s.run(args.seed);
     fs::create_dir_all(&args.out)?;
 
-    let base = args
-        .out
-        .join(format!("{}_seed{}", result.scenario, result.seed));
+    let base = args.out.join(format!(
+        "{}_{}_seed{}",
+        result.scenario, engine, result.seed
+    ));
     let csv_path = base.with_extension("csv");
     let json_path = base.with_extension("json");
     fs::write(&csv_path, result.to_csv())?;
@@ -169,34 +213,40 @@ fn print_summary(r: &RunResult) {
 }
 
 fn run_matrix(args: &Args) {
-    println!(
-        "| scenario | max overshoot (rps) | overshoot (req) | undershoot (req) | converge (s) | steady stddev (rps) | fairness CV |"
-    );
-    println!("|---|---|---|---|---|---|---|");
-    for s in scenario::library() {
-        let s = apply_overrides(s, args);
-        let r = s.run(args.seed);
-        let sm = &r.summary;
-        let converge = sm
-            .convergence
-            .first()
-            .and_then(|c| c.time_to_converge)
-            .map(|t| format!("{:.1}", t))
-            .unwrap_or_else(|| "never".to_string());
-        let fairness = sm
-            .fairness_cv
-            .map(|cv| format!("{:.3}", cv))
-            .unwrap_or_else(|| "n/a".to_string());
+    for (i, engine) in selected_engines(args).into_iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        println!("### engine: {}\n", engine);
         println!(
-            "| {} | {:.1} | {:.1} | {:.1} | {} | {:.1} | {} |",
-            r.scenario,
-            sm.max_overshoot,
-            sm.integrated_overshoot,
-            sm.integrated_undershoot,
-            converge,
-            sm.steady_stddev,
-            fairness
+            "| scenario | max overshoot (rps) | overshoot (req) | undershoot (req) | converge (s) | steady stddev (rps) | fairness CV |"
         );
+        println!("|---|---|---|---|---|---|---|");
+        for s in scenario::library() {
+            let s = apply_overrides(s, args, engine);
+            let r = s.run(args.seed);
+            let sm = &r.summary;
+            let converge = sm
+                .convergence
+                .first()
+                .and_then(|c| c.time_to_converge)
+                .map(|t| format!("{:.1}", t))
+                .unwrap_or_else(|| "never".to_string());
+            let fairness = sm
+                .fairness_cv
+                .map(|cv| format!("{:.3}", cv))
+                .unwrap_or_else(|| "n/a".to_string());
+            println!(
+                "| {} | {:.1} | {:.1} | {:.1} | {} | {:.1} | {} |",
+                r.scenario,
+                sm.max_overshoot,
+                sm.integrated_overshoot,
+                sm.integrated_undershoot,
+                converge,
+                sm.steady_stddev,
+                fairness
+            );
+        }
     }
 }
 
