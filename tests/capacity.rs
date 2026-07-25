@@ -18,15 +18,17 @@ use std::time::Duration;
 
 use nenya::sim::{scenario, LoadPattern};
 
-/// Convergence time grows linearly with node count (~0.7s/node at the
-/// production gains): equal division hands each node error/n of the cluster
-/// error while gains stay fixed. Milestone 5 gain-scheduling targets this
-/// law — if this test starts failing *fast*, that's the fix landing; update
-/// the model doc.
+/// Fleet convergence is now flat in node count (Milestone 5.4): the old
+/// "0.7s × nodes" law (37s @ 50 nodes, 72s @ 100) was the cold-start
+/// token-bucket burst — every node banked a full cluster-target of tokens
+/// (n × target of collective burst, drained at target-rate excess ≈ n
+/// seconds). With the adaptive burst allowance (`capacity = refill × 1s`)
+/// convergence measures 4s at 10/50/100 nodes. Budgets below guard the
+/// flat law; if they blow up, the cold-start fix regressed.
 #[test]
 #[ignore = "capacity sweep (~5s release); run with --ignored"]
-fn capacity_convergence_scales_linearly_with_nodes() {
-    for (nodes, budget_secs) in [(50usize, 50.0f64), (100, 95.0)] {
+fn capacity_convergence_flat_in_node_count() {
+    for (nodes, budget_secs) in [(50usize, 15.0f64), (100, 15.0)] {
         // Healthy per-node share (100 rps/node) so the estimator floor
         // (see below) doesn't confound the measurement
         let target = 100.0 * nodes as f64;
@@ -40,7 +42,8 @@ fn capacity_convergence_scales_linearly_with_nodes() {
             .unwrap_or_else(|| panic!("{} nodes did not converge in 300s", nodes));
         assert!(
             converge <= budget_secs,
-            "{} nodes converged in {:.1}s (budget {:.0}s ≈ 0.9s/node; baseline ~0.75s/node)",
+            "{} nodes converged in {:.1}s (budget {:.0}s; baseline ~4s flat — \
+             if this blew up, the adaptive burst allowance regressed)",
             nodes,
             converge,
             budget_secs

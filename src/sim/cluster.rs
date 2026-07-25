@@ -83,6 +83,18 @@ pub struct SimConfig {
     /// default; `Some(0)` = pure fixed window, the pre-Milestone-5 behavior)
     pub min_window_samples: Option<usize>,
 
+    /// Initial token fill fraction (`None` = library default, full bucket)
+    pub initial_tokens_frac: Option<f64>,
+
+    /// Explicit static bucket capacity (`None` = library default, which is
+    /// the adaptive `refill × 1s` allowance; set `Some(target)` to
+    /// reproduce the pre-Milestone-5 static cluster-target bucket)
+    pub bucket_capacity: Option<f64>,
+
+    /// Adaptive burst allowance override: bucket capacity tracks
+    /// `refill × seconds` after each control update
+    pub bucket_burst_seconds: Option<f64>,
+
     /// Estimator parameter overrides for the bayesian/hybrid engines.
     /// `None` uses the engine-appropriate simulator-derived default
     /// (`BayesianParams::default()` / `BayesianParams::hybrid_default()`).
@@ -118,6 +130,9 @@ impl Default for SimConfig {
             error_limit_frac: Some(0.2),
             engine: EngineKind::Pid,
             min_window_samples: None,
+            initial_tokens_frac: None,
+            bucket_capacity: None,
+            bucket_burst_seconds: None,
             estimator: None,
             tick: Duration::from_millis(10),
             gossip: GossipModel::default(),
@@ -545,6 +560,15 @@ fn make_limiter(cfg: &SimConfig, now: Instant) -> RateLimiter<f64> {
         .initial_timestamp(now);
     if let Some(k) = cfg.min_window_samples {
         builder = builder.min_window_samples(k);
+    }
+    if let Some(frac) = cfg.initial_tokens_frac {
+        builder = builder.initial_tokens_frac(frac);
+    }
+    if let Some(cap) = cfg.bucket_capacity {
+        builder = builder.bucket_capacity(cap);
+    }
+    if let Some(secs) = cfg.bucket_burst_seconds {
+        builder = builder.bucket_burst_seconds(secs);
     }
 
     match cfg.engine {

@@ -10,9 +10,10 @@
 //! - ±5% band and hold window: roadmap Milestone 4 acceptance criteria
 //! - leave/partition convergence bounds: stale_timeout (10s, the time for a
 //!   silent peer's gossiped rate to fully decay) plus PID settling margin
-//! - the initial ~1s overshoot spike in every scenario is the token buckets
-//!   draining from full (production initializes buckets at capacity) and is
-//!   deliberately not asserted against
+//! - the initial ~1s overshoot spike in every scenario is the first-second
+//!   cold-start burst (capacity starts at the configured default until the
+//!   first control update shrinks it to `refill × 1s` — the Milestone 5.4
+//!   adaptive burst allowance) and is deliberately not asserted against
 
 #![cfg(feature = "sim")]
 
@@ -221,12 +222,12 @@ fn test_scale_sweep_small() {
 fn test_autoscale_absorbs_rapid_joins() {
     let r = scenario::autoscale().run(SEED);
 
-    // Each joining node cold-starts with a full cluster-target-sized bucket
-    // and admits a burst (~250 excess requests/join measured — see the
-    // cold-start fair-share roadmap item). Bound the total; tighten this
-    // when cold-start initialization is fixed.
+    // With the adaptive burst allowance (Milestone 5.4) a joining node's
+    // bucket shrinks to its share within one control update; 27 rapid
+    // joins measure ~2100 requests of overshoot (was ~8100 with the
+    // static cluster-target bucket)
     assert!(
-        r.summary.integrated_overshoot < 12_000.0,
+        r.summary.integrated_overshoot < 4_000.0,
         "autoscale overshoot {:.0} exceeds join-burst budget",
         r.summary.integrated_overshoot
     );

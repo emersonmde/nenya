@@ -32,16 +32,26 @@ per-node HTTP number on stated hardware; after that, the honest phrasing is
 "the coordination layer adds no throughput ceiling: N nodes × measured
 per-node rps".
 
-### 2. Node count — control convergence, not gossip membership
+### 2. Node count — no convergence ceiling (law flattened, Milestone 5)
 
-**Law: convergence time ≈ 0.7s × node count** at the production gains
-(measured: 37s @ 50 nodes, 72s @ 100, 141s @ 200, 278s @ 400, independent of
-rate). Equal division hands each node `error / n` of the cluster error while
-gains stay fixed, so settling stretches linearly. Pick your ops tolerance
-and read off the ceiling: convergence within a minute → ~85 nodes; within
-five → ~400. Gain scheduling by fleet size (Milestone 5) is the lever that
-would flatten this law. Chitchat membership itself is not the binder at
-these sizes (Quickwit operates it at hundreds of nodes).
+**Convergence is flat in node count: ~4s at 10, 50, and 100 nodes** (2×
+target load, production gains). The Milestone 4 law ("≈ 0.7s × node count":
+37s @ 50, 72s @ 100, 278s @ 400) turned out not to be a gain problem at
+all — it was the cold-start token bucket. Every node initialized a full
+cluster-target-sized bucket, so an n-node fleet collectively banked
+n × target of burst tokens, drained at target-rate excess ≈ n seconds. The
+adaptive burst allowance (`bucket capacity = refill × 1s`, the library
+default since Milestone 5.4) removes the banked burst and the law with it.
+
+Two negative sweep results worth keeping (both re-runnable, seed 42):
+integral gain scheduling (`ki × n`) — the roadmap's original candidate —
+*destabilizes* at scale: +53% chronic over-admission at 100 nodes with the
+cluster-scale anti-windup clamp, still +22% with the clamp scaled to
+constant integral authority (`error_limit / n`). The equal-division loop's
+total response is already n-independent (each node corrects `error/n`; n
+nodes sum to one controller's worth), so there was never a gain deficit to
+schedule away. Chitchat membership is likewise not a binder at these sizes
+(Quickwit operates it at hundreds of nodes).
 
 ### 3. Per-node share — rate-estimator floor (fixed, Milestone 5)
 
@@ -94,10 +104,18 @@ CPU     ≈  rps × 30 ns  (decisions)
          + HTTP stack (dominant; Milestone 10 measures)
 ```
 
-Cold-start caveat: buckets initialize at a full cluster-target of tokens, so
-a joining node admits a burst of up to `bucket_capacity` requests
-immediately (measured ~250 excess requests per join in the autoscale
-scenario). Tracked as the cold-start fair-share item in Milestone 5.
+Cold-start (fixed, Milestone 5.4): bucket capacity now tracks the control
+engine's output (`refill × 1s`) instead of staying at a static
+cluster-target size, so a joining node's burst allowance shrinks to its
+fair share within one control update. Swept variants (zero initial tokens,
+capacity tracking, both): tracking is what matters — autoscale join-burst
+overshoot 8040 → 2076 requests, burst-scenario overshoot 5972 → 2452, at
+the cost of ≤0.1% steady throughput (undershoot 25 → 2147 requests over a
+300s 1M-request run at 100 nodes). An explicit
+`RateLimiterBuilder::bucket_capacity` pins a static capacity for callers
+that want a fixed burst budget; the first second of a true cold start
+still admits up to one `target` of burst (capacity starts at the
+configured default until the first engine update).
 
 ## What the simulator deliberately does not model
 

@@ -120,6 +120,13 @@ pub struct RateLimiter<T> {
     /// an empty window as zero (see the Milestone 5 estimator-floor fix)
     min_window_samples: usize,
 
+    /// When set, `bucket_capacity` tracks the engine output after every
+    /// control update: `capacity = refill_rate × burst_seconds`. In
+    /// distributed mode this shrinks the burst allowance to the node's
+    /// current fair share instead of a full cluster target (the Milestone 5
+    /// cold-start fix); `None` keeps the static configured capacity.
+    bucket_burst_seconds: Option<T>,
+
     // Control engine (adaptive coordination; PID by default)
     engine: Box<dyn RateController<T>>,
     target_rate: T,            // Base rate for this node (single-node mode)
@@ -167,6 +174,7 @@ impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 
             accepted_request_timestamps: VecDeque::new(),
             local_accepted_request_rate: T::zero(),
             min_window_samples: DEFAULT_MIN_WINDOW_SAMPLES,
+            bucket_burst_seconds: None,
 
             // Control engine: the provided PID behind the trait
             engine: Box::new(PidEngine::new(pid_controller)),
@@ -331,6 +339,13 @@ impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 
             self.refill_rate = refill.max(T::zero());
         }
 
+        // Adaptive burst allowance: capacity follows the engine's rate, so
+        // a node's burst headroom is proportional to its current share
+        if let Some(burst_seconds) = self.bucket_burst_seconds {
+            self.bucket_capacity = self.refill_rate * burst_seconds;
+            self.tokens = self.tokens.min(self.bucket_capacity);
+        }
+
         self.last_updated = now;
     }
 
@@ -477,6 +492,8 @@ pub struct RateLimiterBuilder<T> {
     num_peers: usize,
     initial_timestamp: Option<Instant>,
     min_window_samples: usize,
+    initial_tokens_frac: Option<T>,
+    bucket_burst_seconds: Option<T>,
 }
 
 impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 'static>
@@ -499,7 +516,28 @@ impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 
             num_peers: 0,
             initial_timestamp: None,
             min_window_samples: DEFAULT_MIN_WINDOW_SAMPLES,
+            initial_tokens_frac: None,
+            bucket_burst_seconds: None,
         }
+    }
+
+    /// Sets the initial token fill as a fraction of bucket capacity
+    /// (default 1.0 — start with a full bucket). `0.0` gives a cold-started
+    /// node no free burst: it admits only what its refill rate earns,
+    /// which in distributed mode prevents each joining node from admitting
+    /// a full cluster-target-sized burst before its first control update.
+    pub fn initial_tokens_frac(mut self, frac: T) -> Self {
+        self.initial_tokens_frac = Some(frac);
+        self
+    }
+
+    /// Makes the bucket capacity track the control engine's output:
+    /// after every update, `capacity = refill_rate × burst_seconds`. The
+    /// burst allowance then follows the node's current share instead of
+    /// staying at the configured cluster-scale capacity.
+    pub fn bucket_burst_seconds(mut self, seconds: T) -> Self {
+        self.bucket_burst_seconds = Some(seconds);
+        self
     }
 
     /// Sets the adaptive-window floor: rate-estimate trimming keeps at
@@ -632,6 +670,24 @@ impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 
     pub fn build(self) -> RateLimiter<T> {
         let now = self.initial_timestamp.unwrap_or_else(Instant::now);
         let bucket_capacity = self.bucket_capacity.unwrap_or(self.target_rate);
+        let initial_tokens = match self.initial_tokens_frac {
+            Some(frac) => bucket_capacity * frac,
+            None => bucket_capacity,
+        };
+
+        // Burst allowance default: adaptive — capacity tracks the engine's
+        // refill rate (1 s of the *current* rate) unless the caller pinned
+        // an explicit static capacity. Simulator-derived (Milestone 5.4
+        // cold-start sweep, seed 42): with the static cluster-scale bucket,
+        // every cold-started node banks and admits a full cluster target of
+        // burst, which made fleet convergence linear in node count
+        // (37 s/72 s at 50/100 nodes → 4 s flat with tracking) and
+        // dominated join overshoot (autoscale 8040 → 2076 requests).
+        let bucket_burst_seconds = match (self.bucket_burst_seconds, self.bucket_capacity) {
+            (Some(seconds), _) => Some(seconds),
+            (None, Some(_)) => None, // explicit capacity stays static
+            (None, None) => Some(T::one()),
+        };
 
         // For distributed mode with PID, setpoint will be adjusted dynamically per update
         let initial_setpoint = if self.cluster_target.is_some() {
@@ -650,8 +706,7 @@ impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 
         };
 
         RateLimiter {
-            // Token bucket initialized with full capacity
-            tokens: bucket_capacity,
+            tokens: initial_tokens,
             last_refill: now,
             refill_rate: self.target_rate,
             bucket_capacity,
@@ -660,6 +715,7 @@ impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 
             accepted_request_timestamps: VecDeque::new(),
             local_accepted_request_rate: T::zero(),
             min_window_samples: self.min_window_samples,
+            bucket_burst_seconds,
 
             // Control engine
             engine,
