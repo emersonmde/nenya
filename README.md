@@ -17,14 +17,16 @@ balancer and one noisy user must not exhaust a shared limit — for example,
 fairly dividing an upstream provider quota (Bedrock TPM, a partner API's
 rate cap) across a fleet and its users.
 
-![Five-node cluster under 2x load: a network partition at t=30s splits the
-cluster 2/3, each side independently converges toward the target, and the
-fleet re-converges within ~3s of healing at
-t=70s](docs/images/partition_pid_seed42.svg)
+![Offered load doubles from 300 to 600 rps at t=30s; the cluster's
+accepted rate holds at the 300 rps target throughout, with one brief
+transient at the step](docs/images/step_pid_seed42.svg)
 
-*Five nodes at 2× offered load, partitioned 2/3 at t=30s and healed at
-t=70s (deterministic simulator, seed 42 — reproduce with
-`cargo run --features sim --example cluster_sim -- --scenario partition --seed 42 --plot`).*
+*Offered load (top line) doubles at t=30s; the three-node cluster holds
+accepted throughput on the 300 rps target with no coordinator. Sample
+jitter is Poisson arrival noise at 500 ms sampling; steady mean is 300.0
+before and 302.3 after the step. Deterministic simulator, seed 42 —
+reproduce with
+`cargo run --features sim --example cluster_sim -- --scenario step --seed 42 --plot`.*
 
 ## Why nenya
 
@@ -32,10 +34,14 @@ t=70s (deterministic simulator, seed 42 — reproduce with
   bytes per active scope per second; every enforcement decision is a local
   in-memory token-bucket check (~30 ns). The limiter can never become an
   availability dependency on your request path.
-- **Per-user scale, measured.** 1M mostly-idle user scopes cost ~360 B
-  each (~355 MB/node). Only scopes with evidence of multi-node activity
-  enter coordination; a user served by a single node is enforced entirely
-  locally with zero gossip. Measurements and the all-hot ablation are in
+- **Per-user limits that stay cheap at fleet scale.** Every user gets a
+  real cluster-wide limit, not a per-node approximation: single-node
+  users are capped exactly by a local bucket, and users spread across
+  nodes are detected through gossiped rate evidence and coordinated
+  before exceeding their limit. Coordination cost scales with the number
+  of users *near their limits* — not with population, node count, or
+  request rate. Measurements (including the memory and wire footprint at
+  10⁶ scopes, and the ablation against gossiping everything) are in
   [docs/capacity-model.md](docs/capacity-model.md).
 - **Control theory instead of quota slicing.** A pluggable controller
   (PID by default; Bayesian per-peer Kalman estimation and a hybrid,
