@@ -116,6 +116,35 @@ the two-tier architecture; the measured state (seed 42, M-series, tests in
   limit promotes 17 scopes (uniform routing; 54 sticky) — the gossip
   payload is the hot head, not the population.
 
+### Is promotion still needed after delta sync? (ablation)
+
+The per-scope-key wire format removed the original scope-count binder
+(retransmitting every scope on any change), so the question deserved a
+before/after test rather than an assumption
+(`tests/two_tier_ablation.rs`, 300k scopes, 2 peers, release, seed 42):
+
+| | two-tier (default) | all-hot (ablated) |
+|---|---|---|
+| RSS | 356 B/scope | 450 B/scope (grows under load) |
+| sync tick (apply+collect, /500 ms) | **1.3 ms** | **218 ms** |
+| replicated keyspace / joiner catch-up | 0 keys | 300k keys ≈ 5.9 MB |
+| steady delta wire (600 rps, 100k users) | ~1 KB/s/peer | ~24 KB/s/peer |
+
+**Verdict: still needed, but the binder moved.** Steady-state wire volume
+is no longer the problem — delta sync means only value-changing keys
+retransmit (~400/s at this traffic, proportional to distinct active
+users/sec, not user count). What still rules out all-hot at scale:
+1. **Sync-tick CPU**: applying peer observations + collecting rates is
+   O(scopes × peers) every 500 ms under the manager write lock — 44% of
+   the tick budget at 300k scopes with 2 peers, past the whole tick near
+   1M, stalling the decision path.
+2. **Replicated keyspace + catch-up**: every node holds every peer's full
+   keyset and every joiner must ingest it (~1.5 min at 300k on Linux's
+   64 KB/round; a >9 KB burst stalls forever on default macOS).
+3. **Traffic-proportional churn**: the delta wire scales with active
+   users/sec — fine at 600 rps, MB/s at the 10⁵-rps regimes the capacity
+   model targets. Two-tier caps all three at the hot-set size K.
+
 ## Two-tier defaults (Milestone 6.4 sweep, seed 42)
 
 Derivation data from `tier_threshold_sweep` (re-run:
