@@ -249,6 +249,9 @@ network model.
 - **Seeded workloads**: constant/ramp/step/burst/Poisson, per-node and per-scope
   skew — same seed → byte-identical results
 - **Metrics**: overshoot, convergence time, oscillation, fairness, undershoot
+- **Artifact output**: CSV/JSON time series plus static SVG/PNG charts —
+  reproducible and shareable. Replaces the egui realtime dashboard example,
+  which is removed (with its whole dependency tree) as part of Milestone 4
 - **CI**: scenario acceptance thresholds as tests (fast subset <30s)
 
 ## Control Engines — [Planned — Milestone 5]

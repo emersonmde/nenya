@@ -77,7 +77,8 @@ cargo audit
 # All pre-commit checks at once (or: git config core.hooksPath .git-hooks)
 ./.git-hooks/pre-commit
 
-# Single-node PID simulator with plotting
+# Single-node PID simulator with realtime plot
+# (retired in Milestone 4 — replaced by simulator CSV/JSON + chart artifacts)
 cargo run --example request_simulator_plot -- --help
 
 # Docs
@@ -106,7 +107,7 @@ src/
 ├── config/             # Env-var config (Config::from_env) — TOML is planned, NOT yet implemented
 ├── gossip/             # Chitchat integration: manager, state schema, 500ms sync loop
 └── discovery/          # Placeholder only (Milestone 8)
-examples/               # request_simulator_plot (single-node PID tuning)
+examples/               # request_simulator_plot (egui GUI — retired in M4 for simulator artifacts)
 tests/                  # Integration tests (HTTP API, multi-node gossip)
 nenya-sentinel/         # Deprecation stub only — the binary is now `nenya` itself
 ```

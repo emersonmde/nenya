@@ -213,9 +213,11 @@ sweep parameters or run in CI.
   - Oscillation: variance / peak-to-peak of cluster accepted rate at steady state
   - Fairness: dispersion of per-node accepted rates under uniform load
   - Undershoot: throughput sacrificed below target
-- [ ] **Output formats**
-  - CSV/JSON time series for offline analysis
-  - Plot generation (extend the existing plotters-based example)
+- [ ] **Output formats — artifacts, not a live GUI**
+  - CSV/JSON time series per run for offline analysis
+  - Static chart rendering to SVG/PNG (e.g., the `plotters` crate — no GUI
+    stack), so results are reproducible and shareable in PRs/docs instead of
+    eyeballed on a realtime dashboard
 - [ ] **Benchmark harness**
   - Run a scenario matrix across engine configs, emit comparison table
   - This is the tool Milestone 5 uses to judge PID vs. Bayesian
@@ -261,6 +263,22 @@ seeds can.
   are checkable against real code with stateright, and a separate spec would
   drift. Reserved for the Milestone 9 auth handshake, where
   exhaustive adversarial interleaving analysis is the whole point.
+
+#### 4.6 Retire the GUI Examples
+
+The egui/eframe realtime dashboard (`request_simulator_plot`) was the manual
+tuning tool; scripted scenarios with rendered artifacts replace it with
+something reproducible, CI-checkable, and shareable.
+
+- [ ] Port any load patterns unique to the example into simulator scenarios
+  before deleting anything
+- [ ] Remove `request_simulator_plot` and the dashboard; drop the
+  egui/eframe/egui_plot dev-dependencies
+- [ ] Remove the quick-xml ignores from `.cargo/audit.toml` — they exist only
+  for the eframe dependency tree (this also clears most of the audit
+  "unmaintained" warnings)
+- [ ] Update README: Request Simulator section → simulator usage and sample
+  output artifacts
 
 **Deliverable**: `cargo test` covers multi-node dynamics deterministically;
 a benchmark harness produces engine comparison tables from scenario runs
@@ -867,6 +885,8 @@ Deliberately deferred; prioritize from real usage.
 - Stateright safety invariants (staleness, no double-count, peer accounting)
   verified and running in CI
 - Benchmark harness emits engine comparison tables
+- Runs emit CSV/JSON + SVG/PNG chart artifacts; GUI examples and
+  egui/eframe dependencies removed, audit ignores dropped
 
 ### Milestone 5 Complete
 - PID, Bayesian, and hybrid engines behind one trait, selected by explicit

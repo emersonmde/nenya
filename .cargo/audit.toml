@@ -6,7 +6,8 @@
 # eframe/egui, which are dev-dependencies of the plotting example
 # (build-time code generation for Linux Wayland support; never compiled
 # into the library or the server binary).
-# Remove both ignores when eframe/egui are upgraded past 0.28.
+# The GUI examples and their egui/eframe dependency tree are removed in
+# Milestone 4 (roadmap 4.6) — delete both ignores then.
 ignore = [
     "RUSTSEC-2026-0194", # quick-xml: quadratic runtime on duplicate attribute check
     "RUSTSEC-2026-0195", # quick-xml: unbounded namespace allocation DoS
