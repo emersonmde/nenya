@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["EngineKind"],"fn":["staleness_weight"],"struct":["BayesianEngine","BayesianParams","ControlInput","HybridEngine","PeerRate","PidEngine"],"trait":["RateController"],"type":["HybridParams"]};

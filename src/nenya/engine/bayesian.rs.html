@@ -1,0 +1,428 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `src/engine/bayesian.rs`."><title>bayesian.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="nenya" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../../../static.files/src-script-813739b1.js"></script><script defer src="../../../src-files.js"></script><script defer src="../../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">nenya/engine/</div>bayesian.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="doccomment">//! Bayesian rate-estimator engine: per-peer scalar Kalman filters plus
+<a href=#2 id=2 data-nosnippet>2</a>//! uncertainty-aware admission.
+<a href=#3 id=3 data-nosnippet>3</a>//!
+<a href=#4 id=4 data-nosnippet>4</a>//! # Model
+<a href=#5 id=5 data-nosnippet>5</a>//!
+<a href=#6 id=6 data-nosnippet>6</a>//! Each peer's true accepted rate is a latent variable observed through
+<a href=#7 id=7 data-nosnippet>7</a>//! delayed, noisy gossip samples. Per (peer, scope) we run a scalar Kalman
+<a href=#8 id=8 data-nosnippet>8</a>//! filter with random-walk dynamics:
+<a href=#9 id=9 data-nosnippet>9</a>//!
+<a href=#10 id=10 data-nosnippet>10</a>//! ```text
+<a href=#11 id=11 data-nosnippet>11</a>//! state:        x_k = x_{k-1} + w_k,   w_k ~ N(0, q · Δt)
+<a href=#12 id=12 data-nosnippet>12</a>//! observation:  z_k = x_k + v_k,       v_k ~ N(0, r)
+<a href=#13 id=13 data-nosnippet>13</a>//! ```
+<a href=#14 id=14 data-nosnippet>14</a>//!
+<a href=#15 id=15 data-nosnippet>15</a>//! where `q` (process noise, rps²/s) encodes how fast peer rates are
+<a href=#16 id=16 data-nosnippet>16</a>//! believed to change and `r` (measurement noise, rps²) the sampling error
+<a href=#17 id=17 data-nosnippet>17</a>//! of the peer's sliding-window rate estimate. The filter equations are the
+<a href=#18 id=18 data-nosnippet>18</a>//! standard scalar predict/update cycle (Welch &amp; Bishop, "An Introduction to
+<a href=#19 id=19 data-nosnippet>19</a>//! the Kalman Filter", UNC-Chapel Hill TR 95-041, eqs. 1.9–1.12):
+<a href=#20 id=20 data-nosnippet>20</a>//!
+<a href=#21 id=21 data-nosnippet>21</a>//! ```text
+<a href=#22 id=22 data-nosnippet>22</a>//! predict:  x̂⁻ = x̂           (random walk: F = 1, no control input)
+<a href=#23 id=23 data-nosnippet>23</a>//!           P⁻ = P + q · Δt
+<a href=#24 id=24 data-nosnippet>24</a>//! update:   K  = P⁻ / (P⁻ + r)
+<a href=#25 id=25 data-nosnippet>25</a>//!           x̂  = x̂⁻ + K (z − x̂⁻)
+<a href=#26 id=26 data-nosnippet>26</a>//!           P  = (1 − K) P⁻
+<a href=#27 id=27 data-nosnippet>27</a>//! ```
+<a href=#28 id=28 data-nosnippet>28</a>//!
+<a href=#29 id=29 data-nosnippet>29</a>//! Between gossip samples no update runs, but the *usable* variance of a
+<a href=#30 id=30 data-nosnippet>30</a>//! peer's estimate at query time is `P + q · age`: *staleness is
+<a href=#31 id=31 data-nosnippet>31</a>//! uncertainty*. This subsumes Milestone 3's linear staleness decay with a
+<a href=#32 id=32 data-nosnippet>32</a>//! principled equivalent — an old observation doesn't fade toward zero rate,
+<a href=#33 id=33 data-nosnippet>33</a>//! it stays at its last mean with ever-wider error bars.
+<a href=#34 id=34 data-nosnippet>34</a>//!
+<a href=#35 id=35 data-nosnippet>35</a>//! # Admission policy
+<a href=#36 id=36 data-nosnippet>36</a>//!
+<a href=#37 id=37 data-nosnippet>37</a>//! The cluster estimate is the sum of independent per-peer Gaussians:
+<a href=#38 id=38 data-nosnippet>38</a>//!
+<a href=#39 id=39 data-nosnippet>39</a>//! ```text
+<a href=#40 id=40 data-nosnippet>40</a>//! Ŝ = Σ x̂ᵢ          (peer total mean)
+<a href=#41 id=41 data-nosnippet>41</a>//! V = Σ (Pᵢ + q·ageᵢ)  (peer total variance; independence assumed)
+<a href=#42 id=42 data-nosnippet>42</a>//! ```
+<a href=#43 id=43 data-nosnippet>43</a>//!
+<a href=#44 id=44 data-nosnippet>44</a>//! The node then admits against the estimate's upper confidence bound,
+<a href=#45 id=45 data-nosnippet>45</a>//! taking whatever headroom the cluster target leaves:
+<a href=#46 id=46 data-nosnippet>46</a>//!
+<a href=#47 id=47 data-nosnippet>47</a>//! ```text
+<a href=#48 id=48 data-nosnippet>48</a>//! refill = cluster_target − (Ŝ + z·√V)
+<a href=#49 id=49 data-nosnippet>49</a>//! ```
+<a href=#50 id=50 data-nosnippet>50</a>//!
+<a href=#51 id=51 data-nosnippet>51</a>//! clamped to `[min_rate/n, max_rate/n]` (n = 1 + live peers). With
+<a href=#52 id=52 data-nosnippet>52</a>//! symmetric saturated demand this fixed-points at the fair share
+<a href=#53 id=53 data-nosnippet>53</a>//! `(cluster_target − (n−1)·z·σ)/n`; under skew, cold nodes' low observed
+<a href=#54 id=54 data-nosnippet>54</a>//! rates leave headroom the hot node claims automatically — share division
+<a href=#55 id=55 data-nosnippet>55</a>//! is demand-weighted without explicit coordination. The `z·√V` term makes
+<a href=#56 id=56 data-nosnippet>56</a>//! the node conservative exactly when information is stale (partition,
+<a href=#57 id=57 data-nosnippet>57</a>//! churn) and aggressive when the estimate is tight.
+<a href=#58 id=58 data-nosnippet>58</a>//!
+<a href=#59 id=59 data-nosnippet>59</a>//! # Membership
+<a href=#60 id=60 data-nosnippet>60</a>//!
+<a href=#61 id=61 data-nosnippet>61</a>//! Peers whose observations exceed `stale_timeout` are dropped from the
+<a href=#62 id=62 data-nosnippet>62</a>//! filter bank entirely. The random-walk model keeps a silent peer's *mean*
+<a href=#63 id=63 data-nosnippet>63</a>//! at its last value forever (only the variance grows), so without a
+<a href=#64 id=64 data-nosnippet>64</a>//! membership cutoff a dead peer would permanently reserve headroom. The
+<a href=#65 id=65 data-nosnippet>65</a>//! cutoff is a transport/membership concern, deliberately identical to the
+<a href=#66 id=66 data-nosnippet>66</a>//! gossip layer's liveness horizon; estimation handles everything short
+<a href=#67 id=67 data-nosnippet>67</a>//! of it.
+<a href=#68 id=68 data-nosnippet>68</a>
+<a href=#69 id=69 data-nosnippet>69</a></span><span class="kw">use </span>std::collections::BTreeMap;
+<a href=#70 id=70 data-nosnippet>70</a><span class="kw">use </span>std::time::Duration;
+<a href=#71 id=71 data-nosnippet>71</a>
+<a href=#72 id=72 data-nosnippet>72</a><span class="kw">use </span>num_traits::{Float, FromPrimitive, Signed};
+<a href=#73 id=73 data-nosnippet>73</a>
+<a href=#74 id=74 data-nosnippet>74</a><span class="kw">use super</span>::{ControlInput, RateController, DEFAULT_STALE_TIMEOUT};
+<a href=#75 id=75 data-nosnippet>75</a>
+<a href=#76 id=76 data-nosnippet>76</a><span class="doccomment">/// Tuning parameters for [`BayesianEngine`] (and the estimator half of
+<a href=#77 id=77 data-nosnippet>77</a>/// [`super::HybridEngine`]).
+<a href=#78 id=78 data-nosnippet>78</a>///
+<a href=#79 id=79 data-nosnippet>79</a>/// Defaults are simulator-derived (Milestone 5.3 sweep, seed 42, recorded
+<a href=#80 id=80 data-nosnippet>80</a>/// in `docs/engine-comparison.md`). For the pure Bayesian engine the
+<a href=#81 id=81 data-nosnippet>81</a>/// estimate-and-set feedback race must be damped by a slow Kalman gain:
+<a href=#82 id=82 data-nosnippet>82</a>/// `q = 1, r = 100` was the only swept corner where most scenarios
+<a href=#83 id=83 data-nosnippet>83</a>/// converge (fast-gain settings oscillate at ±150 rps). `r = 100` is also
+<a href=#84 id=84 data-nosnippet>84</a>/// what Poisson counting noise predicts for a 1 s window at the
+<a href=#85 id=85 data-nosnippet>85</a>/// benchmark's ~100 rps per-node shares (variance ≈ λ). `z = 1` is the
+<a href=#86 id=86 data-nosnippet>86</a>/// roadmap's documented starting point; the sweep showed z mainly trades
+<a href=#87 id=87 data-nosnippet>87</a>/// undershoot for convergence speed with no clearly better setting.
+<a href=#88 id=88 data-nosnippet>88</a>///
+<a href=#89 id=89 data-nosnippet>89</a>/// The hybrid engine wants the opposite: a fast filter (its PID supplies
+<a href=#90 id=90 data-nosnippet>90</a>/// the damping) — use [`BayesianParams::hybrid_default`] there.
+<a href=#91 id=91 data-nosnippet>91</a></span><span class="attr">#[derive(Debug, Clone, Copy)]
+<a href=#92 id=92 data-nosnippet>92</a></span><span class="kw">pub struct </span>BayesianParams {
+<a href=#93 id=93 data-nosnippet>93</a>    <span class="doccomment">/// Process noise `q` (rps²/s): how fast peer rates are believed to
+<a href=#94 id=94 data-nosnippet>94</a>    /// change. Larger values track fast-moving peers more closely but keep
+<a href=#95 id=95 data-nosnippet>95</a>    /// wider error bars on stale data.
+<a href=#96 id=96 data-nosnippet>96</a>    </span><span class="kw">pub </span>process_noise: f64,
+<a href=#97 id=97 data-nosnippet>97</a>
+<a href=#98 id=98 data-nosnippet>98</a>    <span class="doccomment">/// Measurement noise `r` (rps²): variance of a single gossiped rate
+<a href=#99 id=99 data-nosnippet>99</a>    /// sample. For a 1 s sliding-window estimate of a Poisson stream at
+<a href=#100 id=100 data-nosnippet>100</a>    /// rate λ, the counting error alone gives variance ≈ λ, so values well
+<a href=#101 id=101 data-nosnippet>101</a>    /// below the per-node share underweight real sampling noise.
+<a href=#102 id=102 data-nosnippet>102</a>    </span><span class="kw">pub </span>measurement_noise: f64,
+<a href=#103 id=103 data-nosnippet>103</a>
+<a href=#104 id=104 data-nosnippet>104</a>    <span class="doccomment">/// Confidence multiplier `z` for the admission bound
+<a href=#105 id=105 data-nosnippet>105</a>    /// (`mean + z·σ`). 0 admits against the raw mean; 1 (default) against
+<a href=#106 id=106 data-nosnippet>106</a>    /// one standard deviation of headroom pessimism.
+<a href=#107 id=107 data-nosnippet>107</a>    </span><span class="kw">pub </span>confidence_z: f64,
+<a href=#108 id=108 data-nosnippet>108</a>
+<a href=#109 id=109 data-nosnippet>109</a>    <span class="doccomment">/// Membership horizon: peers silent longer than this are dropped from
+<a href=#110 id=110 data-nosnippet>110</a>    /// the filter bank. Should match the transport's stale timeout.
+<a href=#111 id=111 data-nosnippet>111</a>    </span><span class="kw">pub </span>stale_timeout: Duration,
+<a href=#112 id=112 data-nosnippet>112</a>}
+<a href=#113 id=113 data-nosnippet>113</a>
+<a href=#114 id=114 data-nosnippet>114</a><span class="kw">impl </span>Default <span class="kw">for </span>BayesianParams {
+<a href=#115 id=115 data-nosnippet>115</a>    <span class="kw">fn </span>default() -&gt; <span class="self">Self </span>{
+<a href=#116 id=116 data-nosnippet>116</a>        BayesianParams {
+<a href=#117 id=117 data-nosnippet>117</a>            process_noise: <span class="number">1.0</span>,
+<a href=#118 id=118 data-nosnippet>118</a>            measurement_noise: <span class="number">100.0</span>,
+<a href=#119 id=119 data-nosnippet>119</a>            confidence_z: <span class="number">1.0</span>,
+<a href=#120 id=120 data-nosnippet>120</a>            stale_timeout: DEFAULT_STALE_TIMEOUT,
+<a href=#121 id=121 data-nosnippet>121</a>        }
+<a href=#122 id=122 data-nosnippet>122</a>    }
+<a href=#123 id=123 data-nosnippet>123</a>}
+<a href=#124 id=124 data-nosnippet>124</a>
+<a href=#125 id=125 data-nosnippet>125</a><span class="kw">impl </span>BayesianParams {
+<a href=#126 id=126 data-nosnippet>126</a>    <span class="doccomment">/// Estimator defaults for [`super::HybridEngine`]: a fast filter
+<a href=#127 id=127 data-nosnippet>127</a>    /// (`q = 10, r = 10`), since the PID half supplies the damping.
+<a href=#128 id=128 data-nosnippet>128</a>    /// Simulator-derived (Milestone 5.3 sweep): hybrid results are nearly
+<a href=#129 id=129 data-nosnippet>129</a>    /// identical across `q/r` within ×10 of this point, while the
+<a href=#130 id=130 data-nosnippet>130</a>    /// Bayesian-tuned slow gain (`q = 1, r = 100`) measurably slows hybrid
+<a href=#131 id=131 data-nosnippet>131</a>    /// convergence (scale_50 never re-enters the band).
+<a href=#132 id=132 data-nosnippet>132</a>    </span><span class="kw">pub fn </span>hybrid_default() -&gt; <span class="self">Self </span>{
+<a href=#133 id=133 data-nosnippet>133</a>        BayesianParams {
+<a href=#134 id=134 data-nosnippet>134</a>            process_noise: <span class="number">10.0</span>,
+<a href=#135 id=135 data-nosnippet>135</a>            measurement_noise: <span class="number">10.0</span>,
+<a href=#136 id=136 data-nosnippet>136</a>            confidence_z: <span class="number">1.0</span>,
+<a href=#137 id=137 data-nosnippet>137</a>            stale_timeout: DEFAULT_STALE_TIMEOUT,
+<a href=#138 id=138 data-nosnippet>138</a>        }
+<a href=#139 id=139 data-nosnippet>139</a>    }
+<a href=#140 id=140 data-nosnippet>140</a>}
+<a href=#141 id=141 data-nosnippet>141</a>
+<a href=#142 id=142 data-nosnippet>142</a><span class="doccomment">/// One peer's scalar Kalman filter state.
+<a href=#143 id=143 data-nosnippet>143</a></span><span class="attr">#[derive(Debug, Clone)]
+<a href=#144 id=144 data-nosnippet>144</a></span><span class="kw">struct </span>PeerFilter&lt;T&gt; {
+<a href=#145 id=145 data-nosnippet>145</a>    <span class="doccomment">/// Posterior mean x̂ at the last incorporated sample
+<a href=#146 id=146 data-nosnippet>146</a>    </span>mean: T,
+<a href=#147 id=147 data-nosnippet>147</a>
+<a href=#148 id=148 data-nosnippet>148</a>    <span class="doccomment">/// Posterior variance P at the last incorporated sample
+<a href=#149 id=149 data-nosnippet>149</a>    </span>variance: T,
+<a href=#150 id=150 data-nosnippet>150</a>
+<a href=#151 id=151 data-nosnippet>151</a>    <span class="doccomment">/// Engine-clock time of the last incorporated sample (t_now − age);
+<a href=#152 id=152 data-nosnippet>152</a>    /// used both to detect new samples and to size the predict step
+<a href=#153 id=153 data-nosnippet>153</a>    </span>last_sample_time: T,
+<a href=#154 id=154 data-nosnippet>154</a>}
+<a href=#155 id=155 data-nosnippet>155</a>
+<a href=#156 id=156 data-nosnippet>156</a><span class="doccomment">/// Shared per-peer Kalman filter bank (used by both the Bayesian and hybrid
+<a href=#157 id=157 data-nosnippet>157</a>/// engines). Keyed by peer id in a `BTreeMap` so summation order — and
+<a href=#158 id=158 data-nosnippet>158</a>/// therefore floating-point results — is deterministic.
+<a href=#159 id=159 data-nosnippet>159</a></span><span class="attr">#[derive(Debug, Clone)]
+<a href=#160 id=160 data-nosnippet>160</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">struct </span>FilterBank&lt;T&gt; {
+<a href=#161 id=161 data-nosnippet>161</a>    filters: BTreeMap&lt;String, PeerFilter&lt;T&gt;&gt;,
+<a href=#162 id=162 data-nosnippet>162</a>
+<a href=#163 id=163 data-nosnippet>163</a>    <span class="doccomment">/// Engine-local clock, advanced by `input.dt` each update. Only
+<a href=#164 id=164 data-nosnippet>164</a>    /// differences of this clock are ever used.
+<a href=#165 id=165 data-nosnippet>165</a>    </span>clock: T,
+<a href=#166 id=166 data-nosnippet>166</a>
+<a href=#167 id=167 data-nosnippet>167</a>    process_noise: T,
+<a href=#168 id=168 data-nosnippet>168</a>    measurement_noise: T,
+<a href=#169 id=169 data-nosnippet>169</a>    stale_timeout: Duration,
+<a href=#170 id=170 data-nosnippet>170</a>}
+<a href=#171 id=171 data-nosnippet>171</a>
+<a href=#172 id=172 data-nosnippet>172</a><span class="doccomment">/// A peer's estimate evaluated at the current engine clock.
+<a href=#173 id=173 data-nosnippet>173</a></span><span class="attr">#[derive(Debug, Clone, Copy)]
+<a href=#174 id=174 data-nosnippet>174</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">struct </span>PeerEstimate&lt;T&gt; {
+<a href=#175 id=175 data-nosnippet>175</a>    <span class="kw">pub </span>mean: T,
+<a href=#176 id=176 data-nosnippet>176</a>    <span class="kw">pub </span>variance: T,
+<a href=#177 id=177 data-nosnippet>177</a>}
+<a href=#178 id=178 data-nosnippet>178</a>
+<a href=#179 id=179 data-nosnippet>179</a><span class="kw">impl</span>&lt;T: Float + FromPrimitive + Copy&gt; FilterBank&lt;T&gt; {
+<a href=#180 id=180 data-nosnippet>180</a>    <span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>new(params: <span class="kw-2">&amp;</span>BayesianParams) -&gt; <span class="self">Self </span>{
+<a href=#181 id=181 data-nosnippet>181</a>        FilterBank {
+<a href=#182 id=182 data-nosnippet>182</a>            filters: BTreeMap::new(),
+<a href=#183 id=183 data-nosnippet>183</a>            clock: T::zero(),
+<a href=#184 id=184 data-nosnippet>184</a>            process_noise: T::from_f64(params.process_noise).unwrap(),
+<a href=#185 id=185 data-nosnippet>185</a>            measurement_noise: T::from_f64(params.measurement_noise).unwrap(),
+<a href=#186 id=186 data-nosnippet>186</a>            stale_timeout: params.stale_timeout,
+<a href=#187 id=187 data-nosnippet>187</a>        }
+<a href=#188 id=188 data-nosnippet>188</a>    }
+<a href=#189 id=189 data-nosnippet>189</a>
+<a href=#190 id=190 data-nosnippet>190</a>    <span class="doccomment">/// Advance the clock, incorporate new samples, prune dead peers, and
+<a href=#191 id=191 data-nosnippet>191</a>    /// return each live peer's estimate at the current time.
+<a href=#192 id=192 data-nosnippet>192</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>observe(
+<a href=#193 id=193 data-nosnippet>193</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#194 id=194 data-nosnippet>194</a>        peers: <span class="kw-2">&amp;</span>[<span class="kw">super</span>::PeerRate&lt;T&gt;],
+<a href=#195 id=195 data-nosnippet>195</a>        dt: Duration,
+<a href=#196 id=196 data-nosnippet>196</a>    ) -&gt; Vec&lt;PeerEstimate&lt;T&gt;&gt; {
+<a href=#197 id=197 data-nosnippet>197</a>        <span class="self">self</span>.clock = <span class="self">self</span>.clock + T::from_f64(dt.as_secs_f64()).unwrap();
+<a href=#198 id=198 data-nosnippet>198</a>
+<a href=#199 id=199 data-nosnippet>199</a>        <span class="kw">let </span><span class="kw-2">mut </span>estimates = Vec::with_capacity(peers.len());
+<a href=#200 id=200 data-nosnippet>200</a>        <span class="kw">let </span><span class="kw-2">mut </span>seen: Vec&lt;<span class="kw-2">&amp;</span>str&gt; = Vec::with_capacity(peers.len());
+<a href=#201 id=201 data-nosnippet>201</a>
+<a href=#202 id=202 data-nosnippet>202</a>        <span class="kw">for </span>obs <span class="kw">in </span>peers {
+<a href=#203 id=203 data-nosnippet>203</a>            <span class="comment">// Past the membership horizon the peer is presumed gone; skip it
+<a href=#204 id=204 data-nosnippet>204</a>            // here and prune its filter below
+<a href=#205 id=205 data-nosnippet>205</a>            </span><span class="kw">if </span>obs.age &gt;= <span class="self">self</span>.stale_timeout {
+<a href=#206 id=206 data-nosnippet>206</a>                <span class="kw">continue</span>;
+<a href=#207 id=207 data-nosnippet>207</a>            }
+<a href=#208 id=208 data-nosnippet>208</a>            seen.push(obs.id.as_str());
+<a href=#209 id=209 data-nosnippet>209</a>
+<a href=#210 id=210 data-nosnippet>210</a>            <span class="kw">let </span>age = T::from_f64(obs.age.as_secs_f64()).unwrap();
+<a href=#211 id=211 data-nosnippet>211</a>            <span class="kw">let </span>sample_time = <span class="self">self</span>.clock - age;
+<a href=#212 id=212 data-nosnippet>212</a>
+<a href=#213 id=213 data-nosnippet>213</a>            <span class="kw">let </span>filter = <span class="self">self
+<a href=#214 id=214 data-nosnippet>214</a>                </span>.filters
+<a href=#215 id=215 data-nosnippet>215</a>                .entry(obs.id.clone())
+<a href=#216 id=216 data-nosnippet>216</a>                .or_insert_with(|| PeerFilter {
+<a href=#217 id=217 data-nosnippet>217</a>                    <span class="comment">// First contact: the sample itself is the prior, with a
+<a href=#218 id=218 data-nosnippet>218</a>                    // single measurement's worth of variance (Welch &amp; Bishop
+<a href=#219 id=219 data-nosnippet>219</a>                    // §4: filter initialization from the first observation)
+<a href=#220 id=220 data-nosnippet>220</a>                    </span>mean: obs.rate,
+<a href=#221 id=221 data-nosnippet>221</a>                    variance: <span class="self">self</span>.measurement_noise,
+<a href=#222 id=222 data-nosnippet>222</a>                    last_sample_time: sample_time,
+<a href=#223 id=223 data-nosnippet>223</a>                });
+<a href=#224 id=224 data-nosnippet>224</a>
+<a href=#225 id=225 data-nosnippet>225</a>            <span class="comment">// A strictly newer sample time means the transport delivered a
+<a href=#226 id=226 data-nosnippet>226</a>            // fresh observation (ages reset on receipt); run one
+<a href=#227 id=227 data-nosnippet>227</a>            // predict/update cycle sized by the inter-sample gap
+<a href=#228 id=228 data-nosnippet>228</a>            </span><span class="kw">let </span>gap = sample_time - filter.last_sample_time;
+<a href=#229 id=229 data-nosnippet>229</a>            <span class="kw">if </span>gap &gt; T::zero() {
+<a href=#230 id=230 data-nosnippet>230</a>                <span class="kw">let </span>predicted_var = filter.variance + <span class="self">self</span>.process_noise * gap;
+<a href=#231 id=231 data-nosnippet>231</a>                <span class="kw">let </span>gain = predicted_var / (predicted_var + <span class="self">self</span>.measurement_noise);
+<a href=#232 id=232 data-nosnippet>232</a>                filter.mean = filter.mean + gain * (obs.rate - filter.mean);
+<a href=#233 id=233 data-nosnippet>233</a>                filter.variance = (T::one() - gain) * predicted_var;
+<a href=#234 id=234 data-nosnippet>234</a>                filter.last_sample_time = sample_time;
+<a href=#235 id=235 data-nosnippet>235</a>            }
+<a href=#236 id=236 data-nosnippet>236</a>
+<a href=#237 id=237 data-nosnippet>237</a>            <span class="comment">// Estimate at the current clock: mean is unchanged under the
+<a href=#238 id=238 data-nosnippet>238</a>            // random walk; variance grows with time since the last sample
+<a href=#239 id=239 data-nosnippet>239</a>            </span><span class="kw">let </span>since_sample = <span class="self">self</span>.clock - filter.last_sample_time;
+<a href=#240 id=240 data-nosnippet>240</a>            estimates.push(PeerEstimate {
+<a href=#241 id=241 data-nosnippet>241</a>                mean: filter.mean,
+<a href=#242 id=242 data-nosnippet>242</a>                variance: filter.variance + <span class="self">self</span>.process_noise * since_sample,
+<a href=#243 id=243 data-nosnippet>243</a>            });
+<a href=#244 id=244 data-nosnippet>244</a>        }
+<a href=#245 id=245 data-nosnippet>245</a>
+<a href=#246 id=246 data-nosnippet>246</a>        <span class="comment">// Prune peers no longer observed (or past the horizon) so a dead
+<a href=#247 id=247 data-nosnippet>247</a>        // peer's mean cannot reserve headroom forever
+<a href=#248 id=248 data-nosnippet>248</a>        </span><span class="self">self</span>.filters.retain(|id, <span class="kw">_</span>| seen.contains(<span class="kw-2">&amp;</span>id.as_str()));
+<a href=#249 id=249 data-nosnippet>249</a>
+<a href=#250 id=250 data-nosnippet>250</a>        estimates
+<a href=#251 id=251 data-nosnippet>251</a>    }
+<a href=#252 id=252 data-nosnippet>252</a>}
+<a href=#253 id=253 data-nosnippet>253</a>
+<a href=#254 id=254 data-nosnippet>254</a><span class="doccomment">/// Pure Bayesian estimate-and-set engine. See the module docs for the
+<a href=#255 id=255 data-nosnippet>255</a>/// model, admission policy, and parameter meanings.
+<a href=#256 id=256 data-nosnippet>256</a></span><span class="attr">#[derive(Debug, Clone)]
+<a href=#257 id=257 data-nosnippet>257</a></span><span class="kw">pub struct </span>BayesianEngine&lt;T&gt; {
+<a href=#258 id=258 data-nosnippet>258</a>    bank: FilterBank&lt;T&gt;,
+<a href=#259 id=259 data-nosnippet>259</a>    confidence_z: T,
+<a href=#260 id=260 data-nosnippet>260</a>    last_setpoint: <span class="prelude-ty">Option</span>&lt;T&gt;,
+<a href=#261 id=261 data-nosnippet>261</a>}
+<a href=#262 id=262 data-nosnippet>262</a>
+<a href=#263 id=263 data-nosnippet>263</a><span class="kw">impl</span>&lt;T: Float + FromPrimitive + Copy&gt; BayesianEngine&lt;T&gt; {
+<a href=#264 id=264 data-nosnippet>264</a>    <span class="kw">pub fn </span>new(params: BayesianParams) -&gt; <span class="self">Self </span>{
+<a href=#265 id=265 data-nosnippet>265</a>        BayesianEngine {
+<a href=#266 id=266 data-nosnippet>266</a>            bank: FilterBank::new(<span class="kw-2">&amp;</span>params),
+<a href=#267 id=267 data-nosnippet>267</a>            confidence_z: T::from_f64(params.confidence_z).unwrap(),
+<a href=#268 id=268 data-nosnippet>268</a>            last_setpoint: <span class="prelude-val">None</span>,
+<a href=#269 id=269 data-nosnippet>269</a>        }
+<a href=#270 id=270 data-nosnippet>270</a>    }
+<a href=#271 id=271 data-nosnippet>271</a>}
+<a href=#272 id=272 data-nosnippet>272</a>
+<a href=#273 id=273 data-nosnippet>273</a><span class="kw">impl</span>&lt;T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug&gt; RateController&lt;T&gt;
+<a href=#274 id=274 data-nosnippet>274</a>    <span class="kw">for </span>BayesianEngine&lt;T&gt;
+<a href=#275 id=275 data-nosnippet>275</a>{
+<a href=#276 id=276 data-nosnippet>276</a>    <span class="kw">fn </span>update(<span class="kw-2">&amp;mut </span><span class="self">self</span>, input: <span class="kw-2">&amp;</span>ControlInput&lt;<span class="lifetime">'_</span>, T&gt;) -&gt; T {
+<a href=#277 id=277 data-nosnippet>277</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(cluster_target) = input.cluster_target <span class="kw">else </span>{
+<a href=#278 id=278 data-nosnippet>278</a>            <span class="comment">// Single-node mode: estimation adds nothing (there are no peers
+<a href=#279 id=279 data-nosnippet>279</a>            // to estimate); the token bucket enforces the static target
+<a href=#280 id=280 data-nosnippet>280</a>            </span><span class="kw">let </span>refill = num_traits::clamp(input.target_rate, input.min_rate, input.max_rate);
+<a href=#281 id=281 data-nosnippet>281</a>            <span class="self">self</span>.last_setpoint = <span class="prelude-val">Some</span>(refill);
+<a href=#282 id=282 data-nosnippet>282</a>            <span class="kw">return </span>refill;
+<a href=#283 id=283 data-nosnippet>283</a>        };
+<a href=#284 id=284 data-nosnippet>284</a>
+<a href=#285 id=285 data-nosnippet>285</a>        <span class="kw">let </span>estimates = <span class="self">self</span>.bank.observe(input.peers, input.dt);
+<a href=#286 id=286 data-nosnippet>286</a>        <span class="kw">let </span>live = estimates.len();
+<a href=#287 id=287 data-nosnippet>287</a>
+<a href=#288 id=288 data-nosnippet>288</a>        <span class="kw">let </span><span class="kw-2">mut </span>peer_sum = T::zero();
+<a href=#289 id=289 data-nosnippet>289</a>        <span class="kw">let </span><span class="kw-2">mut </span>peer_var = T::zero();
+<a href=#290 id=290 data-nosnippet>290</a>        <span class="kw">for </span>e <span class="kw">in </span><span class="kw-2">&amp;</span>estimates {
+<a href=#291 id=291 data-nosnippet>291</a>            peer_sum = peer_sum + e.mean;
+<a href=#292 id=292 data-nosnippet>292</a>            peer_var = peer_var + e.variance;
+<a href=#293 id=293 data-nosnippet>293</a>        }
+<a href=#294 id=294 data-nosnippet>294</a>
+<a href=#295 id=295 data-nosnippet>295</a>        <span class="comment">// Admit against the upper confidence bound of the peer total
+<a href=#296 id=296 data-nosnippet>296</a>        </span><span class="kw">let </span>ucb = peer_sum + <span class="self">self</span>.confidence_z * peer_var.sqrt();
+<a href=#297 id=297 data-nosnippet>297</a>        <span class="kw">let </span>headroom = cluster_target - ucb;
+<a href=#298 id=298 data-nosnippet>298</a>
+<a href=#299 id=299 data-nosnippet>299</a>        <span class="kw">let </span>n = T::from_usize(<span class="number">1 </span>+ live).unwrap();
+<a href=#300 id=300 data-nosnippet>300</a>        <span class="kw">let </span>refill = num_traits::clamp(headroom, input.min_rate / n, input.max_rate / n);
+<a href=#301 id=301 data-nosnippet>301</a>        <span class="self">self</span>.last_setpoint = <span class="prelude-val">Some</span>(refill);
+<a href=#302 id=302 data-nosnippet>302</a>        refill
+<a href=#303 id=303 data-nosnippet>303</a>    }
+<a href=#304 id=304 data-nosnippet>304</a>
+<a href=#305 id=305 data-nosnippet>305</a>    <span class="kw">fn </span>setpoint(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; T {
+<a href=#306 id=306 data-nosnippet>306</a>        <span class="comment">// The engine's effective local target is the admission rate itself
+<a href=#307 id=307 data-nosnippet>307</a>        </span><span class="self">self</span>.last_setpoint.unwrap_or_else(T::zero)
+<a href=#308 id=308 data-nosnippet>308</a>    }
+<a href=#309 id=309 data-nosnippet>309</a>}
+<a href=#310 id=310 data-nosnippet>310</a>
+<a href=#311 id=311 data-nosnippet>311</a><span class="attr">#[cfg(test)]
+<a href=#312 id=312 data-nosnippet>312</a></span><span class="kw">mod </span>tests {
+<a href=#313 id=313 data-nosnippet>313</a>    <span class="kw">use super</span>::<span class="kw-2">*</span>;
+<a href=#314 id=314 data-nosnippet>314</a>    <span class="kw">use </span><span class="kw">crate</span>::engine::PeerRate;
+<a href=#315 id=315 data-nosnippet>315</a>
+<a href=#316 id=316 data-nosnippet>316</a>    <span class="kw">fn </span>peer(id: <span class="kw-2">&amp;</span>str, rate: f64, age_ms: u64) -&gt; PeerRate&lt;f64&gt; {
+<a href=#317 id=317 data-nosnippet>317</a>        PeerRate {
+<a href=#318 id=318 data-nosnippet>318</a>            id: id.to_string(),
+<a href=#319 id=319 data-nosnippet>319</a>            rate,
+<a href=#320 id=320 data-nosnippet>320</a>            age: Duration::from_millis(age_ms),
+<a href=#321 id=321 data-nosnippet>321</a>        }
+<a href=#322 id=322 data-nosnippet>322</a>    }
+<a href=#323 id=323 data-nosnippet>323</a>
+<a href=#324 id=324 data-nosnippet>324</a>    <span class="kw">fn </span>input&lt;<span class="lifetime">'a</span>&gt;(
+<a href=#325 id=325 data-nosnippet>325</a>        local_rate: f64,
+<a href=#326 id=326 data-nosnippet>326</a>        peers: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>[PeerRate&lt;f64&gt;],
+<a href=#327 id=327 data-nosnippet>327</a>        cluster_target: <span class="prelude-ty">Option</span>&lt;f64&gt;,
+<a href=#328 id=328 data-nosnippet>328</a>    ) -&gt; ControlInput&lt;<span class="lifetime">'a</span>, f64&gt; {
+<a href=#329 id=329 data-nosnippet>329</a>        ControlInput {
+<a href=#330 id=330 data-nosnippet>330</a>            local_rate,
+<a href=#331 id=331 data-nosnippet>331</a>            peers,
+<a href=#332 id=332 data-nosnippet>332</a>            target_rate: <span class="number">100.0</span>,
+<a href=#333 id=333 data-nosnippet>333</a>            cluster_target,
+<a href=#334 id=334 data-nosnippet>334</a>            min_rate: <span class="number">30.0</span>,
+<a href=#335 id=335 data-nosnippet>335</a>            max_rate: <span class="number">600.0</span>,
+<a href=#336 id=336 data-nosnippet>336</a>            dt: Duration::from_secs(<span class="number">1</span>),
+<a href=#337 id=337 data-nosnippet>337</a>        }
+<a href=#338 id=338 data-nosnippet>338</a>    }
+<a href=#339 id=339 data-nosnippet>339</a>
+<a href=#340 id=340 data-nosnippet>340</a>    <span class="attr">#[test]
+<a href=#341 id=341 data-nosnippet>341</a>    </span><span class="kw">fn </span>test_no_peers_takes_full_target() {
+<a href=#342 id=342 data-nosnippet>342</a>        <span class="kw">let </span><span class="kw-2">mut </span>engine = BayesianEngine::new(BayesianParams::default());
+<a href=#343 id=343 data-nosnippet>343</a>        <span class="kw">let </span>refill = engine.update(<span class="kw-2">&amp;</span>input(<span class="number">0.0</span>, <span class="kw-2">&amp;</span>[], <span class="prelude-val">Some</span>(<span class="number">300.0</span>)));
+<a href=#344 id=344 data-nosnippet>344</a>        <span class="macro">assert_eq!</span>(refill, <span class="number">300.0</span>, <span class="string">"cold start: no peers → full cluster target"</span>);
+<a href=#345 id=345 data-nosnippet>345</a>    }
+<a href=#346 id=346 data-nosnippet>346</a>
+<a href=#347 id=347 data-nosnippet>347</a>    <span class="attr">#[test]
+<a href=#348 id=348 data-nosnippet>348</a>    </span><span class="kw">fn </span>test_headroom_shrinks_with_peer_load() {
+<a href=#349 id=349 data-nosnippet>349</a>        <span class="kw">let </span><span class="kw-2">mut </span>engine = BayesianEngine::new(BayesianParams::default());
+<a href=#350 id=350 data-nosnippet>350</a>        <span class="kw">let </span>peers = <span class="macro">vec!</span>[peer(<span class="string">"a"</span>, <span class="number">100.0</span>, <span class="number">0</span>), peer(<span class="string">"b"</span>, <span class="number">100.0</span>, <span class="number">0</span>)];
+<a href=#351 id=351 data-nosnippet>351</a>        <span class="kw">let </span>refill = engine.update(<span class="kw-2">&amp;</span>input(<span class="number">100.0</span>, <span class="kw-2">&amp;</span>peers, <span class="prelude-val">Some</span>(<span class="number">300.0</span>)));
+<a href=#352 id=352 data-nosnippet>352</a>        <span class="comment">// Headroom = 300 − (200 + z·σ) &lt; 100, and above min bound 30/3
+<a href=#353 id=353 data-nosnippet>353</a>        </span><span class="macro">assert!</span>(refill &lt; <span class="number">100.0</span>, <span class="string">"got {}"</span>, refill);
+<a href=#354 id=354 data-nosnippet>354</a>        <span class="macro">assert!</span>(refill &gt; <span class="number">10.0</span>, <span class="string">"got {}"</span>, refill);
+<a href=#355 id=355 data-nosnippet>355</a>    }
+<a href=#356 id=356 data-nosnippet>356</a>
+<a href=#357 id=357 data-nosnippet>357</a>    <span class="attr">#[test]
+<a href=#358 id=358 data-nosnippet>358</a>    </span><span class="kw">fn </span>test_staleness_widens_error_bars() {
+<a href=#359 id=359 data-nosnippet>359</a>        <span class="kw">let </span>params = BayesianParams::default();
+<a href=#360 id=360 data-nosnippet>360</a>        <span class="kw">let </span><span class="kw-2">mut </span>fresh_engine = BayesianEngine::new(params);
+<a href=#361 id=361 data-nosnippet>361</a>        <span class="kw">let </span><span class="kw-2">mut </span>stale_engine = BayesianEngine::new(params);
+<a href=#362 id=362 data-nosnippet>362</a>
+<a href=#363 id=363 data-nosnippet>363</a>        <span class="comment">// Both engines see the same peer, then it goes silent for one
+<a href=#364 id=364 data-nosnippet>364</a>        </span><span class="kw">let </span>warm = <span class="macro">vec!</span>[peer(<span class="string">"a"</span>, <span class="number">100.0</span>, <span class="number">0</span>)];
+<a href=#365 id=365 data-nosnippet>365</a>        fresh_engine.update(<span class="kw-2">&amp;</span>input(<span class="number">100.0</span>, <span class="kw-2">&amp;</span>warm, <span class="prelude-val">Some</span>(<span class="number">300.0</span>)));
+<a href=#366 id=366 data-nosnippet>366</a>        stale_engine.update(<span class="kw-2">&amp;</span>input(<span class="number">100.0</span>, <span class="kw-2">&amp;</span>warm, <span class="prelude-val">Some</span>(<span class="number">300.0</span>)));
+<a href=#367 id=367 data-nosnippet>367</a>
+<a href=#368 id=368 data-nosnippet>368</a>        <span class="kw">let </span>fresh = fresh_engine.update(<span class="kw-2">&amp;</span>input(<span class="number">100.0</span>, <span class="kw-2">&amp;</span>[peer(<span class="string">"a"</span>, <span class="number">100.0</span>, <span class="number">100</span>)], <span class="prelude-val">Some</span>(<span class="number">300.0</span>)));
+<a href=#369 id=369 data-nosnippet>369</a>        <span class="kw">let </span>stale = stale_engine.update(<span class="kw-2">&amp;</span>input(<span class="number">100.0</span>, <span class="kw-2">&amp;</span>[peer(<span class="string">"a"</span>, <span class="number">100.0</span>, <span class="number">8000</span>)], <span class="prelude-val">Some</span>(<span class="number">300.0</span>)));
+<a href=#370 id=370 data-nosnippet>370</a>        <span class="macro">assert!</span>(
+<a href=#371 id=371 data-nosnippet>371</a>            stale &lt; fresh,
+<a href=#372 id=372 data-nosnippet>372</a>            <span class="string">"stale info must admit less: stale {} vs fresh {}"</span>,
+<a href=#373 id=373 data-nosnippet>373</a>            stale,
+<a href=#374 id=374 data-nosnippet>374</a>            fresh
+<a href=#375 id=375 data-nosnippet>375</a>        );
+<a href=#376 id=376 data-nosnippet>376</a>    }
+<a href=#377 id=377 data-nosnippet>377</a>
+<a href=#378 id=378 data-nosnippet>378</a>    <span class="attr">#[test]
+<a href=#379 id=379 data-nosnippet>379</a>    </span><span class="kw">fn </span>test_dead_peer_dropped_frees_headroom() {
+<a href=#380 id=380 data-nosnippet>380</a>        <span class="kw">let </span><span class="kw-2">mut </span>engine = BayesianEngine::new(BayesianParams::default());
+<a href=#381 id=381 data-nosnippet>381</a>        <span class="kw">let </span>warm = <span class="macro">vec!</span>[peer(<span class="string">"a"</span>, <span class="number">200.0</span>, <span class="number">0</span>)];
+<a href=#382 id=382 data-nosnippet>382</a>        <span class="kw">let </span>before = engine.update(<span class="kw-2">&amp;</span>input(<span class="number">50.0</span>, <span class="kw-2">&amp;</span>warm, <span class="prelude-val">Some</span>(<span class="number">300.0</span>)));
+<a href=#383 id=383 data-nosnippet>383</a>
+<a href=#384 id=384 data-nosnippet>384</a>        <span class="comment">// Peer past the membership horizon: filter pruned, headroom back
+<a href=#385 id=385 data-nosnippet>385</a>        </span><span class="kw">let </span>gone = <span class="macro">vec!</span>[peer(<span class="string">"a"</span>, <span class="number">200.0</span>, <span class="number">15_000</span>)];
+<a href=#386 id=386 data-nosnippet>386</a>        <span class="kw">let </span>after = engine.update(<span class="kw-2">&amp;</span>input(<span class="number">50.0</span>, <span class="kw-2">&amp;</span>gone, <span class="prelude-val">Some</span>(<span class="number">300.0</span>)));
+<a href=#387 id=387 data-nosnippet>387</a>        <span class="macro">assert!</span>(before &lt; <span class="number">150.0</span>);
+<a href=#388 id=388 data-nosnippet>388</a>        <span class="macro">assert_eq!</span>(after, <span class="number">300.0</span>, <span class="string">"dead peer must not reserve headroom"</span>);
+<a href=#389 id=389 data-nosnippet>389</a>    }
+<a href=#390 id=390 data-nosnippet>390</a>
+<a href=#391 id=391 data-nosnippet>391</a>    <span class="attr">#[test]
+<a href=#392 id=392 data-nosnippet>392</a>    </span><span class="kw">fn </span>test_filter_converges_to_true_rate() {
+<a href=#393 id=393 data-nosnippet>393</a>        <span class="kw">let </span>params = BayesianParams {
+<a href=#394 id=394 data-nosnippet>394</a>            process_noise: <span class="number">1.0</span>,
+<a href=#395 id=395 data-nosnippet>395</a>            measurement_noise: <span class="number">100.0</span>,
+<a href=#396 id=396 data-nosnippet>396</a>            ..BayesianParams::default()
+<a href=#397 id=397 data-nosnippet>397</a>        };
+<a href=#398 id=398 data-nosnippet>398</a>        <span class="kw">let </span><span class="kw-2">mut </span>bank = FilterBank::&lt;f64&gt;::new(<span class="kw-2">&amp;</span>params);
+<a href=#399 id=399 data-nosnippet>399</a>        <span class="comment">// Repeated samples at 100 rps, arriving fresh every second
+<a href=#400 id=400 data-nosnippet>400</a>        </span><span class="kw">let </span><span class="kw-2">mut </span>mean = <span class="number">0.0</span>;
+<a href=#401 id=401 data-nosnippet>401</a>        <span class="kw">for _ in </span><span class="number">0</span>..<span class="number">30 </span>{
+<a href=#402 id=402 data-nosnippet>402</a>            <span class="kw">let </span>est = bank.observe(<span class="kw-2">&amp;</span>[peer(<span class="string">"a"</span>, <span class="number">100.0</span>, <span class="number">0</span>)], Duration::from_secs(<span class="number">1</span>));
+<a href=#403 id=403 data-nosnippet>403</a>            mean = est[<span class="number">0</span>].mean;
+<a href=#404 id=404 data-nosnippet>404</a>        }
+<a href=#405 id=405 data-nosnippet>405</a>        <span class="macro">assert!</span>((mean - <span class="number">100.0</span>).abs() &lt; <span class="number">1.0</span>, <span class="string">"converged to {}"</span>, mean);
+<a href=#406 id=406 data-nosnippet>406</a>    }
+<a href=#407 id=407 data-nosnippet>407</a>
+<a href=#408 id=408 data-nosnippet>408</a>    <span class="attr">#[test]
+<a href=#409 id=409 data-nosnippet>409</a>    </span><span class="kw">fn </span>test_deterministic_summation_order() {
+<a href=#410 id=410 data-nosnippet>410</a>        <span class="comment">// BTreeMap keying: identical inputs in different list order give
+<a href=#411 id=411 data-nosnippet>411</a>        // identical results
+<a href=#412 id=412 data-nosnippet>412</a>        </span><span class="kw">let </span>mk = || BayesianEngine::new(BayesianParams::default());
+<a href=#413 id=413 data-nosnippet>413</a>        <span class="kw">let </span>(<span class="kw-2">mut </span>e1, <span class="kw-2">mut </span>e2) = (mk(), mk());
+<a href=#414 id=414 data-nosnippet>414</a>        <span class="kw">let </span>fwd = <span class="macro">vec!</span>[peer(<span class="string">"a"</span>, <span class="number">10.0</span>, <span class="number">0</span>), peer(<span class="string">"b"</span>, <span class="number">20.0</span>, <span class="number">0</span>), peer(<span class="string">"c"</span>, <span class="number">30.0</span>, <span class="number">0</span>)];
+<a href=#415 id=415 data-nosnippet>415</a>        <span class="kw">let </span>rev: Vec&lt;<span class="kw">_</span>&gt; = fwd.iter().rev().cloned().collect();
+<a href=#416 id=416 data-nosnippet>416</a>        <span class="kw">let </span>r1 = e1.update(<span class="kw-2">&amp;</span>input(<span class="number">5.0</span>, <span class="kw-2">&amp;</span>fwd, <span class="prelude-val">Some</span>(<span class="number">300.0</span>)));
+<a href=#417 id=417 data-nosnippet>417</a>        <span class="kw">let </span>r2 = e2.update(<span class="kw-2">&amp;</span>input(<span class="number">5.0</span>, <span class="kw-2">&amp;</span>rev, <span class="prelude-val">Some</span>(<span class="number">300.0</span>)));
+<a href=#418 id=418 data-nosnippet>418</a>        <span class="macro">assert_eq!</span>(r1, r2);
+<a href=#419 id=419 data-nosnippet>419</a>    }
+<a href=#420 id=420 data-nosnippet>420</a>
+<a href=#421 id=421 data-nosnippet>421</a>    <span class="attr">#[test]
+<a href=#422 id=422 data-nosnippet>422</a>    </span><span class="kw">fn </span>test_single_node_mode_static() {
+<a href=#423 id=423 data-nosnippet>423</a>        <span class="kw">let </span><span class="kw-2">mut </span>engine = BayesianEngine::new(BayesianParams::default());
+<a href=#424 id=424 data-nosnippet>424</a>        <span class="kw">let </span>refill = engine.update(<span class="kw-2">&amp;</span>input(<span class="number">50.0</span>, <span class="kw-2">&amp;</span>[], <span class="prelude-val">None</span>));
+<a href=#425 id=425 data-nosnippet>425</a>        <span class="macro">assert_eq!</span>(refill, <span class="number">100.0</span>);
+<a href=#426 id=426 data-nosnippet>426</a>    }
+<a href=#427 id=427 data-nosnippet>427</a>}
+</code></pre></div></section></main></body></html>
