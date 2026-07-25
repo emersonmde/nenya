@@ -50,6 +50,14 @@ pub struct ClusterTestHarness {
 impl ClusterTestHarness {
     /// Spawn a cluster with the specified number of nodes
     pub async fn spawn_cluster(count: usize) -> Result<Self, String> {
+        Self::spawn_cluster_with_env(count, &[]).await
+    }
+
+    /// Spawn a cluster with extra environment variables applied to every node
+    pub async fn spawn_cluster_with_env(
+        count: usize,
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self, String> {
         if count == 0 {
             return Err("Cluster must have at least 1 node".to_string());
         }
@@ -61,7 +69,7 @@ impl ClusterTestHarness {
         let (http_port, gossip_port) = allocate_port_pair();
         let node_id = "node-0".to_string();
 
-        let process = spawn_node(&node_id, http_port, gossip_port, &[])
+        let process = spawn_node(&node_id, http_port, gossip_port, &[], extra_env)
             .map_err(|e| format!("Failed to spawn node 0: {}", e))?;
 
         seed_nodes.push(format!("127.0.0.1:{}", gossip_port));
@@ -83,7 +91,7 @@ impl ClusterTestHarness {
             let (http_port, gossip_port) = allocate_port_pair();
             let node_id = format!("node-{}", i);
 
-            let process = spawn_node(&node_id, http_port, gossip_port, &seed_nodes)
+            let process = spawn_node(&node_id, http_port, gossip_port, &seed_nodes, extra_env)
                 .map_err(|e| format!("Failed to spawn node {}: {}", i, e))?;
 
             nodes.push(NodeHandle {
@@ -106,6 +114,11 @@ impl ClusterTestHarness {
     }
 
     /// Wait for cluster convergence (all nodes see expected peer count)
+    ///
+    /// `/health` reports the peer count from the first scope's limiter, and
+    /// scopes only exist once a request has touched them — so each poll first
+    /// sends a probe request to every node to ensure a scope exists for the
+    /// gossip sync loop to stamp with the peer count.
     pub async fn wait_for_convergence(&self, timeout: Duration) -> Result<(), String> {
         let expected_peers = self.nodes.len() - 1;
         let start = std::time::Instant::now();
@@ -113,6 +126,10 @@ impl ClusterTestHarness {
         loop {
             if start.elapsed() > timeout {
                 return Err(format!("Cluster failed to converge within {:?}", timeout));
+            }
+
+            for node_idx in 0..self.nodes.len() {
+                let _ = self.should_throttle(node_idx, "__convergence_probe").await;
             }
 
             let mut all_converged = true;
@@ -152,6 +169,51 @@ impl ClusterTestHarness {
             .client
             .post(&url)
             .json(&serde_json::json!({ "scope": scope }))
+            .send()
+            .await
+            .map_err(|e| format!("Request failed: {}", e))?;
+
+        if response.status() != StatusCode::OK {
+            return Err(format!("Request returned status: {}", response.status()));
+        }
+
+        response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse JSON: {}", e))
+    }
+
+    /// Kill a node's process (simulates a crash; the NodeHandle stays in the
+    /// list so indices remain stable, but the process is gone)
+    #[allow(dead_code)] // not every test binary uses every harness method
+    pub async fn kill_node(&mut self, node_idx: usize) -> Result<(), String> {
+        let node = self
+            .nodes
+            .get_mut(node_idx)
+            .ok_or_else(|| format!("Node index {} out of range", node_idx))?;
+
+        if let Some(mut process) = node.process.take() {
+            process
+                .kill()
+                .map_err(|e| format!("Failed to kill node {}: {}", node_idx, e))?;
+            let _ = process.wait();
+        }
+        Ok(())
+    }
+
+    /// Get scope statistics from a node without recording a request
+    #[allow(dead_code)] // not every test binary uses every harness method
+    pub async fn scope_stats(&self, node_idx: usize, scope: &str) -> Result<Value, String> {
+        let node = self
+            .nodes
+            .get(node_idx)
+            .ok_or_else(|| format!("Node index {} out of range", node_idx))?;
+
+        let url = format!("{}?scope={}", node.url("/scope_stats"), scope);
+
+        let response = self
+            .client
+            .get(&url)
             .send()
             .await
             .map_err(|e| format!("Request failed: {}", e))?;
@@ -208,6 +270,7 @@ impl ClusterTestHarness {
     }
 
     /// Generate load across all nodes
+    #[allow(dead_code)] // not every test binary uses every harness method
     pub async fn generate_load(
         &self,
         scope: &str,
@@ -241,6 +304,7 @@ impl ClusterTestHarness {
 
 /// Load generation statistics
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct LoadStats {
     pub total_requests: usize,
     pub accepted: usize,
@@ -253,6 +317,7 @@ fn spawn_node(
     http_port: u16,
     gossip_port: u16,
     seed_nodes: &[String],
+    extra_env: &[(&str, &str)],
 ) -> Result<Child, std::io::Error> {
     let mut cmd = Command::new("cargo");
     cmd.args(["run", "--features", "server", "--quiet", "--"])
@@ -261,10 +326,17 @@ fn spawn_node(
         .env("NENYA_GOSSIP_ADDR", format!("127.0.0.1:{}", gossip_port))
         .env("NENYA_NODE_ID", node_id)
         .env("NENYA_DEFAULT_TARGET_RATE", "100.0")
-        .env("NENYA_DEFAULT_CLUSTER_TARGET", "300.0");
+        .env("NENYA_DEFAULT_CLUSTER_TARGET", "300.0")
+        // The seed node has no seed_nodes of its own, so gossip must be
+        // enabled explicitly or it runs standalone and the cluster never forms
+        .env("NENYA_ENABLE_GOSSIP", "1");
 
     if !seed_nodes.is_empty() {
         cmd.env("NENYA_SEED_NODES", seed_nodes.join(","));
+    }
+
+    for (key, value) in extra_env {
+        cmd.env(key, value);
     }
 
     cmd.spawn()

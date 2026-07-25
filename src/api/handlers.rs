@@ -151,11 +151,14 @@ pub async fn should_throttle(
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let manager = state.manager.read().await;
 
-    // Get first scope's peer count (all scopes should have same peer count)
+    // The sync loop stamps every scope with the live peer count each tick,
+    // but a scope created between ticks still reads 0 — report the max so a
+    // freshly auto-created scope can't mask cluster membership
     let peers = manager
         .get_all_scopes()
-        .first()
+        .iter()
         .map(|(_, stats)| stats.num_peers)
+        .max()
         .unwrap_or(0);
 
     Json(HealthResponse {

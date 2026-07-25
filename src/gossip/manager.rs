@@ -1,8 +1,11 @@
 //! Gossip manager wrapping Chitchat for cluster coordination
 
+use super::aggregate::PeerObservation;
 use super::state::GossipState;
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(feature = "server")]
 use chitchat::{spawn_chitchat, ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig};
@@ -40,6 +43,18 @@ impl std::fmt::Display for GossipError {
 #[cfg(feature = "server")]
 impl std::error::Error for GossipError {}
 
+/// Record of when a peer's state was last observed to change, on the local
+/// monotonic clock
+#[cfg(feature = "server")]
+struct PeerReceipt {
+    /// The peer's gossiped timestamp, used only as an opaque change marker
+    /// (compared for equality, never against local time)
+    last_timestamp: SystemTime,
+
+    /// Local monotonic time when that timestamp was first observed
+    received_at: Instant,
+}
+
 /// Manager for gossip protocol using Chitchat
 #[cfg(feature = "server")]
 pub struct GossipManager {
@@ -51,6 +66,9 @@ pub struct GossipManager {
 
     /// Gossip listen address
     listen_addr: SocketAddr,
+
+    /// Age-at-receipt tracking per peer, for staleness decay
+    receipts: Mutex<HashMap<String, PeerReceipt>>,
 }
 
 #[cfg(feature = "server")]
@@ -90,6 +108,7 @@ impl GossipManager {
             node_id,
             handle,
             listen_addr,
+            receipts: Mutex::new(HashMap::new()),
         })
     }
 
@@ -109,7 +128,49 @@ impl GossipManager {
         Ok(())
     }
 
+    /// Get per-peer observations with locally measured ages, for age-weighted
+    /// aggregation.
+    ///
+    /// Age is time since the peer's gossiped timestamp was last seen to
+    /// *change*, measured on the local monotonic clock (age-at-receipt). The
+    /// peer's `SystemTime` is used only as an opaque change marker and is never
+    /// compared against local time, so cross-node clock skew — including
+    /// future-dated timestamps — cannot produce negative ages or amplified
+    /// rates. A healthy peer republishes with a fresh timestamp every sync
+    /// interval, keeping its age near zero; a crashed or partitioned peer's
+    /// timestamp freezes and its age grows until decay drops it.
+    pub async fn get_peer_observations(&self) -> Vec<PeerObservation> {
+        let states = self.get_peer_states().await;
+        let now = Instant::now();
+
+        let mut receipts = self.receipts.lock().expect("receipts mutex poisoned");
+
+        // Drop receipts for peers Chitchat has evicted (phi accrual failure
+        // detection removes them from the live set) so the map can't grow
+        // unboundedly with node churn
+        receipts.retain(|node_id, _| states.iter().any(|s| &s.node_id == node_id));
+
+        states
+            .into_iter()
+            .map(|state| {
+                let age = observation_age(&mut receipts, &state.node_id, state.timestamp, now);
+                PeerObservation {
+                    node_id: state.node_id,
+                    age,
+                    scope_rates: state
+                        .scopes
+                        .into_iter()
+                        .map(|(scope, s)| (scope, s.accepted_rate))
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
     /// Get states from all peer nodes (excluding self)
+    ///
+    /// Only nodes Chitchat considers live are included, and the local node is
+    /// always skipped — peer rates can never double-count local traffic.
     pub async fn get_peer_states(&self) -> Vec<GossipState> {
         self.handle
             .with_chitchat(|chitchat| {
@@ -169,9 +230,101 @@ impl GossipManager {
     }
 }
 
+/// Compute a peer observation's age from receipt records.
+///
+/// If the peer's gossiped `timestamp` differs from the last one seen (or the
+/// peer is new), the receipt resets and the age is zero; otherwise the age is
+/// the local monotonic time elapsed since that timestamp was first observed.
+/// The timestamp is compared only for equality — its actual value (past,
+/// future, skewed) is irrelevant.
+#[cfg(feature = "server")]
+fn observation_age(
+    receipts: &mut HashMap<String, PeerReceipt>,
+    node_id: &str,
+    timestamp: SystemTime,
+    now: Instant,
+) -> Duration {
+    match receipts.get_mut(node_id) {
+        Some(receipt) if receipt.last_timestamp == timestamp => {
+            now.saturating_duration_since(receipt.received_at)
+        }
+        _ => {
+            receipts.insert(
+                node_id.to_string(),
+                PeerReceipt {
+                    last_timestamp: timestamp,
+                    received_at: now,
+                },
+            );
+            Duration::ZERO
+        }
+    }
+}
+
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_observation_age_new_peer_is_zero() {
+        let mut receipts = HashMap::new();
+        let now = Instant::now();
+        let ts = SystemTime::now();
+
+        let age = observation_age(&mut receipts, "peer-1", ts, now);
+        assert_eq!(age, Duration::ZERO);
+    }
+
+    #[test]
+    fn test_observation_age_grows_while_timestamp_frozen() {
+        let mut receipts = HashMap::new();
+        let start = Instant::now();
+        let ts = SystemTime::now();
+
+        observation_age(&mut receipts, "peer-1", ts, start);
+
+        // Same timestamp seen 3 seconds later (local clock): peer went silent
+        let age = observation_age(&mut receipts, "peer-1", ts, start + Duration::from_secs(3));
+        assert_eq!(age, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn test_observation_age_resets_on_new_timestamp() {
+        let mut receipts = HashMap::new();
+        let start = Instant::now();
+        let ts1 = SystemTime::now();
+
+        observation_age(&mut receipts, "peer-1", ts1, start);
+
+        // Peer republished with a new timestamp: age resets to zero
+        let ts2 = ts1 + Duration::from_millis(500);
+        let age = observation_age(&mut receipts, "peer-1", ts2, start + Duration::from_secs(3));
+        assert_eq!(age, Duration::ZERO);
+
+        // And grows again from there while frozen
+        let age = observation_age(&mut receipts, "peer-1", ts2, start + Duration::from_secs(5));
+        assert_eq!(age, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_observation_age_future_dated_timestamp_harmless() {
+        let mut receipts = HashMap::new();
+        let start = Instant::now();
+
+        // Peer's clock is an hour ahead: timestamp is only a change marker,
+        // so the age is still measured on the local clock
+        let future_ts = SystemTime::now() + Duration::from_secs(3600);
+        let age = observation_age(&mut receipts, "peer-1", future_ts, start);
+        assert_eq!(age, Duration::ZERO);
+
+        let age = observation_age(
+            &mut receipts,
+            "peer-1",
+            future_ts,
+            start + Duration::from_secs(2),
+        );
+        assert_eq!(age, Duration::from_secs(2));
+    }
 
     #[tokio::test]
     async fn test_gossip_state_roundtrip() {

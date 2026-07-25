@@ -4,14 +4,15 @@ This document outlines the implementation plan for Nenya distributed rate limiti
 
 ## Current Milestone
 
-**Status**: Milestones 0-2 Complete - Ready for Milestone 3 (Gossip Correctness Fixes)
+**Status**: Milestones 0-3 Complete - Ready for Milestone 4 (Simulation & Testing Architecture)
 
 **Completed**:
 - ✅ Milestone 0: Single-crate restructure, HTTP stack, distributed coordination foundation
 - ✅ Milestone 1: Single-node HTTP rate limiter with scope management
 - ✅ Milestone 2: Distributed gossip coordination with equal division PID
+- ✅ Milestone 3: Gossip correctness fixes (stale peer decay, sync loop locking)
 
-See Milestone 3 below for next steps.
+See Milestone 4 below for next steps.
 
 ## Principles
 
@@ -79,7 +80,7 @@ Distributed coordination via Chitchat gossip with **equal division PID**:
 
 ## Milestone 3: Gossip Correctness Fixes
 
-- [ ] **MILESTONE COMPLETE**
+- [x] **MILESTONE COMPLETE**
 
 **Goal**: Fix known correctness gaps in the gossip aggregation path before building
 on top of it.
@@ -96,20 +97,24 @@ with no regard for age. A peer that goes silent (crash, partition) keeps
 contributing its last known rate indefinitely, suppressing local admission with
 phantom load. `ScopeState.timestamp` is already gossiped but unused — use it.
 
-- [ ] **Age-weighted aggregation**
-  - Full weight for states fresher than `2 × sync_interval`
-  - Linear (or exponential) decay from there to zero at a configurable
-    `stale_timeout` (default: 10s)
-  - Drop peers entirely past `stale_timeout`
-- [ ] **Clock skew handling**
-  - Peer timestamps come from `SystemTime` on other machines; clamp
-    future-dated timestamps to now, and document tolerance assumptions
-  - Consider age-at-receipt tracking (record local `Instant` when a peer state
-    is received) to avoid cross-node clock comparison entirely
-- [ ] **Verify self-exclusion and dead-node removal**
-  - Confirm `get_peer_states()` never includes the local node (double-count)
-  - Confirm Chitchat's failure detector removes dead nodes from the peer set,
-    and that `num_peers` reflects live peers only
+- [x] **Age-weighted aggregation** (`src/gossip/aggregate.rs`)
+  - Full weight for states fresher than `2 × sync_interval`; linear decay to
+    zero at `stale_timeout` (default 10s, `NENYA_STALE_TIMEOUT_MS`); peers past
+    `stale_timeout` are dropped and excluded from the live peer count
+  - Scopes with no live peer data get their external rate explicitly reset to
+    zero each tick (previously a vanished peer's last injected rate persisted
+    in the limiter forever)
+- [x] **Clock skew handling** — solved via age-at-receipt tracking
+  - `GossipManager` records the local `Instant` whenever a peer's gossiped
+    timestamp *changes*; age is measured entirely on the local monotonic clock
+  - Peer `SystemTime` values are used only as opaque change markers (equality
+    comparison), so skewed or future-dated timestamps cannot produce negative
+    ages or amplified rates — no clamping needed
+- [x] **Verify self-exclusion and dead-node removal**
+  - `get_peer_states()` iterates Chitchat's live nodes and always skips self
+  - Receipt records are pruned when Chitchat evicts a node; `num_peers` now
+    counts only peers with staleness weight > 0 (a silent peer stops counting
+    at `stale_timeout`, before Chitchat eviction)
 
 **Tests**:
 - Unit: stale peer contributes zero after `stale_timeout`
@@ -123,15 +128,27 @@ phantom load. `ScopeState.timestamp` is already gossiped but unused — use it.
 `gossip_sync_loop` takes a write lock on the entire `RateLimitManager` twice per
 500ms tick, serializing against the hot admission path.
 
-- [ ] **Reduce write-lock scope**
-  - Snapshot scope names under a read lock; take short per-mutation write locks
-    (or move to per-limiter locking / `DashMap` if profiling justifies it)
-  - Merge the two write-lock sections (external rate update + peer count update)
-    into one pass
-- [ ] **Benchmark before/after**
-  - Measure p99 `/should_throttle` latency under load with gossip active
-  - Document results; if contention is negligible at realistic scope counts,
-    record that finding and stop (don't over-engineer)
+- [x] **Reduce write-lock scope**
+  - Merged the external-rate update and peer-count update into a single pass
+    under one write lock (was two passes); both critical sections are now a
+    single limiter traversal with no I/O or awaits inside, and gossip I/O
+    happens between them
+- [x] **Benchmark before/after** (`benches/gossip_contention_bench.rs`,
+  `cargo bench --features server --bench gossip_contention_bench`)
+  - Decision latency through the shared `RwLock` path, 100k iterations per
+    case, gossip sync loop idle vs. active at production 500ms interval:
+
+    | Scopes | Idle p50/p99 | Active p50/p99 | Active max |
+    |--------|--------------|----------------|------------|
+    | 1      | 167ns / 209ns | 125ns / 167ns | 47µs |
+    | 100    | 125ns / 167ns | 84ns / 166ns  | 36µs |
+    | 1000   | 83ns / 166ns  | 83ns / 125ns  | 126µs |
+
+  - **Finding: contention is negligible at realistic scope counts.** p50/p99
+    are statistically indistinguishable idle vs. active; the only effect is a
+    rare max-latency outlier (tens of µs) when a decision lands behind the
+    sync loop's write pass. Per-limiter locking / `DashMap` is not justified —
+    recorded and stopped, per the task's guidance.
 
 **Tests**: existing tests pass; add a benchmark comparing decision latency with
 gossip loop idle vs. active at 1, 100, and 1000 scopes

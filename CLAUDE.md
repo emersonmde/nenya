@@ -28,21 +28,19 @@ no coordinator.
 2. **[`docs/architecture.md`](docs/architecture.md)** — design details; each section is marked Implemented or Planned
 3. This file — commands, structure, conventions
 
-**Current milestone: 3 — Gossip Correctness Fixes.** Known defects to fix:
-- **Stale peer decay**: `gossip_sync_loop` (`src/gossip/sync.rs`) sums peer rates
-  with no age weighting. A crashed/partitioned peer's last known rate is counted
-  forever. `ScopeState.timestamp` (`src/gossip/state.rs`) is gossiped but unused.
-- **Lock contention**: the sync loop takes a write lock on the whole
-  `RateLimitManager` twice per 500ms tick, serializing against the admission path.
-  Measure first; fix only if it matters.
+**Current milestone: 4 — Simulation & Testing Architecture.** Build the
+deterministic multi-node simulator (virtual clock, message-bus gossip model,
+seeded workloads, scenario library, metrics + chart artifacts). It must reuse
+the real aggregation/decay logic from `src/gossip/aggregate.rs`, not a
+reimplementation. See the roadmap's Milestone 4 section for the task list.
 
 ## Milestone Overview
 
 | Milestone | Status | Deliverable |
 |-----------|--------|-------------|
 | 0-2 | ✅ Complete | Single-crate structure, HTTP rate limiter, gossip coordination |
-| 3 | ⏳ Current | Gossip correctness fixes (stale decay, locking) |
-| 4 | 🔜 Next | Deterministic multi-node simulator + scenario/benchmark suite |
+| 3 | ✅ Complete | Gossip correctness fixes (stale decay, locking) |
+| 4 | ⏳ Current | Deterministic multi-node simulator + scenario/benchmark suite |
 | 5 | 🔜 Future | Pluggable engines: PID vs Bayesian (Kalman), benchmarked |
 | 6 | 🔜 Future | Two-tier coordination for per-user scale (millions of scopes) |
 | 7 | 🔜 Future | Client SDKs (Rust, Python, Node, Go) |
@@ -105,7 +103,8 @@ src/
 ├── main.rs             # Binary entry (compile_error! without `server` feature)
 ├── api/                # HTTP API: handlers, RateLimitManager, metrics, errors
 ├── config/             # Env-var config (Config::from_env) — TOML is planned, NOT yet implemented
-├── gossip/             # Chitchat integration: manager, state schema, 500ms sync loop
+├── gossip/             # Chitchat integration: manager, state schema, sync loop,
+│                       #   age-weighted staleness decay (aggregate.rs)
 └── discovery/          # Placeholder only (Milestone 8)
 examples/               # request_simulator_plot (egui GUI — retired in M4 for simulator artifacts)
 tests/                  # Integration tests (HTTP API, multi-node gossip)

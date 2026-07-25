@@ -102,10 +102,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let manager_clone = manager.clone();
                 let gossip_clone = gossip.clone();
                 let node_id = config.node_id.clone();
+                let sync_interval = config.sync_interval;
+                let stale_timeout = config.stale_timeout;
 
                 tokio::spawn(async move {
                     tracing::info!("Starting gossip sync loop...");
-                    gossip_sync_loop(manager_clone, gossip_clone, node_id).await;
+                    gossip_sync_loop(
+                        manager_clone,
+                        gossip_clone,
+                        node_id,
+                        sync_interval,
+                        stale_timeout,
+                    )
+                    .await;
                 });
 
                 Some(gossip)

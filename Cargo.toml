@@ -65,3 +65,8 @@ harness = false
 [[bench]]
 name = "pid_controller_bench"
 harness = false
+
+[[bench]]
+name = "gossip_contention_bench"
+harness = false
+required-features = ["server"]

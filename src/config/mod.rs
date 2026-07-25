@@ -11,9 +11,13 @@
 //! - `NENYA_DEFAULT_TARGET_RATE`: Default target rate for new scopes (default: 100.0)
 //! - `NENYA_DEFAULT_CLUSTER_TARGET`: Cluster-wide target rate when distributed (default: 300.0)
 //! - `NENYA_NODE_ID`: Optional node identifier (default: hostname)
+//! - `NENYA_SYNC_INTERVAL_MS`: Gossip sync loop interval in ms (default: 500)
+//! - `NENYA_STALE_TIMEOUT_MS`: Age at which a silent peer's rate contribution
+//!   decays to zero and it stops counting as live (default: 10000)
 
 use std::env;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 #[cfg(feature = "server")]
 use serde::{Deserialize, Serialize};
@@ -84,6 +88,12 @@ pub struct Config {
 
     /// PID derivative gain
     pub default_kd: f64,
+
+    /// Gossip sync loop interval
+    pub sync_interval: Duration,
+
+    /// Age past which a silent peer's gossiped rate is fully discounted
+    pub stale_timeout: Duration,
 }
 
 #[cfg(feature = "server")]
@@ -189,6 +199,36 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.08);
 
+        let sync_interval_ms: u64 = env::var("NENYA_SYNC_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(500);
+
+        if sync_interval_ms == 0 {
+            return Err(ConfigError::InvalidValue(
+                "NENYA_SYNC_INTERVAL_MS".to_string(),
+                "must be positive".to_string(),
+            ));
+        }
+
+        let stale_timeout_ms: u64 = env::var("NENYA_STALE_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10_000);
+
+        // The full-weight window is 2 × sync_interval; a stale timeout inside
+        // it leaves no decay span (hard cutoff) and is almost certainly a
+        // misconfiguration
+        if stale_timeout_ms <= 2 * sync_interval_ms {
+            return Err(ConfigError::InvalidValue(
+                "NENYA_STALE_TIMEOUT_MS".to_string(),
+                format!(
+                    "must exceed 2 × sync interval ({} ms)",
+                    2 * sync_interval_ms
+                ),
+            ));
+        }
+
         Ok(Config {
             cluster_secret,
             listen_addr,
@@ -202,6 +242,8 @@ impl Config {
             default_kp,
             default_ki,
             default_kd,
+            sync_interval: Duration::from_millis(sync_interval_ms),
+            stale_timeout: Duration::from_millis(stale_timeout_ms),
         })
     }
 
@@ -225,6 +267,8 @@ impl Config {
             default_kp: 0.5,
             default_ki: 0.02,
             default_kd: 0.08,
+            sync_interval: Duration::from_millis(500),
+            stale_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -248,6 +292,8 @@ mod tests {
         env::remove_var("NENYA_DEFAULT_KP");
         env::remove_var("NENYA_DEFAULT_KI");
         env::remove_var("NENYA_DEFAULT_KD");
+        env::remove_var("NENYA_SYNC_INTERVAL_MS");
+        env::remove_var("NENYA_STALE_TIMEOUT_MS");
     }
 
     #[test]
@@ -296,6 +342,56 @@ mod tests {
         assert_eq!(config.default_kp, 0.5);
         assert_eq!(config.default_ki, 0.02);
         assert_eq!(config.default_kd, 0.08);
+        assert_eq!(config.sync_interval, Duration::from_millis(500));
+        assert_eq!(config.stale_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    #[serial]
+    fn test_custom_gossip_timing() {
+        clean_env();
+        env::set_var("NENYA_CLUSTER_SECRET", "test");
+        env::set_var("NENYA_SYNC_INTERVAL_MS", "250");
+        env::set_var("NENYA_STALE_TIMEOUT_MS", "5000");
+
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.sync_interval, Duration::from_millis(250));
+        assert_eq!(config.stale_timeout, Duration::from_millis(5000));
+    }
+
+    #[test]
+    #[serial]
+    fn test_stale_timeout_must_exceed_full_weight_window() {
+        clean_env();
+        env::set_var("NENYA_CLUSTER_SECRET", "test");
+        env::set_var("NENYA_SYNC_INTERVAL_MS", "500");
+        env::set_var("NENYA_STALE_TIMEOUT_MS", "1000");
+
+        let result = Config::from_env();
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ConfigError::InvalidValue(name, _) => {
+                assert_eq!(name, "NENYA_STALE_TIMEOUT_MS");
+            }
+            _ => panic!("Expected InvalidValue error"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_zero_sync_interval_rejected() {
+        clean_env();
+        env::set_var("NENYA_CLUSTER_SECRET", "test");
+        env::set_var("NENYA_SYNC_INTERVAL_MS", "0");
+
+        let result = Config::from_env();
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ConfigError::InvalidValue(name, _) => {
+                assert_eq!(name, "NENYA_SYNC_INTERVAL_MS");
+            }
+            _ => panic!("Expected InvalidValue error"),
+        }
     }
 
     #[test]

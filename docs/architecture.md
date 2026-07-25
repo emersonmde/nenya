@@ -139,7 +139,7 @@ cardinality (millions of scopes — the primary use case) is handled by
 two-tier coordination: local-share enforcement for the tail, gossip only for
 scopes near their limit. See Two-Tier Coordination below.
 
-## Gossip Coordination — [Implemented, correctness fixes in Milestone 3]
+## Gossip Coordination — [Implemented]
 
 **Library**: [Chitchat](https://quickwit.io/blog/chitchat) — Scuttlebutt
 anti-entropy with phi accrual failure detection. Chosen over SWIM-style
@@ -156,30 +156,47 @@ struct GossipState {
 }
 struct ScopeState {
     accepted_rate: f64,      // the only value coordination needs
-    timestamp: SystemTime,   // gossiped; used for staleness decay (Milestone 3)
+    timestamp: SystemTime,   // opaque change marker for age-at-receipt tracking
 }
 ```
 
-**Sync loop** (`src/gossip/sync.rs`, every 500ms):
+**Sync loop** (`src/gossip/sync.rs`, every `sync_interval`, default 500ms):
 1. Refresh and publish local per-scope accepted rates
-2. Aggregate peer rates per scope
-3. `set_external_accepted_request_rate(sum)` + `set_num_peers(n)` on each limiter
+2. Aggregate peer rates per scope with age-weighted staleness decay
+   (`src/gossip/aggregate.rs`)
+3. `set_external_accepted_request_rate(weighted_sum)` + `set_num_peers(live)`
+   on every limiter in one pass; scopes with no live peer data are reset to
+   zero so vanished peers leave no phantom load
 
 **Equal division PID**: each node independently computes
 `cluster_total = local + sum(peers)` and adjusts its local refill rate so the
 cluster converges on `cluster_target`. Conservative default gains
 (Kp=0.5, Ki=0.05, Kd=0.05) tolerate 1–2s gossip lag.
 
-### Known gaps — [Milestone 3]
+### Staleness decay — [Implemented, Milestone 3]
 
-- **No staleness decay**: aggregation sums the last known rate from every peer
-  state present, regardless of age. A dead or partitioned peer suppresses local
-  admission with phantom load until Chitchat evicts it. Fix: age-weighted decay
-  to zero at a configurable `stale_timeout` (~10s), using age-at-receipt to
-  avoid cross-node clock comparison.
-- **Lock contention**: the sync loop write-locks the whole manager twice per
-  tick. Measure impact at realistic scope counts; narrow the critical sections
-  if warranted.
+Peer contributions are weighted by freshness: full weight up to
+`2 × sync_interval`, linear decay to zero at `stale_timeout` (default 10s,
+`NENYA_STALE_TIMEOUT_MS`), dropped past it. Age is **age-at-receipt**: the
+`GossipManager` records the local monotonic `Instant` whenever a peer's
+gossiped timestamp changes, and never compares peer wall-clock times against
+local time — so cross-node clock skew (including future-dated timestamps)
+cannot affect decay. A silent peer also stops counting toward `num_peers` at
+`stale_timeout`, before Chitchat's failure detector evicts it. The decay and
+aggregation logic (`src/gossip/aggregate.rs`) is transport-agnostic — it
+consumes `(rate, age)` observations — so the simulator (Milestone 4) and a
+future blackboard transport reuse it unchanged.
+
+### Lock behavior — [Measured, Milestone 3]
+
+The sync loop takes the manager write lock twice per tick (local rate refresh,
+then a single merged update pass), each a lock-only limiter traversal with
+gossip I/O between them. Benchmarked at 1/100/1000 scopes
+(`benches/gossip_contention_bench.rs`): decision-path p50/p99 are
+indistinguishable with the sync loop idle vs. active (p99 ≤ ~210ns); the only
+effect is a rare max-latency outlier (tens of µs) when a decision waits behind
+a sync pass. Finer-grained locking (per-limiter, `DashMap`) is deliberately
+not pursued — the measurement didn't justify it.
 
 ## Coordination Transports — [Gossip: Implemented; Blackboard: Future]
 
@@ -302,6 +319,9 @@ NENYA_GOSSIP_ADDR=0.0.0.0:8081        # gossip transport
 NENYA_SEED_NODES=host1:8081,host2:8081
 NENYA_ENABLE_GOSSIP=1                 # gossip also enabled if seed nodes set
 NENYA_DEFAULT_TARGET_RATE=100.0       # plus default min/max rate, kp/ki/kd
+NENYA_SYNC_INTERVAL_MS=500            # gossip sync loop interval
+NENYA_STALE_TIMEOUT_MS=10000          # silent-peer decay horizon; must exceed
+                                      #   2 × sync interval
 ```
 
 **Target state [Planned — Milestones 7-9]**: layered hierarchy — hardcoded

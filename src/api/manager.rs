@@ -336,6 +336,14 @@ impl RateLimitManager {
         self.limiters.get_mut(scope)
     }
 
+    /// Iterate mutably over all limiters with their scope names
+    ///
+    /// Used by the gossip sync loop to apply external rates and peer counts in
+    /// a single pass under one write lock.
+    pub fn limiters_mut(&mut self) -> impl Iterator<Item = (&String, &mut RateLimiter<f64>)> {
+        self.limiters.iter_mut()
+    }
+
     /// Get the number of active scopes
     pub fn num_scopes(&self) -> usize {
         self.limiters.len()
