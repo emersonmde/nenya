@@ -350,7 +350,7 @@ cargo run --features sim --example cluster_sim -- --scenario partition --seed 42
 ## Milestone 5: Pluggable Control Engine & Bayesian Estimation
 
 - [x] **MILESTONE COMPLETE** (commits 256eda1 → 11d0d6d → be94883 →
-  06984f7 → 0af0622; roadmap/docs finalization commit hash recorded below)
+  06984f7 → 0af0622 → c8460ea)
 
 **Goal**: Make the control engine swappable behind a trait and build three
 candidate engines: PID, pure Bayesian (estimate-and-set), and the Kalman→PID
