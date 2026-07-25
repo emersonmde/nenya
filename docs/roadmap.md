@@ -173,7 +173,7 @@ cargo fmt --check
 
 ## Milestone 4: Simulation & Testing Architecture
 
-- [x] **MILESTONE COMPLETE**
+- [x] **MILESTONE COMPLETE** (commit f80370d)
 
 **Goal**: A deterministic multi-node simulator that becomes the project's primary
 tool for correctness testing, benchmarking, experimentation, and control-loop
