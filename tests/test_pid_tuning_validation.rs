@@ -180,6 +180,14 @@ fn test_derivative_dampening_effectiveness() {
         .output_limit(20.0)
         .build();
 
+    // min_window_samples(0): this test isolates PID dynamics with a hot
+    // tuning (kp=1.0 at a 100ms interval). The adaptive-window floor would
+    // add 20/rate ≈ 0.4s of estimator memory — four update intervals of
+    // lag — which turns this deliberately aggressive loop into a limit
+    // cycle. Production-default gains are unaffected (measured in the
+    // Milestone 5 estimator-floor sweep); aggressive custom tunings at
+    // rates below min_window_samples / update_interval should reduce the
+    // floor like this.
     let base_time = Instant::now();
     let mut limiter_no_d = RateLimiterBuilder::new(50.0)
         .min_rate(25.0)
@@ -187,6 +195,7 @@ fn test_derivative_dampening_effectiveness() {
         .pid_controller(pid_no_d)
         .update_interval(Duration::from_millis(100))
         .initial_timestamp(base_time - Duration::from_secs(1))
+        .min_window_samples(0)
         .build();
 
     let phase_no_d =
@@ -207,6 +216,7 @@ fn test_derivative_dampening_effectiveness() {
         .pid_controller(pid_with_d)
         .update_interval(Duration::from_millis(100))
         .initial_timestamp(base_time2 - Duration::from_secs(1))
+        .min_window_samples(0)
         .build();
 
     let phase_with_d =

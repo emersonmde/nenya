@@ -43,18 +43,30 @@ five → ~400. Gain scheduling by fleet size (Milestone 5) is the lever that
 would flatten this law. Chitchat membership itself is not the binder at
 these sizes (Quickwit operates it at hundreds of nodes).
 
-### 3. Per-node share — rate-estimator floor (known defect)
+### 3. Per-node share — rate-estimator floor (fixed, Milestone 5)
 
-**Keep each scope's per-node fair share above ~5 requests/second.** Below a
-few events/second, the 1s sliding-window rate estimator mostly sees an empty
-window, chronically under-measures, and the PID over-admits by a roughly
-constant ~0.6 rps *per node* (until the max-rate clamp). Measured: a 300 rps
-target split across 400 nodes (0.75 rps/node share) settles at **+98% over
-target**; at 100 rps/node share the bias is <2% at every fleet size tested.
-Tracked as the estimator-floor item in Milestone 5; directly relevant to
-Milestone 6, where per-user shares are tiny by design (the tail tier's
-bucket-only path avoids the estimator, but promoted borderline scopes do
-not).
+**Fixed by the adaptive-window floor** (`min_window_samples = 20`,
+`RateLimiterBuilder::min_window_samples`): trimming keeps the last 20
+accepted timestamps, so below ~20 rps/node the measurement window stretches
+to span real samples instead of reading mostly-empty 1s windows. Swept at
+K ∈ {0, 2, 5, 10, 20, 30, 50} across 0.75/3/5/100 rps/node shares (seed 42,
+300s runs): steady over-admission falls from **+16–18% (old fixed window)
+to +2.5–3.3% at K=20**; K=50 over-remembers at extreme sparsity (+5.4% at
+0.75 rps/node), K=10 leaves ~5%. Healthy shares (≥100 rps/node) are
+byte-identical. Guarded by `capacity_per_node_share_floor_fixed`, which
+also re-runs the K=0 control to keep the original defect reproducible.
+
+Trade-off: the floor adds estimator memory of `K / rate` seconds whenever
+the rate is below `K / update_interval`. With production-default gains this
+is benign at every regime probed (including 100 ms intervals at 10 rps),
+but a deliberately hot tuning (kp = 1.0, 100 ms interval, ~50 rps → 4
+update intervals of estimator lag) rectifies into a limit cycle ~25% above
+target — aggressive custom tunings at rates below `K / update_interval`
+should lower `min_window_samples`. During idle periods the estimate decays
+hyperbolically (`K / elapsed`) rather than snapping to zero; peers see the
+same decaying value via gossip. Still relevant to Milestone 6 sizing:
+promoted per-user scopes now measure accurately down to well below 1
+rps/node.
 
 ### 4. Scope count — gossip encoding/bandwidth, not CPU
 

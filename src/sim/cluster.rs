@@ -79,6 +79,10 @@ pub struct SimConfig {
     /// production)
     pub engine: EngineKind,
 
+    /// Adaptive-window floor for the rate estimator (`None` = library
+    /// default; `Some(0)` = pure fixed window, the pre-Milestone-5 behavior)
+    pub min_window_samples: Option<usize>,
+
     /// Estimator parameter overrides for the bayesian/hybrid engines.
     /// `None` uses the engine-appropriate simulator-derived default
     /// (`BayesianParams::default()` / `BayesianParams::hybrid_default()`).
@@ -113,6 +117,7 @@ impl Default for SimConfig {
             // derived from the Milestone 4 scenario-matrix sweep
             error_limit_frac: Some(0.2),
             engine: EngineKind::Pid,
+            min_window_samples: None,
             estimator: None,
             tick: Duration::from_millis(10),
             gossip: GossipModel::default(),
@@ -532,12 +537,15 @@ fn make_limiter(cfg: &SimConfig, now: Instant) -> RateLimiter<f64> {
         ..cfg.estimator.unwrap_or(engine_default)
     };
 
-    let builder = RateLimiterBuilder::new(cfg.cluster_target)
+    let mut builder = RateLimiterBuilder::new(cfg.cluster_target)
         .cluster_target(cfg.cluster_target)
         .min_rate(cfg.min_rate)
         .max_rate(cfg.max_rate)
         .update_interval(cfg.pid_update_interval)
         .initial_timestamp(now);
+    if let Some(k) = cfg.min_window_samples {
+        builder = builder.min_window_samples(k);
+    }
 
     match cfg.engine {
         EngineKind::Pid => {

@@ -59,34 +59,45 @@ fn capacity_convergence_scales_linearly_with_nodes() {
     }
 }
 
-/// Characterization of a known defect: when the per-node fair share drops
-/// below a few requests/second, the 1s sliding-window rate estimator mostly
-/// sees an empty window, chronically under-measures, and the PID over-admits
-/// (a roughly constant ~0.6 rps/node excess, up to the max-rate clamp).
-/// Measured at Milestone 4: +16% steady overshoot at 100 nodes sharing a
-/// 300 rps target (3 rps/node share).
+/// Regression guard for the Milestone 5.4 estimator-floor fix: the
+/// adaptive-window floor (`min_window_samples = 20`, swept in the roadmap's
+/// estimator-floor item) keeps the sparse-share steady bias small. Before
+/// the fix, the 1s fixed window mostly read empty at a few rps/node, the
+/// PID chronically over-admitted, and this scenario (100 nodes sharing a
+/// 300 rps target, 3 rps/node share) settled at +16% over target; with the
+/// floor it measures +2.5%.
 ///
-/// This is the estimator-floor roadmap item (Milestone 5). If this test
-/// FAILS because the bias went away, the fix landed: flip the assertion,
-/// tighten the healthy-regime bound, and update docs/capacity-model.md and
-/// the roadmap.
+/// Also asserts the old defect stays reproducible with the floor disabled
+/// (`min_window_samples = 0`), so this characterization keeps meaning
+/// something if the estimator changes again.
 #[test]
-#[ignore = "capacity characterization (~2s release); run with --ignored"]
-fn capacity_per_node_share_floor_characterization() {
-    let mut s = scenario::scale(100).duration(Duration::from_secs(300));
-    s.cfg = s.cfg.with_cluster_target(300.0); // 3 rps/node share
-    s.workloads[0].pattern = LoadPattern::Constant { rate: 600.0 };
-    let r = s.run(42);
+#[ignore = "capacity characterization (~4s release); run with --ignored"]
+fn capacity_per_node_share_floor_fixed() {
+    let steady_bias = |k: usize| {
+        let mut s = scenario::scale(100).duration(Duration::from_secs(300));
+        s.cfg = s.cfg.with_cluster_target(300.0); // 3 rps/node share
+        s.cfg.min_window_samples = Some(k);
+        s.workloads[0].pattern = LoadPattern::Constant { rate: 600.0 };
+        let r = s.run(42);
+        let n = r.samples.len();
+        let steady = &r.samples[n - n / 4..];
+        let mean = steady.iter().map(|s| s.accepted_rate).sum::<f64>() / steady.len() as f64;
+        (mean - r.target) / r.target
+    };
 
-    let n = r.samples.len();
-    let steady = &r.samples[n - n / 4..];
-    let mean = steady.iter().map(|s| s.accepted_rate).sum::<f64>() / steady.len() as f64;
-    let bias = (mean - r.target) / r.target;
+    let fixed = steady_bias(20);
     assert!(
-        bias > 0.08,
-        "sparse-share bias measured {:+.1}% — if the estimator floor was fixed, \
-         update this characterization, docs/capacity-model.md, and the roadmap",
-        bias * 100.0
+        fixed < 0.04,
+        "sparse-share bias with the adaptive-window floor measured {:+.1}% (baseline +2.5%)",
+        fixed * 100.0
+    );
+
+    let legacy = steady_bias(0);
+    assert!(
+        legacy > 0.08,
+        "fixed-window control run measured {:+.1}% — the characterization scenario \
+         no longer reproduces the original defect; re-derive it",
+        legacy * 100.0
     );
 }
 

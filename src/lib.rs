@@ -71,6 +71,20 @@ pub(crate) mod discovery;
 #[cfg(feature = "sim")]
 pub mod sim;
 
+/// Adaptive-window floor for the sliding-window rate estimator: trimming
+/// keeps at least this many accepted timestamps, so below
+/// `min_window_samples / update_interval` the measurement window stretches
+/// to span the last N accepts instead of reading mostly-empty windows.
+///
+/// Simulator-derived (Milestone 5.4 sweep, seed 42, 300s runs, PID engine;
+/// re-run instructions in docs/capacity-model.md): steady over-admission at
+/// sparse per-node shares falls from +16–18% (K=0, the old fixed window)
+/// to +2.5–3.3% at K=20 across 0.75/3/5 rps/node shares, with healthy
+/// shares (≥100 rps/node) byte-identical. K=50 over-remembers at extreme
+/// sparsity (+5.4% at 0.75 rps/node); K=10 leaves ~5% bias. 20 is the
+/// swept optimum.
+const DEFAULT_MIN_WINDOW_SAMPLES: usize = 20;
+
 /// Token bucket rate limiter with sliding window measurement and PID controller for adaptive coordination.
 ///
 /// This hybrid architecture uses:
@@ -99,6 +113,12 @@ pub struct RateLimiter<T> {
     // Sliding Window state (rate measurement)
     accepted_request_timestamps: VecDeque<Instant>,
     local_accepted_request_rate: T,
+
+    /// Adaptive-window floor: trimming keeps at least this many accepted
+    /// timestamps even when they fall outside `update_interval`, so the
+    /// rate estimate stays sample-based at sparse rates instead of reading
+    /// an empty window as zero (see the Milestone 5 estimator-floor fix)
+    min_window_samples: usize,
 
     // Control engine (adaptive coordination; PID by default)
     engine: Box<dyn RateController<T>>,
@@ -146,6 +166,7 @@ impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 
             // Sliding window starts empty
             accepted_request_timestamps: VecDeque::new(),
             local_accepted_request_rate: T::zero(),
+            min_window_samples: DEFAULT_MIN_WINDOW_SAMPLES,
 
             // Control engine: the provided PID behind the trait
             engine: Box::new(PidEngine::new(pid_controller)),
@@ -332,13 +353,18 @@ impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 
         }
     }
 
-    /// Trims old accepted request timestamps that are outside the update interval.
+    /// Trims old accepted request timestamps that are outside the update
+    /// interval, but always keeps the most recent `min_window_samples` so
+    /// the rate estimate stays sample-based at sparse rates (below
+    /// `min_window_samples / update_interval` the window stretches to span
+    /// the last N accepts; above it, behavior is unchanged).
     fn trim_accepted_timestamps(&mut self, now: Instant) {
-        while let Some(timestamp) = self.accepted_request_timestamps.front() {
-            if now.duration_since(*timestamp) > self.update_interval {
-                self.accepted_request_timestamps.pop_front();
-            } else {
-                break;
+        while self.accepted_request_timestamps.len() > self.min_window_samples {
+            match self.accepted_request_timestamps.front() {
+                Some(timestamp) if now.duration_since(*timestamp) > self.update_interval => {
+                    self.accepted_request_timestamps.pop_front();
+                }
+                _ => break,
             }
         }
     }
@@ -450,6 +476,7 @@ pub struct RateLimiterBuilder<T> {
     external_accepted_request_rate: T,
     num_peers: usize,
     initial_timestamp: Option<Instant>,
+    min_window_samples: usize,
 }
 
 impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 'static>
@@ -471,7 +498,18 @@ impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 
             external_accepted_request_rate: T::zero(),
             num_peers: 0,
             initial_timestamp: None,
+            min_window_samples: DEFAULT_MIN_WINDOW_SAMPLES,
         }
+    }
+
+    /// Sets the adaptive-window floor: rate-estimate trimming keeps at
+    /// least this many accepted timestamps, stretching the measurement
+    /// window at sparse rates (below `min_window_samples / update_interval`)
+    /// instead of reading a mostly-empty window. `0` restores the pure
+    /// fixed-window estimator.
+    pub fn min_window_samples(mut self, min_window_samples: usize) -> Self {
+        self.min_window_samples = min_window_samples;
+        self
     }
 
     /// Sets the minimum allowable rate of requests.
@@ -621,6 +659,7 @@ impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 
             // Sliding window starts empty
             accepted_request_timestamps: VecDeque::new(),
             local_accepted_request_rate: T::zero(),
+            min_window_samples: self.min_window_samples,
 
             // Control engine
             engine,
@@ -843,6 +882,7 @@ mod tests {
     fn test_trim_accepted_timestamps() {
         let pid = create_pid_controller(1.0, 0.1, 0.01, 0.001, 0.0, None, None);
         let mut rate_limiter = create_rate_limiter(10.0, 5.0, 15.0, pid, Duration::from_secs(1));
+        rate_limiter.min_window_samples = 0; // pure fixed window
 
         let now = Instant::now();
         rate_limiter
@@ -942,10 +982,43 @@ mod tests {
     }
 
     #[test]
+    fn test_adaptive_window_floor_retains_samples() {
+        // With the adaptive floor, sparse samples older than the window are
+        // kept (up to min_window_samples) so the rate estimate stays
+        // sample-based instead of reading empty
+        let pid = create_pid_controller(1.0, 0.1, 0.01, 0.001, 0.0, None, None);
+        let mut rate_limiter = create_rate_limiter(10.0, 5.0, 15.0, pid, Duration::from_secs(1));
+
+        let now = Instant::now();
+        for age_secs in [30, 20, 10] {
+            rate_limiter
+                .accepted_request_timestamps
+                .push_back(now - Duration::from_secs(age_secs));
+        }
+        rate_limiter.trim_accepted_timestamps(now);
+        assert_eq!(
+            rate_limiter.accepted_request_timestamps.len(),
+            3,
+            "sparse samples inside the floor must be retained"
+        );
+
+        // Rate estimate spans the retained window: 3 samples over 30s
+        rate_limiter.calculate_local_accepted_rate(now);
+        let rate = rate_limiter.local_accepted_request_rate();
+        assert!((rate - 0.1).abs() < 0.01, "expected ~0.1 rps, got {}", rate);
+
+        // Beyond the floor, old samples still trim
+        rate_limiter.min_window_samples = 2;
+        rate_limiter.trim_accepted_timestamps(now);
+        assert_eq!(rate_limiter.accepted_request_timestamps.len(), 2);
+    }
+
+    #[test]
     fn test_sliding_window_trim_correctness() {
         // Verify that old timestamps outside the window are removed
         let pid = create_pid_controller(1.0, 0.1, 0.01, 0.001, 0.0, None, None);
         let mut rate_limiter = create_rate_limiter(100.0, 50.0, 150.0, pid, Duration::from_secs(2));
+        rate_limiter.min_window_samples = 0; // pure fixed window
 
         let now = Instant::now();
 
