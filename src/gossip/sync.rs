@@ -1,7 +1,7 @@
 //! Gossip synchronization loop for distributed rate limiting
 
 use super::aggregate::aggregate_peer_rates;
-use super::{GossipManager, GossipState};
+use super::GossipManager;
 use crate::api::RateLimitManager;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,7 +36,7 @@ use tokio::time::interval;
 pub async fn gossip_sync_loop(
     manager: Arc<RwLock<RateLimitManager>>,
     gossip: Arc<GossipManager>,
-    node_id: String,
+    _node_id: String,
     sync_interval: Duration,
     stale_timeout: Duration,
 ) {
@@ -51,15 +51,11 @@ pub async fn gossip_sync_loop(
 
         // 2. Apply observations + tier maintenance + collect publish set
         // (single write lock, no I/O inside)
-        let local_state = {
+        let local_rates = {
             let mut mgr = manager.write().await;
             let now = std::time::Instant::now();
             mgr.apply_peer_observations(&observations, &aggregated, now);
-            let mut state = GossipState::new(node_id.clone());
-            for (scope, rate) in mgr.collect_gossip_rates(now) {
-                tracing::debug!("Gossip: Publishing {}: local_rate={:.2}", scope, rate);
-                state.update_scope(scope, rate);
-            }
+            let rates = mgr.collect_gossip_rates(now);
             tracing::debug!(
                 "Gossip sync: {} scopes ({} hot), {} live peers, {} peer scopes",
                 mgr.num_scopes(),
@@ -67,12 +63,12 @@ pub async fn gossip_sync_loop(
                 aggregated.live_peers,
                 aggregated.scope_rates.len()
             );
-            state
+            rates
         };
 
-        // 3. Publish to cluster (manager lock released)
-        if let Err(e) = gossip.publish_state(&local_state).await {
-            tracing::error!("Failed to publish gossip state: {}", e);
+        // 3. Publish hot-tier rates to the cluster (manager lock released)
+        if let Err(e) = gossip.publish_rates(&local_rates).await {
+            tracing::error!("Failed to publish gossip rates: {}", e);
         }
     }
 }

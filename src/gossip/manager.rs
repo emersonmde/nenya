@@ -1,11 +1,33 @@
 //! Gossip manager wrapping Chitchat for cluster coordination
+//!
+//! # Wire format (Milestone 6)
+//!
+//! One chitchat key per gossiped scope — `s:<scope>` → rate as a compact
+//! decimal — plus a per-node publish counter `nenya_v` used as an opaque
+//! change marker for age tracking. Chitchat's anti-entropy versions each
+//! key independently, so a sync round retransmits only the scopes whose
+//! rates actually changed instead of one monolithic JSON blob (the
+//! pre-Milestone-6 format re-shipped every scope on any change, ~115
+//! bytes/scope of it serde-JSON `SystemTime` overhead). Values are rounded
+//! to 3 decimals so idle scopes publish byte-identical values and cost
+//! nothing per exchange. Scopes that leave the hot tier are deleted
+//! (chitchat tombstones them and garbage-collects after the deletion grace
+//! period).
 
 use super::aggregate::PeerObservation;
-use super::state::GossipState;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
+
+/// Chitchat key prefix for per-scope accepted rates
+const SCOPE_KEY_PREFIX: &str = "s:";
+
+/// Chitchat key for the per-node publish counter (opaque change marker;
+/// replaces the old wall-clock timestamp — it is only ever compared for
+/// equality, never against any clock)
+const VERSION_KEY: &str = "nenya_v";
 
 #[cfg(feature = "server")]
 use chitchat::{spawn_chitchat, ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig};
@@ -47,11 +69,11 @@ impl std::error::Error for GossipError {}
 /// monotonic clock
 #[cfg(feature = "server")]
 struct PeerReceipt {
-    /// The peer's gossiped timestamp, used only as an opaque change marker
-    /// (compared for equality, never against local time)
-    last_timestamp: SystemTime,
+    /// The peer's gossiped publish counter, used only as an opaque change
+    /// marker (compared for equality, never interpreted)
+    last_marker: String,
 
-    /// Local monotonic time when that timestamp was first observed
+    /// Local monotonic time when that marker was first observed
     received_at: Instant,
 }
 
@@ -69,6 +91,13 @@ pub struct GossipManager {
 
     /// Age-at-receipt tracking per peer, for staleness decay
     receipts: Mutex<HashMap<String, PeerReceipt>>,
+
+    /// Publish counter (the `nenya_v` change marker)
+    publish_counter: AtomicU64,
+
+    /// Scope → last published value, for change suppression and deletion
+    /// of scopes that left the hot tier
+    published: Mutex<HashMap<String, String>>,
 }
 
 #[cfg(feature = "server")]
@@ -109,19 +138,51 @@ impl GossipManager {
             handle,
             listen_addr,
             receipts: Mutex::new(HashMap::new()),
+            publish_counter: AtomicU64::new(0),
+            published: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Publish local state to the cluster
-    pub async fn publish_state(&self, state: &GossipState) -> Result<(), GossipError> {
-        let json = state
-            .to_json()
-            .map_err(|e| GossipError::PublishError(format!("JSON serialization error: {}", e)))?;
+    /// Publish the hot-tier per-scope rates to the cluster: one chitchat
+    /// key per scope (only re-set when the rounded value changed, so
+    /// anti-entropy ships just the deltas), deletion for scopes that left
+    /// the hot set, and a bumped `nenya_v` change marker.
+    pub async fn publish_rates(&self, rates: &[(String, f64)]) -> Result<(), GossipError> {
+        let counter = self.publish_counter.fetch_add(1, Ordering::Relaxed) + 1;
 
-        // Update Chitchat state with serialized JSON
+        // Diff against the previously published set outside the chitchat
+        // callback (the mutex is uncontended: only the sync loop publishes)
+        let (to_set, to_delete) = {
+            let mut published = self.published.lock().expect("published mutex poisoned");
+            let mut to_set: Vec<(String, String)> = Vec::new();
+            for (scope, rate) in rates {
+                let value = format!("{:.3}", rate);
+                if published.get(scope) != Some(&value) {
+                    published.insert(scope.clone(), value.clone());
+                    to_set.push((format!("{}{}", SCOPE_KEY_PREFIX, scope), value));
+                }
+            }
+            let current: std::collections::HashSet<&String> =
+                rates.iter().map(|(scope, _)| scope).collect();
+            let to_delete: Vec<String> = published
+                .keys()
+                .filter(|scope| !current.contains(scope))
+                .map(|scope| format!("{}{}", SCOPE_KEY_PREFIX, scope))
+                .collect();
+            published.retain(|scope, _| current.contains(scope));
+            (to_set, to_delete)
+        };
+
         self.handle
-            .with_chitchat(|chitchat| {
-                chitchat.self_node_state().set("nenya_state", json.clone());
+            .with_chitchat(move |chitchat| {
+                let state = chitchat.self_node_state();
+                for (key, value) in &to_set {
+                    state.set(key, value);
+                }
+                for key in &to_delete {
+                    state.delete(key);
+                }
+                state.set(VERSION_KEY, counter.to_string());
             })
             .await;
 
@@ -131,73 +192,72 @@ impl GossipManager {
     /// Get per-peer observations with locally measured ages, for age-weighted
     /// aggregation.
     ///
-    /// Age is time since the peer's gossiped timestamp was last seen to
-    /// *change*, measured on the local monotonic clock (age-at-receipt). The
-    /// peer's `SystemTime` is used only as an opaque change marker and is never
-    /// compared against local time, so cross-node clock skew — including
-    /// future-dated timestamps — cannot produce negative ages or amplified
-    /// rates. A healthy peer republishes with a fresh timestamp every sync
-    /// interval, keeping its age near zero; a crashed or partitioned peer's
-    /// timestamp freezes and its age grows until decay drops it.
+    /// Age is time since the peer's gossiped `nenya_v` counter was last seen
+    /// to *change*, measured on the local monotonic clock (age-at-receipt).
+    /// The counter is an opaque change marker compared only for equality —
+    /// no cross-node clock comparison exists anywhere, so clock skew cannot
+    /// produce negative ages or amplified rates. A healthy peer republishes
+    /// with a bumped counter every sync interval, keeping its age near zero;
+    /// a crashed or partitioned peer's counter freezes and its age grows
+    /// until decay drops it.
+    ///
+    /// Only nodes Chitchat considers live are included, and the local node
+    /// is always skipped — peer rates can never double-count local traffic.
+    /// Nodes with zero hot scopes still publish the counter, so membership
+    /// liveness flows regardless of gossip payload.
     pub async fn get_peer_observations(&self) -> Vec<PeerObservation> {
-        let states = self.get_peer_states().await;
-        let now = Instant::now();
+        // (node_id, change marker, per-scope rates) per live peer
+        let raw: Vec<(String, String, HashMap<String, f64>)> = self
+            .handle
+            .with_chitchat(|chitchat| {
+                let self_id = chitchat.self_chitchat_id().clone();
+                let mut raw = Vec::new();
+                for chitchat_id in chitchat.live_nodes() {
+                    if chitchat_id == &self_id {
+                        continue;
+                    }
+                    let Some(node_state) = chitchat.node_state(chitchat_id) else {
+                        continue;
+                    };
+                    // A node that never published is not an observation
+                    let Some(marker) = node_state.get(VERSION_KEY) else {
+                        continue;
+                    };
+                    let scope_rates: HashMap<String, f64> = node_state
+                        .iter_prefix(SCOPE_KEY_PREFIX)
+                        .filter_map(|(key, versioned)| {
+                            let scope = &key[SCOPE_KEY_PREFIX.len()..];
+                            versioned
+                                .value
+                                .parse::<f64>()
+                                .ok()
+                                .map(|rate| (scope.to_string(), rate))
+                        })
+                        .collect();
+                    raw.push((chitchat_id.node_id.clone(), marker.to_string(), scope_rates));
+                }
+                raw
+            })
+            .await;
 
+        let now = Instant::now();
         let mut receipts = self.receipts.lock().expect("receipts mutex poisoned");
 
         // Drop receipts for peers Chitchat has evicted (phi accrual failure
         // detection removes them from the live set) so the map can't grow
         // unboundedly with node churn
-        receipts.retain(|node_id, _| states.iter().any(|s| &s.node_id == node_id));
+        receipts.retain(|node_id, _| raw.iter().any(|(id, _, _)| id == node_id));
 
-        states
-            .into_iter()
-            .map(|state| {
-                let age = observation_age(&mut receipts, &state.node_id, state.timestamp, now);
+        raw.into_iter()
+            .map(|(node_id, marker, scope_rates)| {
+                let age = observation_age(&mut receipts, &node_id, &marker, now);
                 PeerObservation {
-                    node_id: state.node_id,
+                    node_id,
                     age,
-                    scope_rates: state
-                        .scopes
-                        .into_iter()
-                        .map(|(scope, s)| (scope, s.accepted_rate))
-                        .collect(),
+                    scope_rates,
                 }
             })
             .collect()
-    }
-
-    /// Get states from all peer nodes (excluding self)
-    ///
-    /// Only nodes Chitchat considers live are included, and the local node is
-    /// always skipped — peer rates can never double-count local traffic.
-    pub async fn get_peer_states(&self) -> Vec<GossipState> {
-        self.handle
-            .with_chitchat(|chitchat| {
-                let mut states = Vec::new();
-                let self_id = chitchat.self_chitchat_id();
-
-                // Iterate through all live nodes
-                for chitchat_id in chitchat.live_nodes() {
-                    // Skip self
-                    if chitchat_id == self_id {
-                        continue;
-                    }
-
-                    // Try to get node state
-                    if let Some(node_state) = chitchat.node_state(chitchat_id) {
-                        // Try to get nenya state
-                        if let Some(json) = node_state.get("nenya_state") {
-                            if let Ok(state) = GossipState::from_json(json) {
-                                states.push(state);
-                            }
-                        }
-                    }
-                }
-
-                states
-            })
-            .await
     }
 
     /// Get the number of alive peers (excluding self)
@@ -232,27 +292,27 @@ impl GossipManager {
 
 /// Compute a peer observation's age from receipt records.
 ///
-/// If the peer's gossiped `timestamp` differs from the last one seen (or the
-/// peer is new), the receipt resets and the age is zero; otherwise the age is
-/// the local monotonic time elapsed since that timestamp was first observed.
-/// The timestamp is compared only for equality — its actual value (past,
-/// future, skewed) is irrelevant.
+/// If the peer's gossiped change marker differs from the last one seen (or
+/// the peer is new), the receipt resets and the age is zero; otherwise the
+/// age is the local monotonic time elapsed since that marker was first
+/// observed. The marker is compared only for equality — its actual value is
+/// irrelevant.
 #[cfg(feature = "server")]
 fn observation_age(
     receipts: &mut HashMap<String, PeerReceipt>,
     node_id: &str,
-    timestamp: SystemTime,
+    marker: &str,
     now: Instant,
 ) -> Duration {
     match receipts.get_mut(node_id) {
-        Some(receipt) if receipt.last_timestamp == timestamp => {
+        Some(receipt) if receipt.last_marker == marker => {
             now.saturating_duration_since(receipt.received_at)
         }
         _ => {
             receipts.insert(
                 node_id.to_string(),
                 PeerReceipt {
-                    last_timestamp: timestamp,
+                    last_marker: marker.to_string(),
                     received_at: now,
                 },
             );
@@ -269,73 +329,37 @@ mod tests {
     fn test_observation_age_new_peer_is_zero() {
         let mut receipts = HashMap::new();
         let now = Instant::now();
-        let ts = SystemTime::now();
 
-        let age = observation_age(&mut receipts, "peer-1", ts, now);
+        let age = observation_age(&mut receipts, "peer-1", "1", now);
         assert_eq!(age, Duration::ZERO);
     }
 
     #[test]
-    fn test_observation_age_grows_while_timestamp_frozen() {
+    fn test_observation_age_grows_while_marker_frozen() {
         let mut receipts = HashMap::new();
         let start = Instant::now();
-        let ts = SystemTime::now();
 
-        observation_age(&mut receipts, "peer-1", ts, start);
+        observation_age(&mut receipts, "peer-1", "7", start);
 
-        // Same timestamp seen 3 seconds later (local clock): peer went silent
-        let age = observation_age(&mut receipts, "peer-1", ts, start + Duration::from_secs(3));
+        // Same marker seen 3 seconds later (local clock): peer went silent
+        let age = observation_age(&mut receipts, "peer-1", "7", start + Duration::from_secs(3));
         assert_eq!(age, Duration::from_secs(3));
     }
 
     #[test]
-    fn test_observation_age_resets_on_new_timestamp() {
+    fn test_observation_age_resets_on_new_marker() {
         let mut receipts = HashMap::new();
         let start = Instant::now();
-        let ts1 = SystemTime::now();
 
-        observation_age(&mut receipts, "peer-1", ts1, start);
+        observation_age(&mut receipts, "peer-1", "7", start);
 
-        // Peer republished with a new timestamp: age resets to zero
-        let ts2 = ts1 + Duration::from_millis(500);
-        let age = observation_age(&mut receipts, "peer-1", ts2, start + Duration::from_secs(3));
+        // Peer republished with a bumped counter: age resets to zero
+        let age = observation_age(&mut receipts, "peer-1", "8", start + Duration::from_secs(3));
         assert_eq!(age, Duration::ZERO);
 
         // And grows again from there while frozen
-        let age = observation_age(&mut receipts, "peer-1", ts2, start + Duration::from_secs(5));
+        let age = observation_age(&mut receipts, "peer-1", "8", start + Duration::from_secs(5));
         assert_eq!(age, Duration::from_secs(2));
-    }
-
-    #[test]
-    fn test_observation_age_future_dated_timestamp_harmless() {
-        let mut receipts = HashMap::new();
-        let start = Instant::now();
-
-        // Peer's clock is an hour ahead: timestamp is only a change marker,
-        // so the age is still measured on the local clock
-        let future_ts = SystemTime::now() + Duration::from_secs(3600);
-        let age = observation_age(&mut receipts, "peer-1", future_ts, start);
-        assert_eq!(age, Duration::ZERO);
-
-        let age = observation_age(
-            &mut receipts,
-            "peer-1",
-            future_ts,
-            start + Duration::from_secs(2),
-        );
-        assert_eq!(age, Duration::from_secs(2));
-    }
-
-    #[tokio::test]
-    async fn test_gossip_state_roundtrip() {
-        let mut state = GossipState::new("test-node".to_string());
-        state.update_scope("test-scope".to_string(), 50.0);
-
-        let json = state.to_json().expect("Failed to serialize");
-        let deserialized = GossipState::from_json(&json).expect("Failed to deserialize");
-
-        assert_eq!(deserialized.node_id, "test-node");
-        assert_eq!(deserialized.scopes.len(), 1);
     }
 
     #[tokio::test]
@@ -374,21 +398,59 @@ mod tests {
         .await
         .expect("Failed to create manager");
 
-        // Create and publish state
-        let mut state = GossipState::new("test-node".to_string());
-        state.update_scope("test-scope".to_string(), 100.0);
-
-        let result = manager.publish_state(&state).await;
+        let result = manager
+            .publish_rates(&[("test-scope".to_string(), 100.0)])
+            .await;
         assert!(result.is_ok());
 
-        // Verify we can retrieve peer states (should be empty since we're alone)
-        let peers = manager.get_peer_states().await;
+        // Verify we can retrieve peer observations (empty: we're alone)
+        let peers = manager.get_peer_observations().await;
         assert_eq!(peers.len(), 0);
 
         let num_peers = manager.num_peers().await;
         assert_eq!(num_peers, 0);
 
         // Clean shutdown
+        let _ = manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_publish_diffs_and_deletes_scope_keys() {
+        let listen_addr = "127.0.0.1:10002".parse().unwrap();
+        let manager = GossipManager::new(
+            "test-node".to_string(),
+            listen_addr,
+            vec![],
+            "test-cluster".to_string(),
+        )
+        .await
+        .expect("Failed to create manager");
+
+        manager
+            .publish_rates(&[("a".to_string(), 10.0), ("b".to_string(), 20.0)])
+            .await
+            .unwrap();
+        // Scope `b` leaves the hot set: its key must be deleted
+        manager
+            .publish_rates(&[("a".to_string(), 10.0)])
+            .await
+            .unwrap();
+
+        let (has_a, has_b, marker) = manager
+            .handle
+            .with_chitchat(|chitchat| {
+                let state = chitchat.self_node_state();
+                (
+                    state.get("s:a").map(|v| v.to_string()),
+                    state.get("s:b").map(|v| v.to_string()),
+                    state.get(VERSION_KEY).map(|v| v.to_string()),
+                )
+            })
+            .await;
+        assert_eq!(has_a.as_deref(), Some("10.000"));
+        assert_eq!(has_b, None, "removed scope key must be deleted");
+        assert_eq!(marker.as_deref(), Some("2"), "counter bumps every publish");
+
         let _ = manager.shutdown().await;
     }
 }

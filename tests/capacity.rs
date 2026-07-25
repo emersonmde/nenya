@@ -105,37 +105,47 @@ fn capacity_per_node_share_floor_fixed() {
 }
 
 /// Cost coefficients for the capacity model: per-scope sync-loop CPU.
-/// These bound the *CPU* cost of scope cardinality; the real binding
-/// constraint today is gossip *bandwidth/encoding* (115 B/scope, single
-/// blob — see the Milestone 6 per-scope-keys item), which the simulator
-/// cannot measure.
+/// These bound the *CPU* cost of scope cardinality; the wire cost is
+/// bounded separately by the per-scope-key encoding (~`scope_len + 10`
+/// bytes per *changed* scope) and the gossip budget K.
 #[cfg(feature = "server")]
 #[test]
 #[ignore = "coefficient microbench (~2s release); run with --ignored"]
 fn capacity_scope_cost_coefficients() {
     use nenya::gossip::aggregate::{aggregate_peer_rates, PeerObservation};
-    use nenya::gossip::GossipState;
     use std::collections::HashMap;
     use std::time::Instant;
 
-    // Serialization: paid once per sync tick (every 500ms)
-    let mut state = GossipState::new("node".to_string());
-    for i in 0..10_000 {
-        state.update_scope(format!("user:{:08x}", i), 123.45);
-    }
+    // Encoding: paid once per sync tick (every 500ms) for changed scopes.
+    // The Milestone 6 wire format publishes one `s:<scope>` key per hot
+    // scope with a 3-decimal value; this measures the value formatting +
+    // key construction for a full 10k-scope churn (worst case: every
+    // scope's rate changed this tick).
+    let scopes: Vec<String> = (0..10_000).map(|i| format!("user:{:08x}", i)).collect();
     let wall = Instant::now();
+    let mut bytes = 0usize;
     for _ in 0..20 {
-        let _ = state.to_json().unwrap();
+        bytes = 0;
+        for scope in &scopes {
+            let key = format!("s:{}", scope);
+            let value = format!("{:.3}", 123.45_f64);
+            bytes += key.len() + value.len();
+        }
     }
     let per_publish = wall.elapsed() / 20;
-    // Baseline ~0.9ms at 10k scopes (~88ns/scope); 5x headroom. Timing
-    // baselines only mean something in release — in debug builds this test
-    // reports coefficients without asserting them.
+    println!(
+        "encode 10k scope keys: {:?}/publish, {} payload bytes ({} B/scope)",
+        per_publish,
+        bytes,
+        bytes / 10_000
+    );
+    // Timing baselines only mean something in release — in debug builds
+    // this test reports coefficients without asserting them.
     let assert_timings = !cfg!(debug_assertions);
     if assert_timings {
         assert!(
             per_publish < Duration::from_millis(5),
-            "serializing 10k scopes took {:?}/publish (baseline ~0.9ms)",
+            "encoding 10k scope keys took {:?}/publish",
             per_publish
         );
     }

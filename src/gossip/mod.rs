@@ -9,9 +9,6 @@ pub mod aggregate;
 pub mod tier;
 
 #[cfg(feature = "server")]
-pub mod state;
-
-#[cfg(feature = "server")]
 pub mod manager;
 
 #[cfg(feature = "server")]
@@ -22,9 +19,6 @@ pub use tier::{budget_evictions, should_promote, DemotionTracker, TailScope, Tie
 
 #[cfg(feature = "server")]
 pub use manager::GossipManager;
-
-#[cfg(feature = "server")]
-pub use state::{GossipState, ScopeState};
 
 #[cfg(feature = "server")]
 pub use sync::gossip_sync_loop;
