@@ -5,329 +5,169 @@
 
 # Nenya
 
-**Nenya** is an adaptive rate limiter using a Proportional-Integral-Derivative (PID) controller.
+**Distributed, adaptive rate limiting with no central coordinator.** Nodes
+share only per-scope accepted rates over gossip; a local control loop on
+each node converges the fleet onto a cluster-wide limit. No Redis, no
+owner-hashing, no rate-limit service to operate — add a node and the fleet
+re-divides the limit by itself.
 
-**Two ways to use it:**
-- **As a library**: Embedded rate limiting in your Rust application
-- **As a binary**: Distributed rate limiting sidecar for microservices
+The design target is **per-user limits at per-user scale**: millions of
+scopes per cluster, where a user's traffic is spread across nodes by a load
+balancer and one noisy user must not exhaust a shared limit — for example,
+fairly dividing an upstream provider quota (Bedrock TPM, a partner API's
+rate cap) across a fleet and its users.
 
-## Features
+![Five-node cluster under 2x load: a network partition at t=30s splits the
+cluster 2/3, each side independently converges toward the target, and the
+fleet re-converges within ~3s of healing at
+t=70s](docs/images/partition_pid_seed42.svg)
 
-- **PID-based adaptive control**: Adjusts rate limits in real-time based on measured throughput
-- **Distributed coordination without a coordinator**: nodes converge on
-  cluster-wide limits through gossip (Chitchat/Scuttlebutt) plus local
-  feedback control — no Redis, no owner-hashing, no central service
-- **Per-user scale**: millions of per-user scopes per cluster via
-  evidence-based two-tier coordination — a scope is enforced locally at its
-  full limit and only enters gossip coordination when peer-observed rates
-  show multi-node activity (~360 B per idle-ish user, measured at 1M
-  scopes; see [docs/capacity-model.md](docs/capacity-model.md))
-- **Pluggable control engines**: PID (default), Bayesian (per-peer Kalman
-  estimation with uncertainty-aware admission), and a Kalman→PID hybrid —
-  explicit config, benchmarked head-to-head in
-  [docs/engine-comparison.md](docs/engine-comparison.md)
-- **Token bucket + sliding window hybrid**: Fast per-request decisions with accurate rate measurement
-- **Derived defaults**: every shipped tunable (control gains, tier
-  thresholds, estimator windows) comes from a published simulator sweep,
-  not hand-picking — the data lives in
-  [docs/capacity-model.md](docs/capacity-model.md)
-- **Generic over numeric types**: Works with f32, f64, or custom numeric types
+*Five nodes at 2× offered load, partitioned 2/3 at t=30s and healed at
+t=70s (deterministic simulator, seed 42 — reproduce with
+`cargo run --features sim --example cluster_sim -- --scenario partition --seed 42 --plot`).*
 
-**Honest positioning**: gossip-based limits are *soft* — worst-case
-overshoot ≈ coordination lag × excess demand. Nenya targets fairness and
-overload protection (its flagship use case is fair per-user division of an
-upstream quota that enforces its own hard cap); it is not billing-grade
-quota enforcement. The measured bounds are documented, not assumed.
+## Why nenya
 
-## Installation
+- **No coordination service.** Gossip (Chitchat/Scuttlebutt) carries a few
+  bytes per active scope per second; every enforcement decision is a local
+  in-memory token-bucket check (~30 ns). The limiter can never become an
+  availability dependency on your request path.
+- **Per-user scale, measured.** 1M mostly-idle user scopes cost ~360 B
+  each (~355 MB/node). Only scopes with evidence of multi-node activity
+  enter coordination; a user served by a single node is enforced entirely
+  locally with zero gossip. Measurements and the all-hot ablation are in
+  [docs/capacity-model.md](docs/capacity-model.md).
+- **Control theory instead of quota slicing.** A pluggable controller
+  (PID by default; Bayesian per-peer Kalman estimation and a hybrid,
+  benchmarked in [docs/engine-comparison.md](docs/engine-comparison.md))
+  adapts each node's admission rate to what the cluster is actually
+  accepting — fleet convergence is ~4 s and flat from 10 to 100 nodes.
+- **Every default is derived.** Gains, tier thresholds, estimator windows,
+  and TTLs come from published simulator sweeps, with the tables and
+  re-run commands in the docs — not hand-picked constants.
+- **Honest limits.** Gossip-based limits are *soft*: worst-case overshoot
+  ≈ coordination lag × excess demand, and the measured bounds are
+  documented (an uncoordinated scope is bounded at 1.25× its limit). If
+  you need billing-grade enforcement, put the hard counter at the
+  resource; nenya's job is fairness and overload protection under it.
 
-### As a Library
+## Quick start
 
-Add to your `Cargo.toml`:
+**Library** (no server dependencies):
 
 ```toml
 [dependencies]
 nenya = "0.1"
 ```
 
-### As a Binary (Sidecar)
-
-```bash
-cargo install nenya
-```
-
-Run a single node:
-```bash
-NENYA_CLUSTER_SECRET=your-secret nenya
-```
-
-Run a 3-node cluster:
-```bash
-# Node 0 (seed)
-NENYA_CLUSTER_SECRET=secret \
-NENYA_LISTEN_ADDR=127.0.0.1:8080 \
-NENYA_GOSSIP_ADDR=127.0.0.1:8081 \
-NENYA_ENABLE_GOSSIP=1 \
-nenya
-
-# Node 1
-NENYA_CLUSTER_SECRET=secret \
-NENYA_LISTEN_ADDR=127.0.0.1:8090 \
-NENYA_GOSSIP_ADDR=127.0.0.1:8091 \
-NENYA_SEED_NODES=127.0.0.1:8081 \
-nenya
-
-# Node 2
-NENYA_CLUSTER_SECRET=secret \
-NENYA_LISTEN_ADDR=127.0.0.1:8100 \
-NENYA_GOSSIP_ADDR=127.0.0.1:8101 \
-NENYA_SEED_NODES=127.0.0.1:8081 \
-nenya
-```
-
-**Status:** Milestones 0–6 complete: HTTP API, distributed gossip
-coordination, deterministic multi-node simulator, pluggable control
-engines, and per-user scale via evidence-based two-tier coordination. See
-[docs/roadmap.md](docs/roadmap.md) for what's next (client SDKs).
-
-## Documentation
-
-- [docs/tuning.md](docs/tuning.md) — **start here to deploy**: configure
-  from things you know (limits, nodes, users, traffic shape, LB config);
-  no internal algorithm knowledge required
-- [docs/architecture.md](docs/architecture.md) — design details, each
-  section marked Implemented or Planned
-- [docs/capacity-model.md](docs/capacity-model.md) — measured scaling
-  ceilings, sweep-derived defaults with their derivation tables, the
-  all-hot ablation, and real-UDP wire findings
-- [docs/engine-comparison.md](docs/engine-comparison.md) — PID vs
-  Bayesian vs hybrid engine benchmark across the scenario matrix
-- [docs/roadmap.md](docs/roadmap.md) — milestone plan and history
-
-### Examples
-
-A basic rate limiter with a static set point:
-
 ```rust
 use nenya::RateLimiterBuilder;
 use nenya::pid_controller::PIDControllerBuilder;
 use std::time::Duration;
 
 fn main() {
-    // Create a rate limiter
-    let mut rate_limiter = RateLimiterBuilder::new(10.0)
-        .update_interval(Duration::from_secs(1))
-        .build();
-
-    // Simulate request processing and check if throttling is necessary
-    for _ in 0..20 {
-        if rate_limiter.should_throttle() {
-            println!("Request throttled");
-        } else {
-            println!("Request accepted");
-        }
-    }
-}
-```
-
-A dynamic rate limiter using a PID Controller:
-
-```rust
-use nenya::RateLimiterBuilder;
-use nenya::pid_controller::PIDControllerBuilder;
-use std::time::Duration;
-
-fn main() {
-    // Create a PID controller with specific parameters
-    let pid_controller = PIDControllerBuilder::new(10.0)
-        .kp(1.0)
-        .ki(0.1)
-        .kd(0.01)
-        .build();
-
-    // Create a rate limiter using the PID Controller
-    let mut rate_limiter = RateLimiterBuilder::new(10.0)
-        .min_rate(5.0)
-        .max_rate(15.0)
-        .pid_controller(pid_controller)
-        .update_interval(Duration::from_secs(1))
-        .build();
-
-    // Simulate request processing and check if throttling is necessary
-    for _ in 0..20 {
-        if rate_limiter.should_throttle() {
-            println!("Request throttled");
-        } else {
-            println!("Request accepted");
-        }
-    }
-}
-```
-
-Distributed rate limiting across a cluster:
-
-```rust
-use nenya::RateLimiterBuilder;
-use nenya::pid_controller::PIDControllerBuilder;
-
-fn main() {
-    let pid = PIDControllerBuilder::new(0.0)  // Setpoint adjusted automatically
-        .kp(0.8)
-        .ki(0.05)
-        .kd(0.04)
-        .build();
-
-    let mut limiter = RateLimiterBuilder::new(100.0)
-        .cluster_target(1000.0)  // 1000 RPS cluster-wide target
+    let pid = PIDControllerBuilder::new(100.0).kp(0.5).ki(0.02).kd(0.08).build();
+    let mut limiter = RateLimiterBuilder::new(100.0) // 100 requests/second
         .min_rate(50.0)
         .max_rate(200.0)
         .pid_controller(pid)
+        .update_interval(Duration::from_secs(1))
         .build();
 
-    // Update peer count from gossip protocol
-    limiter.set_num_peers(9);  // 10 nodes total → 100 RPS per node
-
-    // Inject aggregated rates from other nodes
-    limiter.set_external_accepted_request_rate(850.0);
-
     if limiter.should_throttle() {
-        println!("Request throttled");
-    } else {
-        println!("Request accepted");
+        // reject or queue the request
     }
 }
 ```
 
-### Cluster Simulator
+**Sidecar** (distributed):
 
-A deterministic multi-node simulator (feature `sim`) is the primary tool for
-testing cluster dynamics: N in-process nodes with real rate limiters, a
-message-bus gossip model (propagation delay, jitter, loss, partitions),
-seeded workloads, and a virtual clock. A 60-second scenario runs in
-milliseconds, and the same seed always produces byte-identical artifacts.
+```bash
+cargo install nenya
 
-```sh
-# List scenarios (steady state, step, ramp, burst, join/leave,
-# partition + heal, skewed load, scale sweep, sinusoidal, and the
-# per-user two-tier set: pareto_users, sticky_users, user_ramp)
-cargo run --features sim --example cluster_sim -- --list
+# First node
+NENYA_CLUSTER_SECRET=secret NENYA_ENABLE_GOSSIP=1 nenya
 
-# Run one scenario; writes CSV + JSON time series and an SVG chart
-cargo run --features sim --example cluster_sim -- \
-    --scenario partition --seed 42 --plot
-
-# Run the full scenario matrix and print comparison tables (markdown) —
-# one table per control engine (pid, bayesian, hybrid), or a single
-# engine with --engine. Gains, the anti-windup clamp, and estimator
-# parameters can be overridden per run for A/B comparisons
-# (--kp/--ki/--kd/--error-limit-frac/--process-noise/--measurement-noise).
-cargo run --features sim --example cluster_sim -- --matrix --seed 42
+# Every additional node: point at any existing gossip address
+NENYA_CLUSTER_SECRET=secret NENYA_SEED_NODES=10.0.0.1:8081 nenya
 ```
 
-Artifacts land in `target/sim/` by default (`--out` to change). The
-simulation test suite (`tests/simulation.rs`) asserts the roadmap's
-acceptance thresholds — convergence within the ±5% band, bounded partition
-overshoot, post-heal recovery — against these same scenarios in CI. Scaling
-laws and sizing coefficients (nodes, scopes, rates, memory) are documented
-in [docs/capacity-model.md](docs/capacity-model.md), re-derivable via the
-`tests/capacity.rs` suite.
+Your service makes one local call per request:
+
+```text
+POST localhost:8080/should_throttle   {"scope": "user:1234"}
+→ {"should_throttle": false, ...}
+```
+
+Configuration is a handful of env vars derived from things you already
+know — your limits, how long users stay active, your seed addresses. Node
+count and load-balancer policy need no compensation (measured across
+uniform, round-robin, least-loaded, and sticky routing). See
+[docs/tuning.md](docs/tuning.md).
+
+## How it works
+
+Each scope (user, API key, route) gets a **token bucket** for per-request
+decisions, a **sliding window** measuring its accepted rate, and — when
+coordination is warranted — a **control engine** that adjusts the bucket's
+refill rate.
+
+**Cluster coordination**: every 500 ms, nodes gossip their per-scope
+accepted rates. Each node's controller targets its share of the cluster
+limit using its local rate as the feedback signal; silent peers decay on a
+staleness curve, so crashes and partitions re-divide the limit
+automatically within seconds.
+
+**Per-user scale (two-tier, evidence-based)**: most scopes never need
+coordination. A scope starts as a compact local bucket enforcing its
+**full limit** — a single-node user cannot exceed the limit through one
+bucket, so nothing is throttled below the limit on an assumption about
+routing. Locally-warm scopes publish their rates; full coordination
+engages only when local + peer-observed rates approach the limit *with
+nonzero peer evidence*. The result: sticky-session users are served at
+~0.98 of offered with zero coordination traffic, spread users are
+coordinated before exceeding the limit, and idle users age out after a
+TTL.
+
+## Evidence
+
+Control behavior is developed and verified in a **deterministic
+multi-node simulator** (`--features sim`): real limiter code, a
+message-bus gossip model with delay/jitter/loss/partitions, seeded
+workloads (including Zipf populations of 10⁵–10⁶ users), and a virtual
+clock — a 60-second scenario runs in milliseconds and the same seed is
+byte-identical.
+
+```bash
+cargo run --features sim --example cluster_sim -- --list             # scenarios
+cargo run --features sim --example cluster_sim -- --matrix --seed 42 # engine benchmark
+```
+
+CI asserts the scenario acceptance thresholds, property tests (proptest),
+and exhaustive model checking (stateright) of the aggregation and tier
+state machines on every commit. The wire format is verified against real
+UDP chitchat at 10k scopes.
+
+- [docs/capacity-model.md](docs/capacity-model.md) — scaling ceilings,
+  sweep tables behind every default, memory/wire measurements
+- [docs/engine-comparison.md](docs/engine-comparison.md) — PID vs
+  Bayesian vs hybrid across the scenario matrix
+- [docs/architecture.md](docs/architecture.md) — design, each section
+  marked Implemented or Planned
+- [docs/tuning.md](docs/tuning.md) — operator-facing configuration guide
+- [docs/roadmap.md](docs/roadmap.md) — milestone plan and history
+
+**Status:** milestones 0–6 complete (HTTP API, gossip coordination,
+simulator, pluggable engines, per-user scale). Next: client SDKs
+(Rust/Python/Node/Go) with fail-open semantics.
 
 ## Development
 
-### Setup
-
-Enable pre-commit hooks (runs tests, clippy, fmt, and audit before each commit):
 ```bash
-git config core.hooksPath .git-hooks
+git config core.hooksPath .git-hooks   # tests, clippy, fmt, audit pre-commit
+cargo test --all-features
 ```
-
-### Running Checks
-
-```bash
-# Run all pre-commit checks manually
-./.git-hooks/pre-commit
-
-# Or run individual checks
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
-cargo fmt -- --check
-cargo audit
-```
-
-## How It Works
-
-### Hybrid Architecture
-
-Nenya combines three techniques:
-
-1. **Token Bucket**: Fast per-request decisions, immune to timestamp collisions
-2. **Sliding Window**: Accurate rate measurement for PID feedback
-3. **PID Controller**: Adaptive adjustment based on actual vs target rate
-
-### Single-Node Mode
-
-Standard PID control loop:
-- **Setpoint**: Target rate (e.g., 100 RPS)
-- **Signal**: Measured accepted rate
-- **Output**: Adjustment to token refill rate
-
-### Distributed Mode (Equal Division PID)
-
-For cluster-wide rate limiting:
-- Each node targets an equal share, `cluster_target / live_nodes`, using
-  its *local* accepted rate as the feedback signal
-- Nodes exchange per-scope accepted rates via gossip; peer observations
-  drive liveness (staleness-decayed) and are the input to the estimation
-  engines
-- Automatically rebalances when nodes join/leave
-
-Example: 1000 RPS cluster target with 10 nodes → each node targets 100
-RPS; a node that stops hearing from a peer re-divides the target among
-the survivors once the peer's gossiped rate decays.
-
-### Per-User Scale (Evidence-Based Two-Tier Coordination)
-
-Per-user limits at large cardinality don't gossip every scope — and most
-scopes never need coordination at all:
-
-- **Tail (default)**: each scope is enforced at its **full limit** by a
-  compact local token bucket (~48 B of state; no control engine, no
-  gossip). A user whose traffic lands on one node cannot exceed the limit,
-  so nothing is capped below the limit on assumption alone.
-- **Watched**: a locally-warm scope publishes its rate (bytes only) so
-  spread activity becomes visible to peers.
-- **Hot**: full engine coordination engages only when local + peer-observed
-  rates cross the promotion threshold *with nonzero peer evidence*.
-
-An unpromoted scope's cluster-wide rate is bounded at
-`limit × (1 + demote_utilization)` (1.25× at defaults), independent of
-cluster size. Session-affinity ("sticky") users are the best case: served
-at ~0.98 of offered with no coordination traffic. Thresholds are
-simulator-derived; the sweep tables, the promotion/demotion model-checking
-results, and the 1M-scope memory measurements are in
-[docs/capacity-model.md](docs/capacity-model.md).
-
-### PID Algorithm
-
-1. **Error Calculation**: The error is calculated by subtracting the request
-   rate from the setpoint.
-2. **Proportional Term**: The proportional term is the product of the
-   proportional gain and the error.
-3. **Error Bias**:  The error is adjusted by a bias factor, reacting more to
-   positive errors if $B > 0$ and more to negative errors if $B < 0$.
-4. **Integral Term**: The integral term is the accumulated error over time,
-   clamped to prevent windup.
-5. **Derivative Term**: The derivative term is the rate of change of the error.
-6. **Raw Correction**: The raw correction is the sum of the P, I, and D terms.
-7. **Output Clamping**: The output is clamped to a specified limit to prevent
-   excessive corrections.
-8. **Anti-Windup Feedback**: If clamping occurs, the accumulated error is
-   adjusted to prevent windup.
-9. **Final Output**: The clamped correction is the final output of the PID
-   controller.
-10. **Request Limit Adjustment**: The clamped correction is added to the
-    current request limit to derive the new request limit.
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for more details.
+MIT — see [LICENSE](LICENSE).
