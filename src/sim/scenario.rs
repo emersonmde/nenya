@@ -361,6 +361,39 @@ pub fn laggy() -> Scenario {
     Scenario::new("laggy", cfg, constant(rate)).duration(Duration::from_secs(90))
 }
 
+/// Heavy gossip loss: 60% of messages dropped for the whole run, 2× target
+/// load. Milestone 5 noise-robustness variant: engines that consume gossip
+/// observations directly (bayesian, hybrid) see a sparse, gappy sample
+/// stream — their estimates must widen, not destabilize.
+pub fn lossy_heavy() -> Scenario {
+    let cfg = SimConfig {
+        gossip: GossipModel {
+            loss: 0.6,
+            ..GossipModel::default()
+        },
+        ..SimConfig::default()
+    };
+    let rate = cfg.cluster_target * 2.0;
+    Scenario::new("lossy_heavy", cfg, constant(rate)).duration(Duration::from_secs(90))
+}
+
+/// High jitter: 100ms base delay with up to 3s of per-message jitter, 2×
+/// target load. Milestone 5 noise-robustness variant: observations arrive
+/// out of order relative to their generation times, exercising the
+/// estimators' new-sample detection.
+pub fn jittery() -> Scenario {
+    let cfg = SimConfig {
+        gossip: GossipModel {
+            delay: Duration::from_millis(100),
+            jitter: Duration::from_secs(3),
+            ..GossipModel::default()
+        },
+        ..SimConfig::default()
+    };
+    let rate = cfg.cluster_target * 2.0;
+    Scenario::new("jittery", cfg, constant(rate)).duration(Duration::from_secs(90))
+}
+
 /// Congestion coupling: user traffic saturates the links, so gossip blacks
 /// out completely from t=30s to t=60s while 2× target load continues. Once
 /// records decay past stale_timeout each node sees zero live peers and
@@ -403,6 +436,8 @@ pub fn library() -> Vec<Scenario> {
         autoscale(),
         mass_outage(),
         lossy(),
+        lossy_heavy(),
+        jittery(),
         laggy(),
         congestion(),
         scale(2),

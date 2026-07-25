@@ -81,8 +81,14 @@ impl ScopePattern {
 
     /// Estimator parameters for the bayesian/hybrid engines, with the
     /// membership horizon aligned to the transport's stale timeout.
+    /// Unset fields fall back to the engine-appropriate simulator-derived
+    /// default (the hybrid engine wants a fast filter, the pure Bayesian a
+    /// slow one — see `BayesianParams`).
     fn estimator_params(&self, stale_timeout: Duration) -> BayesianParams {
-        let defaults = BayesianParams::default();
+        let defaults = match self.engine {
+            EngineKind::Hybrid => BayesianParams::hybrid_default(),
+            _ => BayesianParams::default(),
+        };
         BayesianParams {
             process_noise: self.process_noise.unwrap_or(defaults.process_noise),
             measurement_noise: self.measurement_noise.unwrap_or(defaults.measurement_noise),

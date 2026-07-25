@@ -79,10 +79,12 @@ pub struct SimConfig {
     /// production)
     pub engine: EngineKind,
 
-    /// Estimator parameters for the bayesian/hybrid engines (the
-    /// `stale_timeout` field is overridden with this config's
-    /// `stale_timeout` at limiter construction so the two horizons agree)
-    pub bayesian: BayesianParams,
+    /// Estimator parameter overrides for the bayesian/hybrid engines.
+    /// `None` uses the engine-appropriate simulator-derived default
+    /// (`BayesianParams::default()` / `BayesianParams::hybrid_default()`).
+    /// The `stale_timeout` field is always overridden with this config's
+    /// `stale_timeout` at limiter construction so the two horizons agree.
+    pub estimator: Option<BayesianParams>,
 
     /// Simulation tick; all activity is quantized to this
     pub tick: Duration,
@@ -111,7 +113,7 @@ impl Default for SimConfig {
             // derived from the Milestone 4 scenario-matrix sweep
             error_limit_frac: Some(0.2),
             engine: EngineKind::Pid,
-            bayesian: BayesianParams::default(),
+            estimator: None,
             tick: Duration::from_millis(10),
             gossip: GossipModel::default(),
             initially_down: Vec::new(),
@@ -521,9 +523,13 @@ fn make_limiter(cfg: &SimConfig, now: Instant) -> RateLimiter<f64> {
     }
     let pid = pid_builder.build();
 
+    let engine_default = match cfg.engine {
+        EngineKind::Hybrid => BayesianParams::hybrid_default(),
+        _ => BayesianParams::default(),
+    };
     let estimator_params = BayesianParams {
         stale_timeout: cfg.stale_timeout,
-        ..cfg.bayesian
+        ..cfg.estimator.unwrap_or(engine_default)
     };
 
     let builder = RateLimiterBuilder::new(cfg.cluster_target)

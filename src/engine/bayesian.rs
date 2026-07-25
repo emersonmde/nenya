@@ -76,9 +76,18 @@ use super::{ControlInput, RateController, DEFAULT_STALE_TIMEOUT};
 /// Tuning parameters for [`BayesianEngine`] (and the estimator half of
 /// [`super::HybridEngine`]).
 ///
-/// Defaults are placeholders pending the Milestone 5.3 parameter sweep
-/// (`docs/engine-comparison.md` records the sweep and finalizes these);
-/// `z = 1` is the roadmap's documented starting point.
+/// Defaults are simulator-derived (Milestone 5.3 sweep, seed 42, recorded
+/// in `docs/engine-comparison.md`). For the pure Bayesian engine the
+/// estimate-and-set feedback race must be damped by a slow Kalman gain:
+/// `q = 1, r = 100` was the only swept corner where most scenarios
+/// converge (fast-gain settings oscillate at ±150 rps). `r = 100` is also
+/// what Poisson counting noise predicts for a 1 s window at the
+/// benchmark's ~100 rps per-node shares (variance ≈ λ). `z = 1` is the
+/// roadmap's documented starting point; the sweep showed z mainly trades
+/// undershoot for convergence speed with no clearly better setting.
+///
+/// The hybrid engine wants the opposite: a fast filter (its PID supplies
+/// the damping) — use [`BayesianParams::hybrid_default`] there.
 #[derive(Debug, Clone, Copy)]
 pub struct BayesianParams {
     /// Process noise `q` (rps²/s): how fast peer rates are believed to
@@ -104,6 +113,23 @@ pub struct BayesianParams {
 
 impl Default for BayesianParams {
     fn default() -> Self {
+        BayesianParams {
+            process_noise: 1.0,
+            measurement_noise: 100.0,
+            confidence_z: 1.0,
+            stale_timeout: DEFAULT_STALE_TIMEOUT,
+        }
+    }
+}
+
+impl BayesianParams {
+    /// Estimator defaults for [`super::HybridEngine`]: a fast filter
+    /// (`q = 10, r = 10`), since the PID half supplies the damping.
+    /// Simulator-derived (Milestone 5.3 sweep): hybrid results are nearly
+    /// identical across `q/r` within ×10 of this point, while the
+    /// Bayesian-tuned slow gain (`q = 1, r = 100`) measurably slows hybrid
+    /// convergence (scale_50 never re-enters the band).
+    pub fn hybrid_default() -> Self {
         BayesianParams {
             process_noise: 10.0,
             measurement_noise: 10.0,

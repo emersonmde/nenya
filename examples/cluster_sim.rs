@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use plotters::prelude::*;
 
-use nenya::sim::{scenario, EngineKind, RunResult, Scenario};
+use nenya::sim::{scenario, BayesianParams, EngineKind, RunResult, Scenario};
 
 #[derive(Parser)]
 #[command(about = "Deterministic multi-node rate limiter simulator")]
@@ -95,14 +95,24 @@ fn apply_overrides(mut s: Scenario, args: &Args, engine: EngineKind) -> Scenario
     if let Some(frac) = args.error_limit_frac {
         s.cfg.error_limit_frac = if frac < 0.0 { None } else { Some(frac) };
     }
-    if let Some(q) = args.process_noise {
-        s.cfg.bayesian.process_noise = q;
-    }
-    if let Some(r) = args.measurement_noise {
-        s.cfg.bayesian.measurement_noise = r;
-    }
-    if let Some(z) = args.confidence_z {
-        s.cfg.bayesian.confidence_z = z;
+    if args.process_noise.is_some()
+        || args.measurement_noise.is_some()
+        || args.confidence_z.is_some()
+    {
+        let mut p = match engine {
+            EngineKind::Hybrid => BayesianParams::hybrid_default(),
+            _ => BayesianParams::default(),
+        };
+        if let Some(q) = args.process_noise {
+            p.process_noise = q;
+        }
+        if let Some(r) = args.measurement_noise {
+            p.measurement_noise = r;
+        }
+        if let Some(z) = args.confidence_z {
+            p.confidence_z = z;
+        }
+        s.cfg.estimator = Some(p);
     }
     s
 }
