@@ -46,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.default_kd,
     );
     manager.set_gossip_timing(config.sync_interval, config.stale_timeout);
+    manager.set_gossip_budget(config.gossip_budget);
 
     if gossip_enabled {
         tracing::info!(
@@ -67,6 +68,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             process_noise: config.bayesian_process_noise,
             measurement_noise: config.bayesian_measurement_noise,
             confidence_z: config.bayesian_confidence_z,
+            promote_utilization: config.promote_utilization,
+            demote_utilization: config.demote_utilization,
+            demote_hold_secs: config.demote_hold_secs,
         };
 
         manager.set_default_pattern(distributed_pattern);

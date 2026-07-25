@@ -71,6 +71,9 @@ pub struct ThrottleResponse {
 
     /// DEBUG: Max rate bound
     pub max_rate: f64,
+
+    /// Coordination tier: `local`, `tail`, or `hot`
+    pub tier: String,
 }
 
 // Removed From implementation - handler now constructs response directly
@@ -104,17 +107,18 @@ pub async fn should_throttle(
     let mut manager = state.manager.write().await;
     let decision = manager.should_throttle(&req.scope);
 
-    // Get debug info from the limiter
-    let (target_rate, external_accepted_rate, min_rate, max_rate) = {
-        if let Some(limiter) = manager.get_limiter_mut(&req.scope) {
+    // Get debug info from the scope snapshot (works for every tier)
+    let (target_rate, external_accepted_rate, min_rate, max_rate, tier) = {
+        if let Some(snap) = manager.scope_snapshot(&req.scope, std::time::Instant::now()) {
             (
-                limiter.target_rate(),
-                limiter.external_accepted_request_rate(),
+                snap.target_rate,
+                snap.external_rate,
                 50.0,  // TODO: Get from limiter (not exposed yet)
                 200.0, // TODO: Get from limiter (not exposed yet)
+                snap.tier.to_string(),
             )
         } else {
-            (0.0, 0.0, 0.0, 0.0)
+            (0.0, 0.0, 0.0, 0.0, "unknown".to_string())
         }
     };
 
@@ -141,6 +145,7 @@ pub async fn should_throttle(
         external_accepted_rate,
         min_rate,
         max_rate,
+        tier,
     };
 
     Ok(Json(response))
@@ -151,15 +156,9 @@ pub async fn should_throttle(
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let manager = state.manager.read().await;
 
-    // The sync loop stamps every scope with the live peer count each tick,
-    // but a scope created between ticks still reads 0 — report the max so a
-    // freshly auto-created scope can't mask cluster membership
-    let peers = manager
-        .get_all_scopes()
-        .iter()
-        .map(|(_, stats)| stats.num_peers)
-        .max()
-        .unwrap_or(0);
+    // Node-level live peer count, stamped by the sync loop each tick (no
+    // longer derived per scope — tail scopes don't track peers themselves)
+    let peers = manager.live_peers();
 
     Json(HealthResponse {
         healthy: true,
@@ -193,14 +192,8 @@ pub async fn scope_stats(
 
     let manager = state.manager.read().await;
 
-    // Get stats without calling should_throttle
-    if let Some(limiter) = manager.get_limiter(scope) {
-        let target_rate = limiter.target_rate();
-        let external_accepted_rate = limiter.external_accepted_request_rate();
-        let local_accepted_rate = limiter.local_accepted_request_rate();
-        let refill_rate = limiter.refill_rate();
-        let num_peers = limiter.num_peers();
-
+    // Get stats without calling should_throttle (works for every tier)
+    if let Some(snap) = manager.scope_snapshot(scope, std::time::Instant::now()) {
         // Get request rates from metrics
         let total_request_rate = state.metrics.total_rate(scope).await;
         let accepted_request_rate = state.metrics.accepted_rate(scope).await;
@@ -208,16 +201,17 @@ pub async fn scope_stats(
 
         let response = ThrottleResponse {
             should_throttle: false, // Not applicable for stats query
-            local_accepted_rate,
-            refill_rate,
-            num_peers,
+            local_accepted_rate: snap.local_accepted_rate,
+            refill_rate: snap.refill_rate,
+            num_peers: snap.num_peers,
             total_request_rate,
             accepted_request_rate,
             throttled_request_rate,
-            target_rate,
-            external_accepted_rate,
+            target_rate: snap.target_rate,
+            external_accepted_rate: snap.external_rate,
             min_rate: 50.0,  // TODO: Get from limiter
             max_rate: 200.0, // TODO: Get from limiter
+            tier: snap.tier.to_string(),
         };
 
         Ok(Json(response))
@@ -235,6 +229,7 @@ pub async fn scope_stats(
             external_accepted_rate: 0.0,
             min_rate: 0.0,
             max_rate: 0.0,
+            tier: "unknown".to_string(),
         }))
     }
 }

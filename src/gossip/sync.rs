@@ -3,7 +3,6 @@
 use super::aggregate::aggregate_peer_rates;
 use super::{GossipManager, GossipState};
 use crate::api::RateLimitManager;
-use crate::engine::PeerRate;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,20 +14,24 @@ use tokio::time::interval;
 /// Run the gossip synchronization loop
 ///
 /// Every `sync_interval` this background task:
-/// 1. Refreshes and collects local per-scope rates (short write lock)
-/// 2. Publishes state to the cluster via gossip (no manager lock)
-/// 3. Aggregates peer rates with age-weighted staleness decay: peers whose
-///    state hasn't changed within `2 × sync_interval` decay linearly to zero
-///    at `stale_timeout` and are dropped past it (no manager lock)
-/// 4. Applies external rates and the live peer count to every limiter in a
-///    single pass under one write lock; scopes with no live peer data have
-///    their external rate reset to zero so a vanished peer's last known rate
-///    cannot linger as phantom load
+/// 1. Reads peer observations and aggregates them with age-weighted
+///    staleness decay: peers whose state hasn't changed within
+///    `2 × sync_interval` decay linearly to zero at `stale_timeout` and are
+///    dropped past it (no manager lock)
+/// 2. Under one write lock, applies the observations to the manager
+///    ([`RateLimitManager::apply_peer_observations`]): stamps the live peer
+///    count, feeds hot limiters their per-peer observations (zeroing scopes
+///    no live peer reports so a vanished peer's last rate cannot linger as
+///    phantom load), promotes tail scopes that peers gossip, runs demotion
+///    hysteresis, and enforces the gossip budget — then refreshes limiter
+///    state and collects the hot-tier rates to publish
+///    ([`RateLimitManager::collect_gossip_rates`])
+/// 3. Publishes the hot-tier rates to the cluster (no manager lock)
 ///
-/// Lock behavior: the manager write lock is held twice per tick (once for the
-/// local rate refresh, which must mutate limiter state, and once for the
-/// update pass), each scoped to a single pass over the limiters with no I/O or
-/// awaits inside. Gossip I/O happens between the two critical sections.
+/// Only hot-tier scopes are gossiped; tail scopes are enforced locally at
+/// their equal share and non-distributed scopes never participate. The
+/// promotion/demotion policy lives in `gossip::tier` (transport-agnostic;
+/// the simulator runs the same code).
 #[cfg(feature = "server")]
 pub async fn gossip_sync_loop(
     manager: Arc<RwLock<RateLimitManager>>,
@@ -42,69 +45,35 @@ pub async fn gossip_sync_loop(
     loop {
         tick.tick().await;
 
-        // 1. Collect local state with fresh rate calculations. This needs a
-        // write lock because update_state_at advances limiter state.
-        let local_state = {
-            let mut mgr = manager.write().await;
-            let mut state = GossipState::new(node_id.clone());
-
-            let now = std::time::Instant::now();
-            for (scope_name, limiter) in mgr.limiters_mut() {
-                limiter.update_state_at(now);
-                let fresh_rate = limiter.local_accepted_request_rate();
-                tracing::debug!(
-                    "Gossip: Publishing {}: local_rate={:.2}",
-                    scope_name,
-                    fresh_rate
-                );
-                state.update_scope(scope_name.clone(), fresh_rate);
-            }
-
-            state
-        };
-
-        // 2. Publish to cluster (manager lock released)
-        if let Err(e) = gossip.publish_state(&local_state).await {
-            tracing::error!("Failed to publish gossip state: {}", e);
-            continue;
-        }
-
-        // 3. Aggregate peer rates with staleness decay (manager lock released)
+        // 1. Aggregate peer rates with staleness decay (no manager lock)
         let observations = gossip.get_peer_observations().await;
         let aggregated = aggregate_peer_rates(&observations, sync_interval, stale_timeout);
 
-        // 4. Apply external rates, live peer count, and per-peer
-        // observations in one pass. Scopes absent from the aggregate get an
-        // explicit zero. The aggregated values are the transport's reporting
-        // metrics; the control engine consumes the raw observations.
-        let mut mgr = manager.write().await;
-        for (scope_name, limiter) in mgr.limiters_mut() {
-            let external_rate = aggregated
-                .scope_rates
-                .get(scope_name)
-                .copied()
-                .unwrap_or(0.0);
-            limiter.set_external_accepted_request_rate(external_rate);
-            limiter.set_num_peers(aggregated.live_peers);
-            let obs: Vec<PeerRate<f64>> = observations
-                .iter()
-                .filter_map(|o| {
-                    o.scope_rates.get(scope_name).map(|rate| PeerRate {
-                        id: o.node_id.clone(),
-                        rate: *rate,
-                        age: o.age,
-                    })
-                })
-                .collect();
-            limiter.set_peer_observations(obs);
-        }
+        // 2. Apply observations + tier maintenance + collect publish set
+        // (single write lock, no I/O inside)
+        let local_state = {
+            let mut mgr = manager.write().await;
+            let now = std::time::Instant::now();
+            mgr.apply_peer_observations(&observations, &aggregated, now);
+            let mut state = GossipState::new(node_id.clone());
+            for (scope, rate) in mgr.collect_gossip_rates(now) {
+                tracing::debug!("Gossip: Publishing {}: local_rate={:.2}", scope, rate);
+                state.update_scope(scope, rate);
+            }
+            tracing::debug!(
+                "Gossip sync: {} scopes ({} hot), {} live peers, {} peer scopes",
+                mgr.num_scopes(),
+                mgr.num_hot_scopes(),
+                aggregated.live_peers,
+                aggregated.scope_rates.len()
+            );
+            state
+        };
 
-        tracing::debug!(
-            "Gossip sync: {} scopes, {} live peers, {} peer scopes",
-            mgr.num_scopes(),
-            aggregated.live_peers,
-            aggregated.scope_rates.len()
-        );
+        // 3. Publish to cluster (manager lock released)
+        if let Err(e) = gossip.publish_state(&local_state).await {
+            tracing::error!("Failed to publish gossip state: {}", e);
+        }
     }
 }
 
@@ -159,10 +128,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_loop_clears_external_rate_without_peers() {
-        // A limiter with a previously injected external rate must be reset to
-        // zero by the sync loop when no live peers report that scope
+        // A hot-tier limiter with a previously injected external rate must
+        // be reset to zero by the sync loop when no live peers report that
+        // scope
         let mut mgr = RateLimitManager::new(100.0, 0.8, 0.05, 0.04);
-        mgr.should_throttle("test-scope");
+        let mut pattern = crate::api::ScopePattern::default_pattern(100.0);
+        pattern.distributed = true;
+        mgr.set_default_pattern(pattern);
+
+        // Drive enough accepted traffic inside one estimator window to
+        // cross the promotion threshold (0.5 × 100 rps with no peers)
+        let start = std::time::Instant::now();
+        for i in 0..80 {
+            mgr.should_throttle_at("test-scope", start + Duration::from_millis(i * 10));
+        }
+        assert_eq!(mgr.scope_tier("test-scope"), Some("hot"));
+
         mgr.get_limiter_mut("test-scope")
             .unwrap()
             .set_external_accepted_request_rate(500.0);

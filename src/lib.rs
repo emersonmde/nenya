@@ -494,6 +494,7 @@ pub struct RateLimiterBuilder<T> {
     min_window_samples: usize,
     initial_tokens_frac: Option<T>,
     bucket_burst_seconds: Option<T>,
+    initial_refill_rate: Option<T>,
 }
 
 impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 'static>
@@ -518,7 +519,21 @@ impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 
             min_window_samples: DEFAULT_MIN_WINDOW_SAMPLES,
             initial_tokens_frac: None,
             bucket_burst_seconds: None,
+            initial_refill_rate: None,
         }
+    }
+
+    /// Sets the initial token refill rate (default: `target_rate`).
+    ///
+    /// In distributed mode the refill rate only converges to the node's
+    /// fair share after the first control update, so a limiter created
+    /// mid-flight (e.g. a tail scope promoted into the hot tier) would
+    /// admit at the full cluster target for up to one `update_interval`.
+    /// Starting the refill at the already-known share removes that
+    /// discontinuity; the engine takes over from there.
+    pub fn initial_refill_rate(mut self, rate: T) -> Self {
+        self.initial_refill_rate = Some(rate);
+        self
     }
 
     /// Sets the initial token fill as a fraction of bucket capacity
@@ -669,7 +684,17 @@ impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 
     /// Builds and returns the `RateLimiter` instance.
     pub fn build(self) -> RateLimiter<T> {
         let now = self.initial_timestamp.unwrap_or_else(Instant::now);
-        let bucket_capacity = self.bucket_capacity.unwrap_or(self.target_rate);
+        let initial_refill = self.initial_refill_rate.unwrap_or(self.target_rate);
+        // An explicit initial refill also scales the initial burst
+        // allowance (capacity tracks refill × 1s from the first control
+        // update anyway; starting there avoids a one-interval burst window)
+        let bucket_capacity =
+            self.bucket_capacity
+                .unwrap_or(if self.initial_refill_rate.is_some() {
+                    initial_refill
+                } else {
+                    self.target_rate
+                });
         let initial_tokens = match self.initial_tokens_frac {
             Some(frac) => bucket_capacity * frac,
             None => bucket_capacity,
@@ -708,7 +733,7 @@ impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 
         RateLimiter {
             tokens: initial_tokens,
             last_refill: now,
-            refill_rate: self.target_rate,
+            refill_rate: initial_refill,
             bucket_capacity,
 
             // Sliding window starts empty

@@ -25,7 +25,7 @@ pub use error::ApiError;
 pub use handlers::{AppState, HealthResponse, ThrottleRequest, ThrottleResponse};
 
 #[cfg(feature = "server")]
-pub use manager::{RateLimitManager, ScopePattern, ScopeStats, ThrottleDecision};
+pub use manager::{RateLimitManager, ScopePattern, ScopeSnapshot, ScopeStats, ThrottleDecision};
 
 #[cfg(feature = "server")]
 pub use metrics::MetricsCollector;

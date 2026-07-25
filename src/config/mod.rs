@@ -19,6 +19,13 @@
 //! - `NENYA_BAYESIAN_PROCESS_NOISE`: Estimator process noise `q` (rps²/s)
 //! - `NENYA_BAYESIAN_MEASUREMENT_NOISE`: Estimator measurement noise `r` (rps²)
 //! - `NENYA_BAYESIAN_CONFIDENCE_Z`: Admission confidence multiplier `z`
+//! - `NENYA_PROMOTE_UTILIZATION`: Two-tier promotion threshold (fraction of
+//!   estimated cluster utilization; default: sweep-derived, see
+//!   `gossip::tier`)
+//! - `NENYA_DEMOTE_UTILIZATION`: Two-tier demotion threshold (must be below
+//!   the promotion threshold)
+//! - `NENYA_DEMOTE_HOLD_SECS`: Demotion hysteresis hold in seconds
+//! - `NENYA_GOSSIP_BUDGET`: Per-node hard cap on gossiped (hot-tier) scopes
 
 use std::env;
 use std::net::SocketAddr;
@@ -111,6 +118,19 @@ pub struct Config {
 
     /// Admission confidence multiplier `z` override (bayesian engine)
     pub bayesian_confidence_z: Option<f64>,
+
+    /// Two-tier promotion threshold override (fraction of estimated
+    /// cluster utilization; `None` = sweep-derived default)
+    pub promote_utilization: Option<f64>,
+
+    /// Two-tier demotion threshold override (must stay below promotion)
+    pub demote_utilization: Option<f64>,
+
+    /// Demotion hysteresis hold override in seconds
+    pub demote_hold_secs: Option<f64>,
+
+    /// Per-node hard cap on gossiped (hot-tier) scopes
+    pub gossip_budget: usize,
 }
 
 #[cfg(feature = "server")]
@@ -283,6 +303,36 @@ impl Config {
             Err(_) => None,
         };
 
+        let promote_utilization = parse_positive("NENYA_PROMOTE_UTILIZATION")?;
+        let demote_utilization = parse_positive("NENYA_DEMOTE_UTILIZATION")?;
+        let demote_hold_secs = parse_positive("NENYA_DEMOTE_HOLD_SECS")?;
+
+        let gossip_budget: usize = match env::var("NENYA_GOSSIP_BUDGET") {
+            Ok(s) => s.parse().map_err(|_| {
+                ConfigError::InvalidValue(
+                    "NENYA_GOSSIP_BUDGET".to_string(),
+                    "not a positive integer".to_string(),
+                )
+            })?,
+            Err(_) => crate::gossip::tier::DEFAULT_GOSSIP_BUDGET,
+        };
+
+        // Validate the combined tier policy (thresholds ordered, budget ≥ 1)
+        {
+            let defaults = crate::gossip::tier::TierConfig::default();
+            let tier = crate::gossip::tier::TierConfig {
+                promote_utilization: promote_utilization.unwrap_or(defaults.promote_utilization),
+                demote_utilization: demote_utilization.unwrap_or(defaults.demote_utilization),
+                demote_hold: demote_hold_secs
+                    .map(Duration::from_secs_f64)
+                    .unwrap_or(defaults.demote_hold),
+                gossip_budget,
+            };
+            tier.validate().map_err(|e| {
+                ConfigError::InvalidValue("NENYA_PROMOTE/DEMOTE_UTILIZATION".to_string(), e)
+            })?;
+        }
+
         Ok(Config {
             cluster_secret,
             listen_addr,
@@ -302,6 +352,10 @@ impl Config {
             bayesian_process_noise,
             bayesian_measurement_noise,
             bayesian_confidence_z,
+            promote_utilization,
+            demote_utilization,
+            demote_hold_secs,
+            gossip_budget,
         })
     }
 
@@ -331,6 +385,10 @@ impl Config {
             bayesian_process_noise: None,
             bayesian_measurement_noise: None,
             bayesian_confidence_z: None,
+            promote_utilization: None,
+            demote_utilization: None,
+            demote_hold_secs: None,
+            gossip_budget: crate::gossip::tier::DEFAULT_GOSSIP_BUDGET,
         }
     }
 }
@@ -360,6 +418,31 @@ mod tests {
         env::remove_var("NENYA_BAYESIAN_PROCESS_NOISE");
         env::remove_var("NENYA_BAYESIAN_MEASUREMENT_NOISE");
         env::remove_var("NENYA_BAYESIAN_CONFIDENCE_Z");
+        env::remove_var("NENYA_PROMOTE_UTILIZATION");
+        env::remove_var("NENYA_DEMOTE_UTILIZATION");
+        env::remove_var("NENYA_DEMOTE_HOLD_SECS");
+        env::remove_var("NENYA_GOSSIP_BUDGET");
+    }
+
+    #[test]
+    #[serial]
+    fn test_tier_thresholds_validated() {
+        clean_env();
+        env::set_var("NENYA_CLUSTER_SECRET", "test");
+        // Demotion at/above promotion is a misconfiguration
+        env::set_var("NENYA_PROMOTE_UTILIZATION", "0.4");
+        env::set_var("NENYA_DEMOTE_UTILIZATION", "0.4");
+        assert!(Config::from_env().is_err());
+
+        env::set_var("NENYA_DEMOTE_UTILIZATION", "0.2");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.promote_utilization, Some(0.4));
+        assert_eq!(config.demote_utilization, Some(0.2));
+        assert_eq!(
+            config.gossip_budget,
+            crate::gossip::tier::DEFAULT_GOSSIP_BUDGET
+        );
+        clean_env();
     }
 
     #[test]

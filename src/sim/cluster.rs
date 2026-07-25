@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 
 use crate::engine::{BayesianEngine, EngineKind, HybridEngine, PeerRate, PidEngine};
 use crate::gossip::aggregate::{aggregate_peer_rates, PeerObservation};
+use crate::gossip::tier::{
+    budget_evictions, should_promote, DemotionTracker, TailScope, TierConfig,
+};
 use crate::pid_controller::PIDControllerBuilder;
 use crate::{RateLimiter, RateLimiterBuilder};
 
@@ -109,6 +112,12 @@ pub struct SimConfig {
 
     /// Nodes that start down (for join scenarios)
     pub initially_down: Vec<usize>,
+
+    /// Two-tier promotion/demotion policy (production defaults; see
+    /// `gossip::tier`). Scopes start in the compact tail tier and are
+    /// promoted into gossip coordination by the same policy code the
+    /// server runs.
+    pub tier: TierConfig,
 }
 
 impl Default for SimConfig {
@@ -137,6 +146,7 @@ impl Default for SimConfig {
             tick: Duration::from_millis(10),
             gossip: GossipModel::default(),
             initially_down: Vec::new(),
+            tier: TierConfig::default(),
         }
     }
 }
@@ -195,10 +205,31 @@ struct PeerRecord {
     received_at: Duration,
 }
 
+/// One scope's tiered state on a simulated node (mirrors the server's
+/// `ScopeEntry`, minus the non-distributed `Local` variant — every sim
+/// scope is distributed)
+enum SimScope {
+    Tail {
+        tail: TailScope,
+    },
+    Hot {
+        limiter: RateLimiter<f64>,
+        demotion: DemotionTracker,
+    },
+}
+
 struct SimNode {
     up: bool,
-    limiters: BTreeMap<String, RateLimiter<f64>>,
+    scopes: BTreeMap<String, SimScope>,
     records: BTreeMap<usize, PeerRecord>,
+    /// Node-level live-peer count from the last sync pass (tail scopes
+    /// derive their equal share from this)
+    live_peers: usize,
+    /// Number of hot-tier scopes (bounded by the gossip budget at each sync)
+    hot_count: usize,
+    /// Promotion admission floor while at the gossip budget (mirrors
+    /// `RateLimitManager::promotion_floor`)
+    promotion_floor: f64,
     /// Fractional-arrival accumulator per scope (deterministic arrivals)
     accum: BTreeMap<String, f64>,
     rng: SplitMix64,
@@ -249,19 +280,18 @@ impl SimCluster {
         let mut nodes = Vec::with_capacity(cfg.num_nodes);
         for i in 0..cfg.num_nodes {
             let up = !cfg.initially_down.contains(&i);
-            let mut node = SimNode {
+            // Scopes are auto-created in the tail tier on first arrival
+            // (mirroring the server's auto-creation), not pre-allocated
+            let node = SimNode {
                 up,
-                limiters: BTreeMap::new(),
+                scopes: BTreeMap::new(),
                 records: BTreeMap::new(),
+                live_peers: 0,
+                hot_count: 0,
+                promotion_floor: 0.0,
                 accum: BTreeMap::new(),
                 rng: root_rng.fork(),
             };
-            if up {
-                for w in &workloads {
-                    node.limiters
-                        .insert(w.scope.clone(), make_limiter(&cfg, start));
-                }
-            }
             nodes.push(node);
         }
 
@@ -313,21 +343,24 @@ impl SimCluster {
                 let node = &mut self.nodes[*i];
                 node.up = false;
                 // Crash loses all state
-                node.limiters.clear();
+                node.scopes.clear();
                 node.records.clear();
                 node.accum.clear();
+                node.live_peers = 0;
+                node.hot_count = 0;
+                node.promotion_floor = 0.0;
             }
             SimEvent::NodeUp(i) => {
-                let now = self.now();
                 let node = &mut self.nodes[*i];
                 node.up = true;
-                node.limiters.clear();
+                // Fresh join: scopes re-created in the tail tier on first
+                // arrival, exactly like a restarted server process
+                node.scopes.clear();
                 node.records.clear();
                 node.accum.clear();
-                for w in &self.workloads {
-                    node.limiters
-                        .insert(w.scope.clone(), make_limiter(&self.cfg, now));
-                }
+                node.live_peers = 0;
+                node.hot_count = 0;
+                node.promotion_floor = 0.0;
             }
             SimEvent::Partition(groups) => {
                 // Group 0 is the implicit group for unlisted nodes
@@ -436,13 +469,9 @@ impl SimCluster {
                 if n_arrivals == 0 {
                     continue;
                 }
-                let limiter = node
-                    .limiters
-                    .get_mut(&scope)
-                    .expect("limiter exists for every workload scope");
                 for _ in 0..n_arrivals {
                     counts.offered += 1;
-                    if !limiter.should_throttle_at(now) {
+                    if admit_one(&self.cfg, node, &scope, now) {
                         counts.accepted += 1;
                         counts.per_node_accepted[i] += 1;
                     }
@@ -454,19 +483,125 @@ impl SimCluster {
         counts
     }
 
-    /// One node's sync-loop pass, mirroring `gossip_sync_loop` step for step.
+    /// One node's sync-loop pass, mirroring `gossip_sync_loop` step for
+    /// step: aggregate peer observations → peer-triggered promotion → apply
+    /// observations + demotion hysteresis + gossip-budget eviction →
+    /// refresh and publish hot-tier rates.
     fn sync_node(&mut self, i: usize, now: Instant, t: Duration) {
-        // Step 1: refresh and collect local per-scope rates
-        let mut local_rates = HashMap::new();
-        {
-            let node = &mut self.nodes[i];
-            for (scope, limiter) in node.limiters.iter_mut() {
-                limiter.update_state_at(now);
-                local_rates.insert(scope.clone(), limiter.local_accepted_request_rate());
-            }
-        }
+        let tier_cfg = self.cfg.tier;
+        let limit = self.cfg.cluster_target;
 
-        // Step 2: publish to every reachable peer through the message bus
+        // Step 1: aggregate peer observations with the production decay code
+        let observations: Vec<PeerObservation> = self.nodes[i]
+            .records
+            .iter()
+            .map(|(peer, rec)| PeerObservation {
+                node_id: peer.to_string(),
+                age: t.saturating_sub(rec.received_at),
+                scope_rates: rec.rates.clone(),
+            })
+            .collect();
+        let aggregated = aggregate_peer_rates(
+            &observations,
+            self.cfg.sync_interval,
+            self.cfg.stale_timeout,
+        );
+
+        let local_rates = {
+            let node = &mut self.nodes[i];
+            node.live_peers = aggregated.live_peers;
+            let share = limit / (1 + node.live_peers) as f64;
+
+            // Step 2: peer-triggered promotion — a peer gossiping a scope we
+            // hold in the tail tier means it is hot somewhere; our local rate
+            // must join the coordination round
+            for scope in aggregated.scope_rates.keys() {
+                if let Some(SimScope::Tail { tail }) = node.scopes.get_mut(scope) {
+                    let tokens = tail.tokens();
+                    let limiter = make_hot_limiter(&self.cfg, now, share, tokens);
+                    node.scopes.insert(
+                        scope.clone(),
+                        SimScope::Hot {
+                            limiter,
+                            demotion: DemotionTracker::default(),
+                        },
+                    );
+                    node.hot_count += 1;
+                }
+            }
+
+            // Step 3: apply external rates, live peer count, and per-peer
+            // observations to hot scopes (scopes absent from the aggregate
+            // are explicitly zeroed), feeding the demotion hysteresis
+            let mut demote: Vec<String> = Vec::new();
+            let mut utilizations: Vec<(String, f64)> = Vec::new();
+            for (scope, entry) in node.scopes.iter_mut() {
+                let SimScope::Hot { limiter, demotion } = entry else {
+                    continue;
+                };
+                let external = aggregated.scope_rates.get(scope).copied().unwrap_or(0.0);
+                limiter.set_external_accepted_request_rate(external);
+                limiter.set_num_peers(aggregated.live_peers);
+                let obs: Vec<PeerRate<f64>> = observations
+                    .iter()
+                    .filter_map(|o| {
+                        o.scope_rates.get(scope).map(|rate| PeerRate {
+                            id: o.node_id.clone(),
+                            rate: *rate,
+                            age: o.age,
+                        })
+                    })
+                    .collect();
+                limiter.set_peer_observations(obs);
+
+                let cluster_rate = limiter.local_accepted_request_rate() + external;
+                if demotion.observe(cluster_rate, limit, now, &tier_cfg) {
+                    demote.push(scope.clone());
+                } else {
+                    utilizations.push((scope.clone(), cluster_rate / limit));
+                }
+            }
+            for scope in &demote {
+                demote_sim_scope(node, scope, share, now);
+            }
+
+            // Step 4: gossip budget — evict lowest-utilization hot scopes
+            if node.hot_count > tier_cfg.gossip_budget {
+                let evictions = budget_evictions(utilizations.clone(), tier_cfg.gossip_budget);
+                let evicted: std::collections::HashSet<&String> = evictions.iter().collect();
+                utilizations.retain(|(name, _)| !evicted.contains(name));
+                for scope in &evictions {
+                    demote_sim_scope(node, scope, share, now);
+                }
+            }
+            node.promotion_floor = if node.hot_count >= tier_cfg.gossip_budget {
+                let floor = utilizations
+                    .iter()
+                    .map(|(_, u)| *u)
+                    .fold(f64::INFINITY, f64::min);
+                if floor.is_finite() {
+                    floor.max(0.0)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
+            // Step 5: refresh and collect hot-tier rates for publishing
+            let mut local_rates = HashMap::new();
+            for (scope, entry) in node.scopes.iter_mut() {
+                if let SimScope::Hot { limiter, .. } = entry {
+                    limiter.update_state_at(now);
+                    local_rates.insert(scope.clone(), limiter.local_accepted_request_rate());
+                }
+            }
+            local_rates
+        };
+
+        // Step 6: publish to every reachable peer through the message bus.
+        // An empty rate map is still published — membership liveness rides
+        // on the periodic exchange regardless of hot-scope count.
         for j in 0..self.cfg.num_nodes {
             if j == i {
                 continue;
@@ -489,51 +624,98 @@ impl SimCluster {
                     rates: local_rates.clone(),
                 });
         }
+    }
 
-        // Step 3: aggregate peer observations with the production decay code
-        let observations: Vec<PeerObservation> = self.nodes[i]
-            .records
-            .iter()
-            .map(|(peer, rec)| PeerObservation {
-                node_id: peer.to_string(),
-                age: t.saturating_sub(rec.received_at),
-                scope_rates: rec.rates.clone(),
-            })
-            .collect();
-        let aggregated = aggregate_peer_rates(
-            &observations,
-            self.cfg.sync_interval,
-            self.cfg.stale_timeout,
-        );
+    /// Number of hot-tier (gossiped) scopes on a node.
+    pub fn hot_scopes(&self, node: usize) -> usize {
+        self.nodes[node].hot_count
+    }
 
-        // Step 4: apply external rates, live peer count, and per-peer
-        // observations in one pass; scopes absent from the aggregate are
-        // explicitly zeroed. The aggregated values remain the transport's
-        // reporting metrics; the engine consumes the raw observations.
-        let node = &mut self.nodes[i];
-        for (scope, limiter) in node.limiters.iter_mut() {
-            let external = aggregated.scope_rates.get(scope).copied().unwrap_or(0.0);
-            limiter.set_external_accepted_request_rate(external);
-            limiter.set_num_peers(aggregated.live_peers);
-            let obs: Vec<PeerRate<f64>> = observations
-                .iter()
-                .filter_map(|o| {
-                    o.scope_rates.get(scope).map(|rate| PeerRate {
-                        id: o.node_id.clone(),
-                        rate: *rate,
-                        age: o.age,
-                    })
-                })
-                .collect();
-            limiter.set_peer_observations(obs);
-        }
+    /// Coordination tier of a scope on a node (`"tail"`, `"hot"`, or `None`
+    /// if the scope hasn't been created yet).
+    pub fn scope_tier(&self, node: usize, scope: &str) -> Option<&'static str> {
+        Some(match self.nodes[node].scopes.get(scope)? {
+            SimScope::Tail { .. } => "tail",
+            SimScope::Hot { .. } => "hot",
+        })
     }
 }
 
-fn make_limiter(cfg: &SimConfig, now: Instant) -> RateLimiter<f64> {
-    // Mirrors RateLimitManager::create_limiter_from_pattern for a
-    // distributed-mode scope: target == cluster target, PID seeded with the
-    // same gains, default bucket capacity and update interval
+/// Admit one request on a node through its tiered scope entry,
+/// auto-creating the scope in the tail tier and running the promotion test
+/// exactly as the server's `RateLimitManager::should_throttle_at` does.
+fn admit_one(cfg: &SimConfig, node: &mut SimNode, scope: &str, now: Instant) -> bool {
+    let limit = cfg.cluster_target;
+    let num_nodes = 1 + node.live_peers;
+    let share = limit / num_nodes as f64;
+
+    if !node.scopes.contains_key(scope) {
+        node.scopes.insert(
+            scope.to_string(),
+            SimScope::Tail {
+                tail: TailScope::new(now, share),
+            },
+        );
+    }
+
+    let promote_tokens = match node.scopes.get_mut(scope).expect("just inserted") {
+        SimScope::Tail { tail } => {
+            let local_rate = tail.local_rate(now);
+            let wants = should_promote(local_rate, num_nodes, limit, &cfg.tier);
+            let admitted = node.hot_count < cfg.tier.gossip_budget
+                || (local_rate * num_nodes as f64 / limit) >= node.promotion_floor;
+            if wants && admitted {
+                Some(tail.tokens())
+            } else {
+                None
+            }
+        }
+        SimScope::Hot { .. } => None,
+    };
+
+    if let Some(tokens) = promote_tokens {
+        let limiter = make_hot_limiter(cfg, now, share, tokens);
+        node.scopes.insert(
+            scope.to_string(),
+            SimScope::Hot {
+                limiter,
+                demotion: DemotionTracker::default(),
+            },
+        );
+        node.hot_count += 1;
+    }
+
+    match node.scopes.get_mut(scope).expect("entry exists") {
+        SimScope::Tail { tail } => tail.try_admit(now, share),
+        SimScope::Hot { limiter, .. } => !limiter.should_throttle_at(now),
+    }
+}
+
+/// Demote a hot sim scope back to the tail tier, carrying its token balance
+fn demote_sim_scope(node: &mut SimNode, scope: &str, share: f64, now: Instant) {
+    let Some(SimScope::Hot { limiter, .. }) = node.scopes.get(scope) else {
+        return;
+    };
+    let tokens = limiter.tokens().min(share);
+    node.scopes.insert(
+        scope.to_string(),
+        SimScope::Tail {
+            tail: TailScope::with_tokens(now, tokens),
+        },
+    );
+    node.hot_count -= 1;
+}
+
+/// Build the full limiter for a scope promoted into the hot tier. Mirrors
+/// `RateLimitManager::create_promoted_limiter`: same engine construction as
+/// production, refill seeded at the already-enforced equal share, tail
+/// tokens carried over.
+fn make_hot_limiter(
+    cfg: &SimConfig,
+    now: Instant,
+    share: f64,
+    tail_tokens: f64,
+) -> RateLimiter<f64> {
     let mut pid_builder = PIDControllerBuilder::new(cfg.cluster_target)
         .kp(cfg.kp)
         .ki(cfg.ki)
@@ -557,18 +739,32 @@ fn make_limiter(cfg: &SimConfig, now: Instant) -> RateLimiter<f64> {
         .min_rate(cfg.min_rate)
         .max_rate(cfg.max_rate)
         .update_interval(cfg.pid_update_interval)
-        .initial_timestamp(now);
+        .initial_timestamp(now)
+        .initial_refill_rate(share);
     if let Some(k) = cfg.min_window_samples {
         builder = builder.min_window_samples(k);
-    }
-    if let Some(frac) = cfg.initial_tokens_frac {
-        builder = builder.initial_tokens_frac(frac);
     }
     if let Some(cap) = cfg.bucket_capacity {
         builder = builder.bucket_capacity(cap);
     }
     if let Some(secs) = cfg.bucket_burst_seconds {
         builder = builder.bucket_burst_seconds(secs);
+    }
+    // Carry the tail bucket's balance unless the scenario pins an explicit
+    // initial fill (config override wins, as elsewhere)
+    let frac = match cfg.initial_tokens_frac {
+        Some(f) => Some(f),
+        None => {
+            let capacity = cfg.bucket_capacity.unwrap_or(share);
+            if capacity > 0.0 {
+                Some((tail_tokens / capacity).clamp(0.0, 1.0))
+            } else {
+                None
+            }
+        }
+    };
+    if let Some(f) = frac {
+        builder = builder.initial_tokens_frac(f);
     }
 
     match cfg.engine {
@@ -591,11 +787,26 @@ mod tests {
             .arrival(ArrivalProcess::Deterministic)]
     }
 
+    fn hot_limiter<'a>(cluster: &'a SimCluster, node: usize, scope: &str) -> &'a RateLimiter<f64> {
+        match cluster.nodes[node].scopes.get(scope) {
+            Some(SimScope::Hot { limiter, .. }) => limiter,
+            other => panic!(
+                "scope {:?} on node {} expected hot, got {}",
+                scope,
+                node,
+                match other {
+                    Some(SimScope::Tail { .. }) => "tail",
+                    _ => "missing",
+                }
+            ),
+        }
+    }
+
     #[test]
     fn test_gossip_reaches_peers() {
         let cfg = SimConfig::default();
         let mut cluster = SimCluster::new(cfg, constant_workload(600.0), 1);
-        // Run 5 simulated seconds: plenty for publish + delivery
+        // Run 5 simulated seconds: plenty for promotion + publish + delivery
         for _ in 0..500 {
             cluster.run_tick();
         }
@@ -606,7 +817,13 @@ mod tests {
                 "node {} should have records from both peers",
                 i
             );
-            let limiter = cluster.nodes[i].limiters.get("test").unwrap();
+            assert_eq!(
+                cluster.scope_tier(i, "test"),
+                Some("hot"),
+                "an over-limit scope must promote on node {}",
+                i
+            );
+            let limiter = hot_limiter(&cluster, i, "test");
             assert_eq!(limiter.num_peers(), 2);
             assert!(
                 limiter.external_accepted_request_rate() > 0.0,
@@ -629,12 +846,12 @@ mod tests {
             cluster.run_tick();
         }
         assert_eq!(
-            cluster.nodes[0].limiters.get("test").unwrap().num_peers(),
+            hot_limiter(&cluster, 0, "test").num_peers(),
             0,
             "isolated node should see no live peers after stale_timeout"
         );
         assert_eq!(
-            cluster.nodes[1].limiters.get("test").unwrap().num_peers(),
+            hot_limiter(&cluster, 1, "test").num_peers(),
             1,
             "majority-side node should still see its groupmate"
         );
@@ -647,20 +864,72 @@ mod tests {
         for _ in 0..300 {
             cluster.run_tick();
         }
-        assert_eq!(
-            cluster.nodes[0].limiters.get("test").unwrap().num_peers(),
-            2
-        );
+        assert_eq!(hot_limiter(&cluster, 0, "test").num_peers(), 2);
 
         cluster.apply_event(&SimEvent::NodeDown(2));
         for _ in 0..1200 {
             cluster.run_tick();
         }
         assert_eq!(
-            cluster.nodes[0].limiters.get("test").unwrap().num_peers(),
+            hot_limiter(&cluster, 0, "test").num_peers(),
             1,
             "dead peer should stop counting after stale_timeout"
         );
+    }
+
+    #[test]
+    fn test_below_threshold_scope_stays_tail() {
+        // 30 rps offered against a 300 rps cluster limit: estimated
+        // utilization ~10% — far below the promotion threshold, so the
+        // scope must stay in the tail tier with no gossip payload
+        let cfg = SimConfig::default();
+        let mut cluster = SimCluster::new(cfg, constant_workload(30.0), 1);
+        for _ in 0..3000 {
+            cluster.run_tick();
+        }
+        for i in 0..3 {
+            assert_eq!(
+                cluster.scope_tier(i, "test"),
+                Some("tail"),
+                "low-utilization scope must stay tail on node {}",
+                i
+            );
+            assert_eq!(cluster.hot_scopes(i), 0);
+            // Membership liveness still flows without hot scopes
+            assert_eq!(cluster.nodes[i].live_peers, 2);
+        }
+    }
+
+    #[test]
+    fn test_hot_scope_demotes_after_load_drops() {
+        let workloads = vec![Workload::new(
+            "test",
+            LoadPattern::Step {
+                before: 600.0,
+                after: 20.0,
+                at: Duration::from_secs(10),
+            },
+        )
+        .arrival(ArrivalProcess::Deterministic)];
+        let cfg = SimConfig::default();
+        let mut cluster = SimCluster::new(cfg, workloads, 1);
+        // 10s of heavy load: promoted everywhere
+        for _ in 0..1000 {
+            cluster.run_tick();
+        }
+        assert_eq!(cluster.scope_tier(0, "test"), Some("hot"));
+        // 30s at ~7% utilization: past the demotion hold everywhere
+        for _ in 0..3000 {
+            cluster.run_tick();
+        }
+        for i in 0..3 {
+            assert_eq!(
+                cluster.scope_tier(i, "test"),
+                Some("tail"),
+                "idle hot scope must demote on node {}",
+                i
+            );
+        }
     }
 
     #[test]
