@@ -80,7 +80,7 @@ Distributed coordination via Chitchat gossip with **equal division PID**:
 
 ## Milestone 3: Gossip Correctness Fixes
 
-- [x] **MILESTONE COMPLETE**
+- [x] **MILESTONE COMPLETE** (commit 3002913)
 
 **Goal**: Fix known correctness gaps in the gossip aggregation path before building
 on top of it.
