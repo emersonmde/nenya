@@ -165,6 +165,18 @@ pub enum Routing {
     /// (`user_rank % num_nodes`, skipping down nodes) — the worst case for
     /// the uniform-routing estimate
     Sticky,
+
+    /// Strict rotation across up nodes (classic L4 round-robin): the
+    /// lowest-variance spread — each user's traffic is split more evenly
+    /// than uniform random
+    RoundRobin,
+
+    /// Adversarial feedback: every arrival routes to the up node with the
+    /// lowest trailing-1s *accepted* rate. Models least-loaded/latency
+    /// routing interacting with the limiter itself — a throttling node
+    /// serves fast 429s and accepts less, so it looks idle and attracts
+    /// more traffic
+    LeastLoaded,
 }
 
 /// A heavy-tailed population of per-user scopes (Milestone 6): `users`

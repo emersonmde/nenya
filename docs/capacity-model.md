@@ -171,6 +171,30 @@ propagation + control interval); the stateright model
 (`model_check_tier_state_machine`) proves the hysteresis and
 no-flap-under-constant-input properties over all interleavings.
 
+**Routing strategies — measured, only stickiness matters**: the promotion
+estimate assumes uniform routing, so four load-balancer policies were
+compared on the same Zipf population (`test_routing_strategies_preserve_two_tier_invariants`,
+seed 42, 100k users, 60× a 10 rps limit):
+
+| routing | promoted | worst unpromoted rps | head user rps (offered ~50) | node CV |
+|---------|----------|----------------------|------------------------------|---------|
+| uniform | 17 | 2.53 | 10.28 | 0.015 |
+| round-robin | 17 | 3.33 | 10.40 | 0.002 |
+| least-loaded (adverse feedback) | 17 | 3.15 | 10.40 | 0.001 |
+| sticky | 42 | 1.22 | 3.52 | 0.017 |
+
+Round-robin is just a lower-variance uniform. Least-loaded — modeled
+adversarially as "route every arrival to the node with the lowest
+trailing-1s *accepted* rate", i.e. a throttling node's fast 429s attract
+more traffic — turns out to act as an equalizer, indistinguishable from
+round-robin: per-user capping doesn't create the node-level asymmetry the
+feedback loop would need. Static skew is bracketed by the
+uniform/sticky endpoints. The only policy that changes outcomes is full
+session affinity, and its failure mode is *under-service* (head user
+capped at the ~`limit/n` equal-division share, 3.5 of 10 rps), not
+overage — the same engine-side property noted below, addressable by
+demand-weighted division, not by tier policy.
+
 **Count-min sketch — evaluated and rejected**: a mergeable sketch of tail
 rates would answer "approximate cluster rate for any user" at fixed gossip
 size. The simulator data shows promotion + per-pattern tail aggregate

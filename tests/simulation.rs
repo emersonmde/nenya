@@ -568,6 +568,65 @@ fn test_user_ramp_tail_hot_tail_journey() {
     );
 }
 
+/// Routing-strategy robustness (Milestone 6 follow-up): the two-tier
+/// invariants must hold under every load-balancing policy, not just the
+/// uniform-random one the promotion estimate assumes. Round-robin is
+/// lower-variance than uniform; least-loaded is the adverse-feedback case
+/// (a throttling node accepts less, looks idle, and attracts more
+/// traffic); sticky is the known worst case. Measured (seed 42, Zipf 100k
+/// users, 60x a 10 rps limit): uniform/RR/least-loaded are
+/// indistinguishable (17 promoted, head capped at ~10.3-10.4, node CV
+/// ≤ 0.015); sticky promotes 42 and under-serves the head to ~3.5 rps
+/// (the equal-division share ceiling — an engine property, not a tier
+/// one). No routing policy produces unpromoted overage.
+#[test]
+fn test_routing_strategies_preserve_two_tier_invariants() {
+    use nenya::sim::{LoadPattern, PopulationWorkload, Routing, Scenario, SimConfig};
+
+    for (name, routing) in [
+        ("uniform", Routing::Uniform),
+        ("round_robin", Routing::RoundRobin),
+        ("sticky", Routing::Sticky),
+        ("least_loaded", Routing::LeastLoaded),
+    ] {
+        let cfg = SimConfig::default().with_cluster_target(10.0);
+        let s = Scenario::new("routing_probe", cfg, Vec::new()).population(
+            PopulationWorkload::new("user:", 100_000, 1.0, LoadPattern::Constant { rate: 600.0 })
+                .routing(routing),
+        );
+        let cluster = run_cluster(&s, SEED);
+
+        let promoted = cluster.num_ever_hot();
+        assert!(
+            promoted <= 100,
+            "{}: promoted set {} not << 100k users",
+            name,
+            promoted
+        );
+        let mut worst_unpromoted: f64 = 0.0;
+        let mut worst_any: f64 = 0.0;
+        for (scope, _, accepted) in cluster.all_scope_counts() {
+            let rate = accepted as f64 / 60.0;
+            worst_any = worst_any.max(rate);
+            if !cluster.was_ever_hot(scope) {
+                worst_unpromoted = worst_unpromoted.max(rate);
+            }
+        }
+        assert!(
+            worst_unpromoted <= 10.0,
+            "{}: unpromoted user served {:.2} rps over the 10 rps limit",
+            name,
+            worst_unpromoted
+        );
+        assert!(
+            worst_any <= 15.0,
+            "{}: user served {:.2} rps, far over the 10 rps limit",
+            name,
+            worst_any
+        );
+    }
+}
+
 /// Derivation sweep for the two-tier defaults (`gossip::tier` constants).
 /// Prints markdown tables; the shipped values and the published curves in
 /// docs/capacity-model.md come from this — re-run after control changes.

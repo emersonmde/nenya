@@ -243,6 +243,8 @@ struct SimNode {
     /// Tail aggregate for the node's single implicit pattern (summed
     /// accepted rate of unpromoted scopes, maintained on the admit path)
     tail_window: RateWindow,
+    /// Trailing accepted rate across all scopes (LeastLoaded routing input)
+    accept_window: RateWindow,
     /// Sim time of the last idle-scope TTL sweep
     last_ttl_sweep: Duration,
     /// Fractional-arrival accumulator per scope (deterministic arrivals)
@@ -272,6 +274,8 @@ struct PopState {
     /// Cumulative rank-frequency distribution (`cdf[r]` = P(rank ≤ r))
     cdf: Vec<f64>,
     rng: SplitMix64,
+    /// Round-robin cursor (Routing::RoundRobin)
+    rr_next: usize,
 }
 
 impl PopState {
@@ -285,7 +289,12 @@ impl PopState {
         for c in cdf.iter_mut() {
             *c /= total;
         }
-        PopState { wl, cdf, rng }
+        PopState {
+            wl,
+            cdf,
+            rng,
+            rr_next: 0,
+        }
     }
 
     /// Sample a user rank from the Zipf CDF (binary search).
@@ -357,6 +366,7 @@ impl SimCluster {
                 hot_count: 0,
                 promotion_floor: 0.0,
                 tail_window: RateWindow::new(start),
+                accept_window: RateWindow::new(start),
                 last_ttl_sweep: Duration::ZERO,
                 accum: BTreeMap::new(),
                 rng: root_rng.fork(),
@@ -611,6 +621,7 @@ impl SimCluster {
                         counts.accepted += 1;
                         counts.per_node_accepted[i] += 1;
                         *self.scope_accepted.entry(scope.clone()).or_default() += 1;
+                        node.accept_window.record(now);
                     }
                 }
             }
@@ -647,6 +658,21 @@ impl SimCluster {
                                 .find(|&i| self.nodes[i].up)
                                 .expect("at least one up node")
                         }
+                        Routing::RoundRobin => {
+                            let idx = up_nodes[pop.rr_next % up_nodes.len()];
+                            pop.rr_next = (pop.rr_next + 1) % up_nodes.len();
+                            idx
+                        }
+                        Routing::LeastLoaded => *up_nodes
+                            .iter()
+                            .min_by(|&&a, &&b| {
+                                self.nodes[a]
+                                    .accept_window
+                                    .rate_at(now)
+                                    .partial_cmp(&self.nodes[b].accept_window.rate_at(now))
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .expect("at least one up node"),
                     };
                     counts.offered += 1;
                     *self.scope_offered.entry(scope.clone()).or_default() += 1;
@@ -660,6 +686,7 @@ impl SimCluster {
                         counts.accepted += 1;
                         counts.per_node_accepted[node_idx] += 1;
                         *self.scope_accepted.entry(scope).or_default() += 1;
+                        self.nodes[node_idx].accept_window.record(now);
                     }
                 }
             }
