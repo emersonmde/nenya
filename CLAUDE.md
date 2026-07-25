@@ -28,11 +28,10 @@ no coordinator.
 2. **[`docs/architecture.md`](docs/architecture.md)** — design details; each section is marked Implemented or Planned
 3. This file — commands, structure, conventions
 
-**Current milestone: 5 — Pluggable Control Engine & Bayesian Estimation.**
-Extract the `RateController` trait (per-peer `(rate, age)` observations, not
-a pre-aggregated sum), port the PID engine unchanged, implement the Kalman
-BayesianEngine and HybridEngine, and judge them with the Milestone 4
-benchmark harness (`cluster_sim --matrix`). See the roadmap's Milestone 5
+**Current milestone: 6 — Per-User Scale (Two-Tier Coordination).**
+Gossip only scopes near their limit (promotion via `local_rate × num_peers`
+estimate); the heavy-tailed remainder is enforced locally at
+`limit / num_peers` with compact state. See the roadmap's Milestone 6
 section for the task list.
 
 ## Milestone Overview
@@ -42,8 +41,8 @@ section for the task list.
 | 0-2 | ✅ Complete | Single-crate structure, HTTP rate limiter, gossip coordination |
 | 3 | ✅ Complete | Gossip correctness fixes (stale decay, locking) |
 | 4 | ✅ Complete | Deterministic multi-node simulator + scenario/benchmark suite |
-| 5 | ⏳ Current | Pluggable engines: PID vs Bayesian (Kalman), benchmarked |
-| 6 | 🔜 Future | Two-tier coordination for per-user scale (millions of scopes) |
+| 5 | ✅ Complete | Pluggable engines (PID/Bayesian/hybrid) benchmarked; estimator-floor + cold-start fixes |
+| 6 | ⏳ Current | Two-tier coordination for per-user scale (millions of scopes) |
 | 7 | 🔜 Future | Client SDKs (Rust, Python, Node, Go) |
 | 8 | 🔜 Future | Platform deployment + discovery + AgentCore quota arbitration |
 | 9 | 🔜 Future | Cluster authentication |
@@ -103,7 +102,9 @@ jobs -p | xargs kill
 
 ```
 src/
-├── lib.rs              # Library: RateLimiter (token bucket + sliding window + PID)
+├── lib.rs              # Library: RateLimiter (token bucket + sliding window + engine)
+├── engine/             # Library: RateController trait + PidEngine /
+│                       #   BayesianEngine (Kalman) / HybridEngine, staleness curve
 ├── pid_controller.rs   # Library: PID algorithm (error bias, anti-windup)
 ├── main.rs             # Binary entry (compile_error! without `server` feature)
 ├── api/                # HTTP API: handlers, RateLimitManager, metrics, errors
@@ -130,16 +131,20 @@ nenya-sentinel/         # Deprecation stub only — the binary is now `nenya` it
 - Explicit-timestamp APIs (`should_throttle_at`, `update_state_at`) exist and are
   the hook for deterministic simulation (Milestone 4) — prefer extending these
   over adding internal `Instant::now()` calls
-- Distribution hooks: `set_external_accepted_request_rate()`, `set_num_peers()`,
+- Distribution hooks: `set_peer_observations()` (per-peer `(id, rate, age)`
+  — the engines' input) plus `set_external_accepted_request_rate()` /
+  `set_num_peers()` (reporting metrics and legacy input path) and
   `cluster_target()` — this is the entire library-side coordination surface
 
 **Server** (feature `server`):
 - `api::RateLimitManager`: `HashMap<String, RateLimiter<f64>>`, scopes auto-created
   via pattern match (exact > most specific wildcard > `*` default)
 - `gossip::gossip_sync_loop`: every 500ms — publish local per-scope accepted
-  rates, aggregate peer rates, inject via `set_external_accepted_request_rate`
-- Equal division PID: each node targets `cluster_target / num_nodes` and uses
-  `local + sum(peers)` as the feedback signal
+  rates, pass per-peer observations via `set_peer_observations` (plus the
+  aggregated rate/live-peer count as reporting metrics)
+- Default engine (equal-division PID): each node targets
+  `cluster_target / live_nodes` with its *local* accepted rate as the
+  feedback signal; peer observations contribute liveness only
 - Gossip is enabled by `NENYA_SEED_NODES` being non-empty or `NENYA_ENABLE_GOSSIP=1`
 
 ## Key Design Decisions
@@ -147,9 +152,12 @@ nenya-sentinel/         # Deprecation stub only — the binary is now `nenya` it
 - **HTTP/JSON API, not gRPC** — simplicity and cross-language support
 - **Chitchat for gossip** — anti-entropy (Scuttlebutt) + phi accrual failure
   detection; better state-propagation reliability than SWIM
-- **Estimation vs. control separation (Milestone 5)**: the planned
-  `RateController` trait receives per-peer `(rate, age)` observations, not a
-  pre-aggregated sum — aggregation strategy is part of what engines compete on
+- **Estimation vs. control separation (Milestone 5, implemented)**: the
+  `RateController` trait (`src/engine/`) receives per-peer `(rate, age)`
+  observations, not a pre-aggregated sum — aggregation strategy is part of
+  what engines compete on. Default engine is `pid`
+  (data: `docs/engine-comparison.md`); bayesian/hybrid selectable via
+  explicit config only
 - **Simulation before tuning**: control-loop changes (gains, engines, gossip
   parameters) must be evaluated in the deterministic simulator (Milestone 4)
   before shipping; don't hand-tune against real clusters

@@ -4,7 +4,7 @@ This document outlines the implementation plan for Nenya distributed rate limiti
 
 ## Current Milestone
 
-**Status**: Milestones 0-4 Complete - Ready for Milestone 5 (Pluggable Control Engine & Bayesian Estimation)
+**Status**: Milestones 0-5 Complete - Ready for Milestone 6 (Per-User Scale — Two-Tier Coordination)
 
 **Completed**:
 - ✅ Milestone 0: Single-crate restructure, HTTP stack, distributed coordination foundation
@@ -14,8 +14,13 @@ This document outlines the implementation plan for Nenya distributed rate limiti
 - ✅ Milestone 4: Deterministic multi-node simulator, scenario/benchmark suite,
   property tests + stateright model checking (plus first simulator-derived
   production fix: PID anti-windup clamp)
+- ✅ Milestone 5: Pluggable control engines (PID / Bayesian-Kalman / hybrid)
+  behind the `RateController` trait, engine benchmark + comparison doc, and
+  three simulator-derived control fixes (adaptive-window rate estimator,
+  adaptive burst allowance — which flattened the fleet-convergence law —
+  and a documented negative result on gain scheduling)
 
-See Milestone 5 below for next steps.
+See Milestone 6 below for next steps.
 
 ## Principles
 
@@ -344,7 +349,8 @@ cargo run --features sim --example cluster_sim -- --scenario partition --seed 42
 
 ## Milestone 5: Pluggable Control Engine & Bayesian Estimation
 
-- [ ] **MILESTONE COMPLETE**
+- [x] **MILESTONE COMPLETE** (commits 256eda1 → 11d0d6d → be94883 →
+  06984f7 → 0af0622; roadmap/docs finalization commit hash recorded below)
 
 **Goal**: Make the control engine swappable behind a trait and build three
 candidate engines: PID, pure Bayesian (estimate-and-set), and the Kalman→PID
@@ -369,16 +375,16 @@ Engine section as part of this milestone.
 
 #### 5.1 Engine Abstraction
 
-- [ ] **Define `RateController` trait** (library, no server deps)
+- [x] **Define `RateController` trait** (library, no server deps)
   - Inputs per update: local accepted rate, per-peer observations
     `(rate, age)`, live peer count, cluster target, elapsed time
   - Output: new local refill rate (clamped to min/max by the caller)
   - The trait boundary is deliberately narrow: engines see observations,
     not gossip internals
-- [ ] **Port PID behind the trait**
+- [x] **Port PID behind the trait**
   - Existing `PIDController` becomes `PidEngine`; zero behavior change,
     verified by existing tests and simulator baselines
-- [ ] **Config selection**
+- [x] **Config selection**
   - `engine = "pid" | "bayesian" | "hybrid"` per scope pattern in TOML, with
     engine-specific parameter tables; explicit config only, no runtime
     auto-selection
@@ -388,49 +394,49 @@ Engine section as part of this milestone.
 Frame the problem as state estimation: each peer's true rate is a latent
 variable observed through delayed, noisy gossip samples.
 
-- [ ] **Per-peer estimator**
+- [x] **Per-peer estimator**
   - Model peer rate as a random walk; scalar Kalman filter per (peer, scope)
   - Observation update on each gossip sample; process noise grows the
     variance between samples, so **staleness = uncertainty** (this subsumes
     Milestone 3's decay heuristic with a principled equivalent)
-- [ ] **Global estimate**
+- [x] **Global estimate**
   - Cluster rate = sum of peer means + local rate; total variance = sum of
     peer variances
-- [ ] **Uncertainty-aware admission**
+- [x] **Uncertainty-aware admission**
   - Compute local refill rate from the estimate's upper confidence bound
     (configurable z, e.g., admit against `mean + 1σ`): the node is
     automatically conservative exactly when information is stale (partition,
     churn) and aggressive when the estimate is tight
-- [ ] **Document the math**
+- [x] **Document the math**
   - Derivation, assumptions (Gaussian noise, random-walk dynamics), parameter
     meanings (process noise ↔ how fast peer rates are believed to change)
   - Cite sources per constants-verification policy (standard Kalman filter
     references, not blog posts)
-- [ ] **Optional hybrid**: Kalman-filtered global estimate feeding the PID
+- [x] **Optional hybrid**: Kalman-filtered global estimate feeding the PID
   engine — cheap to build once both halves exist; include in the benchmark
   matrix
 
 #### 5.3 Engine Benchmark & Selection
 
-- [ ] **Run the full Milestone 4 scenario matrix** for each engine
+- [x] **Run the full Milestone 4 scenario matrix** for each engine
   (`cluster_sim --matrix` grows an engine dimension):
   - Convergence time, overshoot, oscillation, fairness, partition behavior,
     noise robustness (add high-jitter and message-loss scenario variants —
     the gossip model already supports both, the library just doesn't sweep
     them yet)
   - Parameter sensitivity: how badly does each engine degrade when mistuned?
-- [ ] **Skewed demand as a scoring dimension** — Milestone 4 finding: under
+- [x] **Skewed demand as a scoring dimension** — Milestone 4 finding: under
   the skew scenario (one node receives 90% of 2× target load), equal
   division serves only ~60% of the cluster target (the hot node clamps at
   `max_rate / num_nodes`, fairness CV 0.65, never converges). Engines
   receive per-peer `(rate, age)` observations, so demand-weighted share
   division is inside the trait boundary — score engines on throughput
   achieved under skew, not just fairness under uniform load
-- [ ] **Write up results** in `docs/engine-comparison.md` with plots
+- [x] **Write up results** in `docs/engine-comparison.md` with plots
   (SVG artifacts from `cluster_sim --plot`)
-- [ ] **Pick the default engine** based on data; keep the other available
+- [x] **Pick the default engine** based on data; keep the other available
   via config
-- [ ] **Hot-path check**: engine update runs in the sync loop (per second per
+- [x] **Hot-path check**: engine update runs in the sync loop (per second per
   scope), not per request — verify no regression to the ~40ns decision path
 
 #### 5.4 Simulator-Driven Control Fixes
@@ -440,7 +446,7 @@ Defects and scaling laws surfaced by Milestone 4's capacity sweeps
 [docs/capacity-model.md](capacity-model.md)); each follows the anti-windup
 precedent: sweep in the simulator, ship the derived default.
 
-- [ ] **Rate-estimator floor at sparse per-node shares**: below ~5 rps/node
+- [x] **Rate-estimator floor at sparse per-node shares**: below ~5 rps/node
   fair share, the 1s sliding-window estimator mostly sees an empty window,
   under-measures, and the PID over-admits ~0.6 rps/node (measured +98%
   steady overshoot at 0.75 rps/node share; <2% at 100 rps/node). Candidate
@@ -449,11 +455,11 @@ precedent: sweep in the simulator, ship the derived default.
   tiny by design). Characterized by
   `capacity_per_node_share_floor_characterization` — flip that test when
   fixed
-- [ ] **Gain scheduling vs. fleet size**: convergence ≈ 0.7s × nodes at
+- [x] **Gain scheduling vs. fleet size**: convergence ≈ 0.7s × nodes at
   fixed gains (equal division hands each node error/n). Candidate: scale
   integral gain with `1 + num_peers` to restore n-independent settling;
   sweep for stability margins before shipping
-- [ ] **Cold-start fair-share initialization**: a joining node starts with
+- [x] **Cold-start fair-share initialization**: a joining node starts with
   `bucket_capacity = cluster_target` tokens and `refill = cluster_target`,
   admitting a ~full-bucket burst per join (~250 excess requests/join in the
   autoscale scenario; 27 rapid joins cost 8093 requests of overshoot vs a
@@ -463,12 +469,49 @@ precedent: sweep in the simulator, ship the derived default.
 **Deliverable**: Two production engines behind one trait, a data-backed default,
 and a written comparison
 
-**Verification**:
+**Implementation notes** (full data in
+[docs/engine-comparison.md](engine-comparison.md) and
+[docs/capacity-model.md](capacity-model.md)):
+- `src/engine/`: `RateController` trait + `PidEngine` / `BayesianEngine` /
+  `HybridEngine`; `staleness_weight` moved into the engine module (gossip
+  re-exports it). PID port verified byte-identical against the Milestone 4
+  matrix at seed 42. One deviation from the task text: engines own the
+  min/max clamping (distributed bounds scale with the live node count,
+  which only the engine knows); the caller sanitizes to non-negative
+  finite.
+- Engine selection: `NENYA_DEFAULT_ENGINE` env var + `ScopePattern.engine`
+  and estimator-parameter fields (the future TOML tables will expose the
+  same fields); TOML config itself remains a Milestone 7-9 item.
+- **Default: `pid`** — best all-round convergence at shipped tuning and
+  the only engine whose feedback consumes no gossip data. Hybrid: least
+  overshoot, gracefully tolerates 4× mistuned gains (pid limit-cycles).
+  Bayesian (`q=1, r=100, z=1`, sweep-derived): serves 87% of achievable
+  throughput under 90%-hot-node skew vs pid's 54% — the demand-weighted
+  niche — at the cost of UCB undershoot and no band convergence at 10+
+  nodes under uniform load.
+- **5.4a estimator floor — fixed**: adaptive-window floor
+  (`min_window_samples = 20`, swept over {0,2,5,10,20,30,50}) cuts
+  sparse-share over-admission from +16–18% to +2.5–3.3%;
+  `capacity_per_node_share_floor_fixed` guards it (with a K=0 control run).
+- **5.4b gain scheduling — rejected by the sweep**: `ki × n` gives +53%
+  chronic over-admission at 100 nodes (+22% even with the anti-windup
+  clamp scaled to constant authority). No scheduling knob ships; negative
+  result recorded in capacity-model.md.
+- **5.4c cold start — fixed, and it flattened the scale law**: bucket
+  capacity now tracks `refill × 1s` (library default; explicit
+  `bucket_capacity` pins static). Autoscale join overshoot 8093 → 2087
+  requests, and the Milestone 4 "0.7s × node count" convergence law turned
+  out to be the banked cold-start burst: convergence is now ~4s flat at
+  10/50/100 nodes.
+- Hot path: warm decision 31ns unchanged; cold-start +8ns (one-time Box
+  allocation per scope).
+
+**Verification** (all run at completion):
 ```bash
-cargo test --all-features
-# comparison table across engines (flag added in this milestone):
+cargo test --all-features                                   # 18 suites green
+cargo test --all-features --release -- --ignored            # full matrix + sweeps
 cargo run --features sim --example cluster_sim -- --matrix --seed 42
-# docs/engine-comparison.md exists with results and plots
+cargo fmt -- --check && cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 **Commit Message**: `Milestone 5: Pluggable control engines with PID vs Bayesian benchmark`

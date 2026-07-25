@@ -15,6 +15,10 @@
 
 - **PID-based adaptive control**: Adjusts rate limits in real-time based on measured throughput
 - **Distributed coordination**: Equal division PID algorithm for cluster-wide rate limiting
+- **Pluggable control engines**: PID (default), Bayesian (per-peer Kalman
+  estimation with uncertainty-aware admission), and a Kalman→PID hybrid —
+  explicit config, benchmarked head-to-head in
+  [docs/engine-comparison.md](docs/engine-comparison.md)
 - **Token bucket + sliding window hybrid**: Fast per-request decisions with accurate rate measurement
 - **AIMD-inspired tuning**: Conservative PID gains optimized for distributed systems (kp=0.5, ki=0.02, kd=0.08)
 - **Generic over numeric types**: Works with f32, f64, or custom numeric types
@@ -178,10 +182,11 @@ cargo run --features sim --example cluster_sim -- --list
 cargo run --features sim --example cluster_sim -- \
     --scenario partition --seed 42 --plot
 
-# Run the full scenario matrix and print a comparison table (markdown).
-# This is the benchmark harness for judging control-engine changes —
-# gains and the anti-windup clamp can be overridden per run for A/B
-# comparisons (--kp/--ki/--kd/--error-limit-frac).
+# Run the full scenario matrix and print comparison tables (markdown) —
+# one table per control engine (pid, bayesian, hybrid), or a single
+# engine with --engine. Gains, the anti-windup clamp, and estimator
+# parameters can be overridden per run for A/B comparisons
+# (--kp/--ki/--kd/--error-limit-frac/--process-noise/--measurement-noise).
 cargo run --features sim --example cluster_sim -- --matrix --seed 42
 ```
 
