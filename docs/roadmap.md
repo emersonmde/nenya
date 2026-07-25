@@ -357,6 +357,11 @@ So all three go through the Milestone 4 scenario matrix.
 The engine is always an **explicit config option** — never selected at runtime.
 Benchmarks decide only which value ships as the documented recommended default.
 
+**Baseline to beat**: the Milestone 4 matrix at seed 42 with production PID
+defaults (recorded in the Milestone 4 implementation notes) — notably
+partition overshoot 9506 requests, leave re-convergence 12.0s, scale_50
+convergence 42.5s, and the skew scenario never converging (see 5.3).
+
 **Architecture Reference**: update [docs/architecture.md](architecture.md) with an
 Engine section as part of this milestone.
 
@@ -407,11 +412,22 @@ variable observed through delayed, noisy gossip samples.
 
 #### 5.3 Engine Benchmark & Selection
 
-- [ ] **Run the full Milestone 4 scenario matrix** for each engine:
+- [ ] **Run the full Milestone 4 scenario matrix** for each engine
+  (`cluster_sim --matrix` grows an engine dimension):
   - Convergence time, overshoot, oscillation, fairness, partition behavior,
-    noise robustness (high jitter + message loss scenarios)
+    noise robustness (add high-jitter and message-loss scenario variants —
+    the gossip model already supports both, the library just doesn't sweep
+    them yet)
   - Parameter sensitivity: how badly does each engine degrade when mistuned?
+- [ ] **Skewed demand as a scoring dimension** — Milestone 4 finding: under
+  the skew scenario (one node receives 90% of 2× target load), equal
+  division serves only ~60% of the cluster target (the hot node clamps at
+  `max_rate / num_nodes`, fairness CV 0.65, never converges). Engines
+  receive per-peer `(rate, age)` observations, so demand-weighted share
+  division is inside the trait boundary — score engines on throughput
+  achieved under skew, not just fairness under uniform load
 - [ ] **Write up results** in `docs/engine-comparison.md` with plots
+  (SVG artifacts from `cluster_sim --plot`)
 - [ ] **Pick the default engine** based on data; keep the other available
   via config
 - [ ] **Hot-path check**: engine update runs in the sync loop (per second per
@@ -423,7 +439,8 @@ and a written comparison
 **Verification**:
 ```bash
 cargo test --all-features
-cargo run --example engine_benchmark   # emits comparison table
+# comparison table across engines (flag added in this milestone):
+cargo run --features sim --example cluster_sim -- --matrix --seed 42
 # docs/engine-comparison.md exists with results and plots
 ```
 
