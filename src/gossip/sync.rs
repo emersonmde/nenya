@@ -51,11 +51,11 @@ pub async fn gossip_sync_loop(
 
         // 2. Apply observations + tier maintenance + collect publish set
         // (single write lock, no I/O inside)
-        let local_rates = {
+        let (local_rates, tail_rates) = {
             let mut mgr = manager.write().await;
             let now = std::time::Instant::now();
             mgr.apply_peer_observations(&observations, &aggregated, now);
-            let rates = mgr.collect_gossip_rates(now);
+            let payload = mgr.collect_gossip_rates(now);
             tracing::debug!(
                 "Gossip sync: {} scopes ({} hot), {} live peers, {} peer scopes",
                 mgr.num_scopes(),
@@ -63,11 +63,12 @@ pub async fn gossip_sync_loop(
                 aggregated.live_peers,
                 aggregated.scope_rates.len()
             );
-            rates
+            payload
         };
 
-        // 3. Publish hot-tier rates to the cluster (manager lock released)
-        if let Err(e) = gossip.publish_rates(&local_rates).await {
+        // 3. Publish hot-tier rates + per-pattern tail aggregates to the
+        // cluster (manager lock released)
+        if let Err(e) = gossip.publish_rates(&local_rates, &tail_rates).await {
             tracing::error!("Failed to publish gossip rates: {}", e);
         }
     }

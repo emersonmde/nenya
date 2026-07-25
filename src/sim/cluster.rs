@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use crate::engine::{BayesianEngine, EngineKind, HybridEngine, PeerRate, PidEngine};
 use crate::gossip::aggregate::{aggregate_peer_rates, PeerObservation};
 use crate::gossip::tier::{
-    budget_evictions, should_promote, DemotionTracker, TailScope, TierConfig,
+    budget_evictions, should_promote, DemotionTracker, RateWindow, TailScope, TierConfig,
 };
 use crate::pid_controller::PIDControllerBuilder;
 use crate::{RateLimiter, RateLimiterBuilder};
@@ -200,6 +200,9 @@ impl SimEvent {
 
 struct PeerRecord {
     rates: HashMap<String, f64>,
+    /// Peer's tail aggregate (summed unpromoted-scope rate; the sim's
+    /// single implicit pattern is `*`)
+    tail_rate: f64,
     /// Simulated time the record last changed (age-at-receipt, mirroring
     /// `GossipManager`'s local-monotonic-clock bookkeeping)
     received_at: Duration,
@@ -230,6 +233,9 @@ struct SimNode {
     /// Promotion admission floor while at the gossip budget (mirrors
     /// `RateLimitManager::promotion_floor`)
     promotion_floor: f64,
+    /// Tail aggregate for the node's single implicit pattern (summed
+    /// accepted rate of unpromoted scopes, maintained on the admit path)
+    tail_window: RateWindow,
     /// Fractional-arrival accumulator per scope (deterministic arrivals)
     accum: BTreeMap<String, f64>,
     rng: SplitMix64,
@@ -239,6 +245,7 @@ struct Delivery {
     to: usize,
     from: usize,
     rates: HashMap<String, f64>,
+    tail_rate: f64,
 }
 
 /// Per-tick request counters.
@@ -289,6 +296,7 @@ impl SimCluster {
                 live_peers: 0,
                 hot_count: 0,
                 promotion_floor: 0.0,
+                tail_window: RateWindow::new(start),
                 accum: BTreeMap::new(),
                 rng: root_rng.fork(),
             };
@@ -340,6 +348,7 @@ impl SimCluster {
     pub fn apply_event(&mut self, event: &SimEvent) {
         match event {
             SimEvent::NodeDown(i) => {
+                let now = self.now();
                 let node = &mut self.nodes[*i];
                 node.up = false;
                 // Crash loses all state
@@ -349,8 +358,10 @@ impl SimCluster {
                 node.live_peers = 0;
                 node.hot_count = 0;
                 node.promotion_floor = 0.0;
+                node.tail_window = RateWindow::new(now);
             }
             SimEvent::NodeUp(i) => {
+                let now = self.now();
                 let node = &mut self.nodes[*i];
                 node.up = true;
                 // Fresh join: scopes re-created in the tail tier on first
@@ -361,6 +372,7 @@ impl SimCluster {
                 node.live_peers = 0;
                 node.hot_count = 0;
                 node.promotion_floor = 0.0;
+                node.tail_window = RateWindow::new(now);
             }
             SimEvent::Partition(groups) => {
                 // Group 0 is the implicit group for unlisted nodes
@@ -401,6 +413,7 @@ impl SimCluster {
                         d.from,
                         PeerRecord {
                             rates: d.rates,
+                            tail_rate: d.tail_rate,
                             received_at: t,
                         },
                     );
@@ -499,6 +512,7 @@ impl SimCluster {
                 node_id: peer.to_string(),
                 age: t.saturating_sub(rec.received_at),
                 scope_rates: rec.rates.clone(),
+                tail_rates: HashMap::from([("*".to_string(), rec.tail_rate)]),
             })
             .collect();
         let aggregated = aggregate_peer_rates(
@@ -596,8 +610,9 @@ impl SimCluster {
                     local_rates.insert(scope.clone(), limiter.local_accepted_request_rate());
                 }
             }
-            local_rates
+            (local_rates, node.tail_window.rate(now))
         };
+        let (local_rates, local_tail_rate) = local_rates;
 
         // Step 6: publish to every reachable peer through the message bus.
         // An empty rate map is still published — membership liveness rides
@@ -622,8 +637,15 @@ impl SimCluster {
                     to: j,
                     from: i,
                     rates: local_rates.clone(),
+                    tail_rate: local_tail_rate,
                 });
         }
+    }
+
+    /// This node's tail aggregate (summed accepted rate of unpromoted
+    /// scopes), read-only.
+    pub fn tail_rate(&self, node: usize, t: Duration) -> f64 {
+        self.nodes[node].tail_window.rate_at(self.start + t)
     }
 
     /// Number of hot-tier (gossiped) scopes on a node.
@@ -686,7 +708,13 @@ fn admit_one(cfg: &SimConfig, node: &mut SimNode, scope: &str, now: Instant) -> 
     }
 
     match node.scopes.get_mut(scope).expect("entry exists") {
-        SimScope::Tail { tail } => tail.try_admit(now, share),
+        SimScope::Tail { tail } => {
+            let admitted = tail.try_admit(now, share);
+            if admitted {
+                node.tail_window.record(now);
+            }
+            admitted
+        }
         SimScope::Hot { limiter, .. } => !limiter.should_throttle_at(now),
     }
 }
@@ -897,6 +925,23 @@ mod tests {
             assert_eq!(cluster.hot_scopes(i), 0);
             // Membership liveness still flows without hot scopes
             assert_eq!(cluster.nodes[i].live_peers, 2);
+            // Tail visibility: the per-pattern aggregate carries the
+            // unpromoted volume (~10 rps/node of the 30 rps offered)
+            let tail = cluster.tail_rate(i, cluster.sim_time());
+            assert!(
+                (tail - 10.0).abs() < 3.0,
+                "node {} tail aggregate {:.1}, expected ~10",
+                i,
+                tail
+            );
+            // ...and peers see it through gossip
+            let peer_tail: f64 = cluster.nodes[i].records.values().map(|r| r.tail_rate).sum();
+            assert!(
+                (peer_tail - 20.0).abs() < 6.0,
+                "node {} sees {:.1} rps of peer tail volume, expected ~20",
+                i,
+                peer_tail
+            );
         }
     }
 

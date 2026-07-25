@@ -5,7 +5,7 @@
 use crate::engine::{BayesianEngine, BayesianParams, EngineKind, HybridEngine, PidEngine};
 use crate::gossip::aggregate::{AggregatedRates, PeerObservation};
 use crate::gossip::tier::{
-    budget_evictions, should_promote, DemotionTracker, TailScope, TierConfig,
+    budget_evictions, should_promote, DemotionTracker, RateWindow, TailScope, TierConfig,
 };
 use crate::pid_controller::PIDControllerBuilder;
 use crate::{RateLimiter, RateLimiterBuilder};
@@ -298,6 +298,16 @@ pub struct RateLimitManager {
     patterns: Vec<ScopePattern>,
     match_order: Vec<usize>,
 
+    /// Per-pattern tail aggregate (summed accepted rate of unpromoted
+    /// scopes), maintained incrementally on the tail admit path — one
+    /// gossiped number per pattern keeps service-level totals visible
+    /// without gossiping tail scopes. Indexed like `patterns`.
+    tail_windows: Vec<RateWindow>,
+
+    /// Latest age-weighted per-pattern tail aggregates from live peers
+    /// (stamped by the sync loop; reporting/visibility only)
+    cluster_tail_rates: HashMap<String, f64>,
+
     /// Number of scopes currently in the hot tier (gossiped)
     hot_count: usize,
 
@@ -348,6 +358,8 @@ impl RateLimitManager {
             scopes: HashMap::new(),
             patterns: vec![ScopePattern::default_pattern(default_target_rate)],
             match_order: vec![0],
+            tail_windows: vec![RateWindow::new(Instant::now())],
+            cluster_tail_rates: HashMap::new(),
             hot_count: 0,
             live_peers: 0,
             promotion_floor: 0.0,
@@ -400,6 +412,7 @@ impl RateLimitManager {
     /// Add a pattern configuration
     pub fn add_pattern(&mut self, pattern: ScopePattern) {
         self.patterns.push(pattern);
+        self.tail_windows.push(RateWindow::new(Instant::now()));
         self.match_order.push(self.patterns.len() - 1);
         self.sort_match_order();
     }
@@ -411,6 +424,7 @@ impl RateLimitManager {
         let patterns = &self.patterns;
         self.match_order.retain(|&i| patterns[i].pattern != "*");
         self.patterns.push(pattern);
+        self.tail_windows.push(RateWindow::new(Instant::now()));
         self.match_order.push(self.patterns.len() - 1);
         self.sort_match_order();
     }
@@ -576,6 +590,12 @@ impl RateLimitManager {
                 };
                 let admitted = tail.try_admit(now, share);
                 let local_accepted_rate = tail.local_rate(now);
+                if admitted {
+                    // Maintain the per-pattern tail aggregate incrementally
+                    // (a sync-time scan over the tail set would defeat the
+                    // compact-tier design)
+                    self.tail_windows[pattern_idx].record(now);
+                }
                 return ThrottleDecision {
                     should_throttle: !admitted,
                     local_accepted_rate,
@@ -741,6 +761,7 @@ impl RateLimitManager {
         now: Instant,
     ) {
         self.live_peers = aggregated.live_peers;
+        self.cluster_tail_rates = aggregated.tail_rates.clone();
 
         // 1. Peer-triggered promotion: a peer gossiping a scope we hold in
         // the tail tier means the scope is hot somewhere — promote so our
@@ -871,12 +892,16 @@ impl RateLimitManager {
         self.hot_count -= 1;
     }
 
-    /// Refresh limiter state and collect the per-scope rates to gossip:
-    /// hot-tier scopes only (tail scopes are local by definition;
-    /// non-distributed scopes never gossip). Also ticks local limiters so
-    /// their control loops stay current under zero load.
+    /// Refresh limiter state and collect the gossip payload: per-scope
+    /// rates for hot-tier scopes plus the per-pattern tail aggregates
+    /// (summed unpromoted rates — tail scopes themselves never gossip;
+    /// non-distributed scopes never participate). Also ticks local
+    /// limiters so their control loops stay current under zero load.
     #[allow(clippy::type_complexity)]
-    pub fn collect_gossip_rates(&mut self, now: Instant) -> Vec<(String, f64)> {
+    pub fn collect_gossip_rates(
+        &mut self,
+        now: Instant,
+    ) -> (Vec<(String, f64)>, Vec<(String, f64)>) {
         let mut rates = Vec::with_capacity(self.hot_count);
         for (name, entry) in self.scopes.iter_mut() {
             match entry {
@@ -890,7 +915,33 @@ impl RateLimitManager {
                 ScopeEntry::Tail { .. } => {}
             }
         }
-        rates
+        // One aggregate per active distributed pattern
+        let mut tail_rates = Vec::new();
+        for &idx in &self.match_order {
+            if self.patterns[idx].distributed {
+                tail_rates.push((
+                    self.patterns[idx].pattern.clone(),
+                    self.tail_windows[idx].rate(now),
+                ));
+            }
+        }
+        (rates, tail_rates)
+    }
+
+    /// Latest age-weighted per-pattern tail aggregates from live peers
+    /// (visibility only — stamped by the sync loop each tick)
+    pub fn cluster_tail_rates(&self) -> &HashMap<String, f64> {
+        &self.cluster_tail_rates
+    }
+
+    /// This node's per-pattern tail aggregate (summed accepted rate of
+    /// unpromoted scopes matching the pattern)
+    pub fn local_tail_rate(&self, pattern: &str, now: Instant) -> f64 {
+        self.match_order
+            .iter()
+            .find(|&&idx| self.patterns[idx].pattern == pattern)
+            .map(|&idx| self.tail_windows[idx].rate_at(now))
+            .unwrap_or(0.0)
     }
 }
 

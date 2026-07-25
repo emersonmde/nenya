@@ -73,7 +73,7 @@ async fn test_10k_scope_keys_propagate_incrementally_over_real_udp() {
     while Instant::now() < deadline {
         published = (published + KEYS_PER_PUBLISH).min(NUM_SCOPES);
         node_a
-            .publish_rates(&rates[..published])
+            .publish_rates(&rates[..published], &[])
             .await
             .expect("publish");
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -149,7 +149,7 @@ async fn test_deleted_scope_keys_vanish_from_peer_view() {
     // Publish both scopes until B sees them
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        node_a.publish_rates(&both).await.expect("publish");
+        node_a.publish_rates(&both, &[]).await.expect("publish");
         tokio::time::sleep(Duration::from_millis(500)).await;
         let obs = node_b.get_peer_observations().await;
         if obs
@@ -164,7 +164,10 @@ async fn test_deleted_scope_keys_vanish_from_peer_view() {
     // Demote `drop`: the key is deleted and must vanish at B
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        node_a.publish_rates(&keep_only).await.expect("republish");
+        node_a
+            .publish_rates(&keep_only, &[])
+            .await
+            .expect("republish");
         tokio::time::sleep(Duration::from_millis(500)).await;
         let obs = node_b.get_peer_observations().await;
         let a_obs = obs.iter().find(|o| o.node_id == "wire-node-a");

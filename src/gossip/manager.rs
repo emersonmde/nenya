@@ -24,6 +24,11 @@ use std::time::{Duration, Instant};
 /// Chitchat key prefix for per-scope accepted rates
 const SCOPE_KEY_PREFIX: &str = "s:";
 
+/// Chitchat key prefix for per-pattern tail aggregates (summed accepted
+/// rate of the node's unpromoted scopes — service-level visibility for
+/// traffic the per-scope keys deliberately omit)
+const TAIL_KEY_PREFIX: &str = "t:";
+
 /// Chitchat key for the per-node publish counter (opaque change marker;
 /// replaces the old wall-clock timestamp — it is only ever compared for
 /// equality, never against any clock)
@@ -143,33 +148,50 @@ impl GossipManager {
         })
     }
 
-    /// Publish the hot-tier per-scope rates to the cluster: one chitchat
-    /// key per scope (only re-set when the rounded value changed, so
-    /// anti-entropy ships just the deltas), deletion for scopes that left
-    /// the hot set, and a bumped `nenya_v` change marker.
-    pub async fn publish_rates(&self, rates: &[(String, f64)]) -> Result<(), GossipError> {
+    /// Publish the hot-tier per-scope rates and per-pattern tail
+    /// aggregates to the cluster: one chitchat key per scope/pattern (only
+    /// re-set when the rounded value changed, so anti-entropy ships just
+    /// the deltas), deletion for keys that left the set, and a bumped
+    /// `nenya_v` change marker.
+    pub async fn publish_rates(
+        &self,
+        rates: &[(String, f64)],
+        tail_rates: &[(String, f64)],
+    ) -> Result<(), GossipError> {
         let counter = self.publish_counter.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Diff against the previously published set outside the chitchat
-        // callback (the mutex is uncontended: only the sync loop publishes)
+        // callback (the mutex is uncontended: only the sync loop
+        // publishes). The map is keyed by the full chitchat key, so scope
+        // and pattern entries cannot collide.
         let (to_set, to_delete) = {
+            let keyed: Vec<(String, f64)> = rates
+                .iter()
+                .map(|(scope, rate)| (format!("{}{}", SCOPE_KEY_PREFIX, scope), *rate))
+                .chain(
+                    tail_rates
+                        .iter()
+                        .map(|(pattern, rate)| (format!("{}{}", TAIL_KEY_PREFIX, pattern), *rate)),
+                )
+                .collect();
+
             let mut published = self.published.lock().expect("published mutex poisoned");
             let mut to_set: Vec<(String, String)> = Vec::new();
-            for (scope, rate) in rates {
+            for (key, rate) in &keyed {
                 let value = format!("{:.3}", rate);
-                if published.get(scope) != Some(&value) {
-                    published.insert(scope.clone(), value.clone());
-                    to_set.push((format!("{}{}", SCOPE_KEY_PREFIX, scope), value));
+                if published.get(key) != Some(&value) {
+                    published.insert(key.clone(), value.clone());
+                    to_set.push((key.clone(), value));
                 }
             }
             let current: std::collections::HashSet<&String> =
-                rates.iter().map(|(scope, _)| scope).collect();
+                keyed.iter().map(|(key, _)| key).collect();
             let to_delete: Vec<String> = published
                 .keys()
-                .filter(|scope| !current.contains(scope))
-                .map(|scope| format!("{}{}", SCOPE_KEY_PREFIX, scope))
+                .filter(|key| !current.contains(key))
+                .cloned()
                 .collect();
-            published.retain(|scope, _| current.contains(scope));
+            published.retain(|key, _| current.contains(key));
             (to_set, to_delete)
         };
 
@@ -206,8 +228,9 @@ impl GossipManager {
     /// Nodes with zero hot scopes still publish the counter, so membership
     /// liveness flows regardless of gossip payload.
     pub async fn get_peer_observations(&self) -> Vec<PeerObservation> {
-        // (node_id, change marker, per-scope rates) per live peer
-        let raw: Vec<(String, String, HashMap<String, f64>)> = self
+        type RawObservation = (String, String, HashMap<String, f64>, HashMap<String, f64>);
+        // (node_id, change marker, per-scope rates, per-pattern tail rates)
+        let raw: Vec<RawObservation> = self
             .handle
             .with_chitchat(|chitchat| {
                 let self_id = chitchat.self_chitchat_id().clone();
@@ -223,18 +246,25 @@ impl GossipManager {
                     let Some(marker) = node_state.get(VERSION_KEY) else {
                         continue;
                     };
-                    let scope_rates: HashMap<String, f64> = node_state
-                        .iter_prefix(SCOPE_KEY_PREFIX)
-                        .filter_map(|(key, versioned)| {
-                            let scope = &key[SCOPE_KEY_PREFIX.len()..];
-                            versioned
-                                .value
-                                .parse::<f64>()
-                                .ok()
-                                .map(|rate| (scope.to_string(), rate))
-                        })
-                        .collect();
-                    raw.push((chitchat_id.node_id.clone(), marker.to_string(), scope_rates));
+                    let parse_prefix = |prefix: &str| -> HashMap<String, f64> {
+                        node_state
+                            .iter_prefix(prefix)
+                            .filter_map(|(key, versioned)| {
+                                let name = &key[prefix.len()..];
+                                versioned
+                                    .value
+                                    .parse::<f64>()
+                                    .ok()
+                                    .map(|rate| (name.to_string(), rate))
+                            })
+                            .collect()
+                    };
+                    raw.push((
+                        chitchat_id.node_id.clone(),
+                        marker.to_string(),
+                        parse_prefix(SCOPE_KEY_PREFIX),
+                        parse_prefix(TAIL_KEY_PREFIX),
+                    ));
                 }
                 raw
             })
@@ -246,15 +276,16 @@ impl GossipManager {
         // Drop receipts for peers Chitchat has evicted (phi accrual failure
         // detection removes them from the live set) so the map can't grow
         // unboundedly with node churn
-        receipts.retain(|node_id, _| raw.iter().any(|(id, _, _)| id == node_id));
+        receipts.retain(|node_id, _| raw.iter().any(|(id, _, _, _)| id == node_id));
 
         raw.into_iter()
-            .map(|(node_id, marker, scope_rates)| {
+            .map(|(node_id, marker, scope_rates, tail_rates)| {
                 let age = observation_age(&mut receipts, &node_id, &marker, now);
                 PeerObservation {
                     node_id,
                     age,
                     scope_rates,
+                    tail_rates,
                 }
             })
             .collect()
@@ -399,7 +430,7 @@ mod tests {
         .expect("Failed to create manager");
 
         let result = manager
-            .publish_rates(&[("test-scope".to_string(), 100.0)])
+            .publish_rates(&[("test-scope".to_string(), 100.0)], &[])
             .await;
         assert!(result.is_ok());
 
@@ -427,12 +458,12 @@ mod tests {
         .expect("Failed to create manager");
 
         manager
-            .publish_rates(&[("a".to_string(), 10.0), ("b".to_string(), 20.0)])
+            .publish_rates(&[("a".to_string(), 10.0), ("b".to_string(), 20.0)], &[])
             .await
             .unwrap();
         // Scope `b` leaves the hot set: its key must be deleted
         manager
-            .publish_rates(&[("a".to_string(), 10.0)])
+            .publish_rates(&[("a".to_string(), 10.0)], &[])
             .await
             .unwrap();
 

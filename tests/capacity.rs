@@ -158,6 +158,7 @@ fn capacity_scope_cost_coefficients() {
             scope_rates: (0..10_000)
                 .map(|i| (format!("user:{:08x}", i), 42.0))
                 .collect::<HashMap<_, _>>(),
+            tail_rates: Default::default(),
         })
         .collect();
     let wall = Instant::now();

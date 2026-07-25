@@ -28,15 +28,24 @@ pub struct PeerObservation {
     /// the local monotonic clock (age-at-receipt)
     pub age: Duration,
 
-    /// Per-scope accepted rates reported by this peer
+    /// Per-scope accepted rates reported by this peer (hot tier only)
     pub scope_rates: HashMap<String, f64>,
+
+    /// Per-pattern tail aggregates reported by this peer: the summed
+    /// accepted rate of its *unpromoted* scopes, one number per pattern —
+    /// service-level visibility for the traffic that individual gossip
+    /// keys deliberately omit
+    pub tail_rates: HashMap<String, f64>,
 }
 
 /// Result of aggregating peer observations
 #[derive(Debug, Clone, Default)]
 pub struct AggregatedRates {
-    /// Sum of age-weighted peer rates per scope
+    /// Sum of age-weighted peer rates per scope (hot tier)
     pub scope_rates: HashMap<String, f64>,
+
+    /// Sum of age-weighted per-pattern tail aggregates
+    pub tail_rates: HashMap<String, f64>,
 
     /// Number of peers considered live (staleness weight > 0)
     pub live_peers: usize,
@@ -61,6 +70,9 @@ pub fn aggregate_peer_rates(
         for (scope, rate) in &peer.scope_rates {
             *result.scope_rates.entry(scope.clone()).or_default() += rate * weight;
         }
+        for (pattern, rate) in &peer.tail_rates {
+            *result.tail_rates.entry(pattern.clone()).or_default() += rate * weight;
+        }
     }
 
     result
@@ -78,6 +90,7 @@ mod tests {
             node_id: node_id.to_string(),
             age,
             scope_rates: rates.iter().map(|(s, r)| (s.to_string(), *r)).collect(),
+            tail_rates: Default::default(),
         }
     }
 

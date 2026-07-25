@@ -66,6 +66,7 @@ fn observations(state: &State) -> Vec<PeerObservation> {
                 node_id: format!("peer{}", p),
                 age: Duration::from_secs((state.time - at) as u64),
                 scope_rates: [("s".to_string(), RATES[p])].into_iter().collect(),
+                tail_rates: Default::default(),
             })
         })
         .collect()

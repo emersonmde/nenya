@@ -62,6 +62,7 @@ proptest! {
             node_id: "p".to_string(),
             age: timeout + Duration::from_millis(age_past_timeout_ms),
             scope_rates: [("s".to_string(), rate)].into_iter().collect(),
+            tail_rates: Default::default(),
         };
         let agg = aggregate_peer_rates(&[peer], Duration::from_millis(500), timeout);
         prop_assert_eq!(agg.live_peers, 0);
@@ -83,6 +84,7 @@ proptest! {
                 node_id: format!("p{}", i),
                 age: Duration::from_millis(*age_ms),
                 scope_rates: [("s".to_string(), *rate)].into_iter().collect(),
+                tail_rates: Default::default(),
             })
             .collect();
 

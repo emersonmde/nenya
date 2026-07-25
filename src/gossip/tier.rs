@@ -118,56 +118,29 @@ impl TierConfig {
     }
 }
 
-/// Compact tail-tier scope state: a token bucket enforcing the equal share
-/// plus a two-bucket sliding-window rate estimate for the promotion test.
-///
-/// Deliberately engine-free: the whole point of the tail tier is that a
-/// million idle-ish users cost tens of bytes each, not a boxed controller,
-/// a peer-observation vector, and a timestamp deque (~1 KB — see
-/// docs/capacity-model.md). The share to enforce is passed in per call
-/// because it changes with cluster membership, which the scope itself never
-/// tracks.
+/// Interpolated two-bucket sliding-window rate estimator: `prev_count`
+/// events landed in the last completed window, `curr_count` in the window
+/// starting at `window_start`. The estimated trailing-window rate weighs
+/// the previous bucket by its remaining overlap. 16 bytes of counters —
+/// used per tail scope (promotion test) and per pattern (the gossiped tail
+/// aggregate).
 #[derive(Debug, Clone)]
-pub struct TailScope {
-    tokens: f64,
-    last_refill: Instant,
-
-    /// Two-bucket sliding-window estimator (interpolated): `prev_count`
-    /// accepts landed in the last completed window, `curr_count` in the
-    /// window starting at `window_start`. The estimated trailing-window
-    /// rate weighs the previous bucket by its remaining overlap.
+pub struct RateWindow {
     window_start: Instant,
     prev_count: u32,
     curr_count: u32,
 }
 
-impl TailScope {
-    /// Create a tail scope with a full 1-second burst at the given share
-    /// (mirroring the library's adaptive `capacity = refill × 1 s` default).
-    pub fn new(now: Instant, share: f64) -> Self {
-        TailScope {
-            tokens: share.max(0.0) * TAIL_WINDOW.as_secs_f64(),
-            last_refill: now,
+impl RateWindow {
+    pub fn new(now: Instant) -> Self {
+        RateWindow {
             window_start: now,
             prev_count: 0,
             curr_count: 0,
         }
     }
 
-    /// Create a tail scope carrying over an explicit token balance (used
-    /// when a hot scope demotes: its remaining tokens transfer, clamped by
-    /// `try_admit`'s share-sized capacity on the next request).
-    pub fn with_tokens(now: Instant, tokens: f64) -> Self {
-        TailScope {
-            tokens: tokens.max(0.0),
-            last_refill: now,
-            window_start: now,
-            prev_count: 0,
-            curr_count: 0,
-        }
-    }
-
-    /// Roll the estimator windows forward to `now`.
+    /// Roll the windows forward to `now`.
     fn roll(&mut self, now: Instant) {
         let elapsed = now.duration_since(self.window_start);
         if elapsed < TAIL_WINDOW {
@@ -179,18 +152,22 @@ impl TailScope {
         self.window_start += TAIL_WINDOW * whole;
     }
 
-    /// Estimated local accepted rate over the trailing window
-    /// (interpolated two-bucket sliding window).
-    pub fn local_rate(&mut self, now: Instant) -> f64 {
+    /// Record one event at `now`.
+    pub fn record(&mut self, now: Instant) {
+        self.roll(now);
+        self.curr_count += 1;
+    }
+
+    /// Estimated trailing-window rate (events/sec), rolling forward first.
+    pub fn rate(&mut self, now: Instant) -> f64 {
         self.roll(now);
         let frac = now.duration_since(self.window_start).as_secs_f64() / TAIL_WINDOW.as_secs_f64();
         (self.prev_count as f64 * (1.0 - frac) + self.curr_count as f64) / TAIL_WINDOW.as_secs_f64()
     }
 
-    /// Read-only variant of [`local_rate`](Self::local_rate) for stats
-    /// paths that only hold a shared reference (computes the same estimate
-    /// without rolling the stored windows).
-    pub fn local_rate_at(&self, now: Instant) -> f64 {
+    /// Read-only variant of [`rate`](Self::rate) for stats paths that only
+    /// hold a shared reference (same estimate, no roll).
+    pub fn rate_at(&self, now: Instant) -> f64 {
         let elapsed = now.duration_since(self.window_start);
         let (prev, curr, frac) = if elapsed < TAIL_WINDOW {
             (
@@ -206,6 +183,56 @@ impl TailScope {
         };
         (prev as f64 * (1.0 - frac) + curr as f64) / TAIL_WINDOW.as_secs_f64()
     }
+}
+
+/// Compact tail-tier scope state: a token bucket enforcing the equal share
+/// plus a two-bucket sliding-window rate estimate for the promotion test.
+///
+/// Deliberately engine-free: the whole point of the tail tier is that a
+/// million idle-ish users cost tens of bytes each, not a boxed controller,
+/// a peer-observation vector, and a timestamp deque (~1 KB — see
+/// docs/capacity-model.md). The share to enforce is passed in per call
+/// because it changes with cluster membership, which the scope itself never
+/// tracks.
+#[derive(Debug, Clone)]
+pub struct TailScope {
+    tokens: f64,
+    last_refill: Instant,
+    window: RateWindow,
+}
+
+impl TailScope {
+    /// Create a tail scope with a full 1-second burst at the given share
+    /// (mirroring the library's adaptive `capacity = refill × 1 s` default).
+    pub fn new(now: Instant, share: f64) -> Self {
+        TailScope {
+            tokens: share.max(0.0) * TAIL_WINDOW.as_secs_f64(),
+            last_refill: now,
+            window: RateWindow::new(now),
+        }
+    }
+
+    /// Create a tail scope carrying over an explicit token balance (used
+    /// when a hot scope demotes: its remaining tokens transfer, clamped by
+    /// `try_admit`'s share-sized capacity on the next request).
+    pub fn with_tokens(now: Instant, tokens: f64) -> Self {
+        TailScope {
+            tokens: tokens.max(0.0),
+            last_refill: now,
+            window: RateWindow::new(now),
+        }
+    }
+
+    /// Estimated local accepted rate over the trailing window.
+    pub fn local_rate(&mut self, now: Instant) -> f64 {
+        self.window.rate(now)
+    }
+
+    /// Read-only variant of [`local_rate`](Self::local_rate) for stats
+    /// paths that only hold a shared reference.
+    pub fn local_rate_at(&self, now: Instant) -> f64 {
+        self.window.rate_at(now)
+    }
 
     /// Try to admit one request at `now`, refilling at `share` tokens/sec
     /// with a 1-second burst allowance. Returns `true` if admitted.
@@ -218,8 +245,7 @@ impl TailScope {
 
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
-            self.roll(now);
-            self.curr_count += 1;
+            self.window.record(now);
             true
         } else {
             false
