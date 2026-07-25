@@ -4,30 +4,56 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Nenya is a distributed adaptive rate limiter using PID (Proportional-Integral-Derivative) control and gossip-based coordination.
+Nenya is a distributed adaptive rate limiter. Nodes coordinate through a gossip
+protocol (Chitchat/Scuttlebutt) by sharing only per-scope accepted rates; each
+node runs a local control loop (currently PID) that converges the cluster toward
+a global target. There is no central coordination service.
 
-**Single crate with dual purpose**:
-- **Library**: Lightweight rate limiting with PID control (`cargo add nenya`)
-- **Binary**: Distributed rate limiting sidecar (`cargo install nenya`)
+**Single crate, dual purpose**:
+- **Library**: embedded rate limiting with PID control (`cargo add nenya`) — no server deps
+- **Binary**: distributed rate limiting sidecar (`cargo install nenya`) — behind the `server` feature
 
-**Vision**: A "one-click" sidecar for microservices that provides distributed rate limiting with minimal configuration. Applications simply call a local HTTP endpoint to make throttling decisions.
+**Vision**: a one-click sidecar for microservices. One pasted config block per
+platform (Compose/Swarm/K8s/ECS), one guard clause (or thin SDK call) in the app.
 
-## Architecture & Roadmap
+**Positioning** (keep docs honest about this): gossip-based limits are *soft*.
+Worst-case overshoot ≈ propagation_delay × excess demand. Nenya targets fairness
+and overload protection, not billing-grade quota enforcement. Its differentiator
+vs. Gubernator/Kong/Redis-based limiters is the control-theoretic approach with
+no coordinator.
 
-**Detailed documentation**:
-- [`docs/architecture.md`](docs/architecture.md) - Complete architectural design, component details, configuration
-- [`docs/roadmap.md`](docs/roadmap.md) - Phased implementation plan with concrete tasks and milestones
+## Where to Start
 
-**Key architectural decisions**:
-- HTTP/JSON API (not gRPC) for simplicity and cross-language support
-- Chitchat library for gossip protocol (Scuttlebutt algorithm, better reliability than SWIM)
-- Pattern-based scope configuration with auto-creation
-- Cluster secret authentication for security
-- Pluggable discovery (Docker Swarm, Kubernetes, static seeds)
+1. **[`docs/roadmap.md`](docs/roadmap.md)** — check the "Current Milestone" section; this drives all work
+2. **[`docs/architecture.md`](docs/architecture.md)** — design details; each section is marked Implemented or Planned
+3. This file — commands, structure, conventions
+
+**Current milestone: 3 — Gossip Correctness Fixes.** Known defects to fix:
+- **Stale peer decay**: `gossip_sync_loop` (`src/gossip/sync.rs`) sums peer rates
+  with no age weighting. A crashed/partitioned peer's last known rate is counted
+  forever. `ScopeState.timestamp` (`src/gossip/state.rs`) is gossiped but unused.
+- **Lock contention**: the sync loop takes a write lock on the whole
+  `RateLimitManager` twice per 500ms tick, serializing against the admission path.
+  Measure first; fix only if it matters.
+
+## Milestone Overview
+
+| Milestone | Status | Deliverable |
+|-----------|--------|-------------|
+| 0-2 | ✅ Complete | Single-crate structure, HTTP rate limiter, gossip coordination |
+| 3 | ⏳ Current | Gossip correctness fixes (stale decay, locking) |
+| 4 | 🔜 Next | Deterministic multi-node simulator + scenario/benchmark suite |
+| 5 | 🔜 Future | Pluggable engines: PID vs Bayesian (Kalman), benchmarked |
+| 6 | 🔜 Future | Two-tier coordination for per-user scale (millions of scopes) |
+| 7 | 🔜 Future | Client SDKs (Rust, Python, Node, Go) |
+| 8 | 🔜 Future | Platform deployment + discovery + AgentCore quota arbitration |
+| 9 | 🔜 Future | Cluster authentication |
+| 10 | 🔜 Future | Production-ready v1.0.0 |
+
+Resource-based (CPU/memory) limiting and transparent proxy mode are deliberately
+deferred to post-v1.0 — see Future Work in the roadmap for the reasoning.
 
 ## Development Commands
-
-### Building and Testing
 
 ```bash
 # Build library only (lightweight, no server deps)
@@ -36,258 +62,140 @@ cargo build --lib
 # Build binary with server features
 cargo build --features server
 
-# Run all tests (library + doctests)
-cargo test --verbose
+# Run all tests (library + server + doctests)
+cargo test --all-features
 
-# Run a specific test
+# Run a specific test / integration tests only
 cargo test test_name
-
-# Run integration tests only
 cargo test --test '*'
-```
 
-### Code Quality
-
-**Pre-commit checks** (run automatically if hooks enabled):
-```bash
-# Run all checks manually
-./.git-hooks/pre-commit
-```
-
-Individual commands:
-```bash
-# Format code
-cargo fmt
-
-# Check formatting without making changes
+# Code quality (all must pass before milestone completion)
 cargo fmt -- --check
-
-# Run clippy linter
 cargo clippy --all-targets --all-features -- -D warnings
-
-# Security audit
 cargo audit
-```
 
-**Setup hooks** (one-time, recommended):
-```bash
-git config core.hooksPath .git-hooks
-```
+# All pre-commit checks at once (or: git config core.hooksPath .git-hooks)
+./.git-hooks/pre-commit
 
-### Examples
-
-```bash
-# Run the request simulator with plotting
-cargo run --example request_simulator_plot -- \
-    --target_tps 80.0 \
-    --min_tps 75.0 \
-    --max_tps 100.0 \
-    --duration 120 \
-    --kp 0.8 \
-    --ki 0.05 \
-    --kd 0.04
-
-# See all available options
+# Single-node PID simulator with plotting
 cargo run --example request_simulator_plot -- --help
+
+# Docs
+cargo doc --no-deps --open
 ```
 
-### Documentation
-
+**Run a local 3-node cluster** (manual verification):
 ```bash
-# Generate and view documentation locally
-cargo doc --no-deps --open
+NENYA_ENABLE_GOSSIP=1 NENYA_LISTEN_ADDR=127.0.0.1:8080 NENYA_GOSSIP_ADDR=127.0.0.1:8081 cargo run --features server &
+NENYA_LISTEN_ADDR=127.0.0.1:8090 NENYA_GOSSIP_ADDR=127.0.0.1:8091 NENYA_SEED_NODES=127.0.0.1:8081 cargo run --features server &
+NENYA_LISTEN_ADDR=127.0.0.1:8100 NENYA_GOSSIP_ADDR=127.0.0.1:8101 NENYA_SEED_NODES=127.0.0.1:8081 cargo run --features server &
+
+curl -X POST localhost:8080/should_throttle -H 'Content-Type: application/json' -d '{"scope":"test"}'
+curl localhost:8090/health   # should report peers
+jobs -p | xargs kill
 ```
 
 ## Codebase Structure
 
-**Single-crate layout** (library + binary):
-
 ```
 src/
-├── lib.rs              # Library entry point (public API)
-├── pid_controller.rs   # Library: PID control algorithm
-├── main.rs             # Binary entry point
-├── api/                # Binary: HTTP API (feature-gated)
-├── config/             # Binary: Configuration (feature-gated)
-├── gossip/             # Binary: Gossip protocol (feature-gated)
-└── discovery/          # Binary: Peer discovery (feature-gated)
+├── lib.rs              # Library: RateLimiter (token bucket + sliding window + PID)
+├── pid_controller.rs   # Library: PID algorithm (error bias, anti-windup)
+├── main.rs             # Binary entry (compile_error! without `server` feature)
+├── api/                # HTTP API: handlers, RateLimitManager, metrics, errors
+├── config/             # Env-var config (Config::from_env) — TOML is planned, NOT yet implemented
+├── gossip/             # Chitchat integration: manager, state schema, 500ms sync loop
+└── discovery/          # Placeholder only (Milestone 8)
+examples/               # request_simulator_plot (single-node PID tuning)
+tests/                  # Integration tests (HTTP API, multi-node gossip)
+nenya-sentinel/         # Deprecation stub only — the binary is now `nenya` itself
 ```
 
-**Library code** (always included):
-- `src/lib.rs` - RateLimiter with sliding window + PID integration
-  - Generic over `T: Float + Signed + FromPrimitive`
-  - Builder pattern: `RateLimiterBuilder`
-  - External rate injection: `set_external_request_rate()`, `set_external_accepted_request_rate()`
-- `src/pid_controller.rs` - PID control algorithm
-  - Error bias, integral windup prevention, anti-windup feedback
-  - Builder pattern: `PIDControllerBuilder`
+**Library** (`src/lib.rs`, `src/pid_controller.rs`, always compiled, deps: num-traits + log only):
+- `RateLimiter<T>`: token bucket for per-request decisions, sliding window for
+  rate measurement, PID adjusts token refill rate. Hot path ~40ns.
+- Generic over `T: Float + Signed + FromPrimitive`; builders for both types
+- Explicit-timestamp APIs (`should_throttle_at`, `update_state_at`) exist and are
+  the hook for deterministic simulation (Milestone 4) — prefer extending these
+  over adding internal `Instant::now()` calls
+- Distribution hooks: `set_external_accepted_request_rate()`, `set_num_peers()`,
+  `cluster_target()` — this is the entire library-side coordination surface
 
-**Binary code** (only when `server` feature enabled):
-- `src/main.rs` - Entry point with `compile_error!` guard
-- `src/api/` - HTTP API handlers (placeholder)
-- `src/config/` - Configuration loading (placeholder)
-- `src/gossip/` - Gossip protocol integration (placeholder)
-- `src/discovery/` - Peer discovery implementations (placeholder)
+**Server** (feature `server`):
+- `api::RateLimitManager`: `HashMap<String, RateLimiter<f64>>`, scopes auto-created
+  via pattern match (exact > most specific wildcard > `*` default)
+- `gossip::gossip_sync_loop`: every 500ms — publish local per-scope accepted
+  rates, aggregate peer rates, inject via `set_external_accepted_request_rate`
+- Equal division PID: each node targets `cluster_target / num_nodes` and uses
+  `local + sum(peers)` as the feedback signal
+- Gossip is enabled by `NENYA_SEED_NODES` being non-empty or `NENYA_ENABLE_GOSSIP=1`
 
-**Other**:
-- `examples/` - Request simulator for testing and tuning
-- `nenya-sentinel/` - Deprecation stub (v0.0.2)
-- `.github/workflows/rust.yml` - CI/CD pipeline (test, fmt, clippy, audit)
+## Key Design Decisions
 
-## Key Implementation Details
-
-### nenya Library
-
-**Architecture - Token Bucket + Sliding Window + PID Hybrid**:
-- **Token Bucket**: Fast per-request throttling decisions, immune to timestamp collisions
-- **Sliding Window**: Accurate rate measurement for PID feedback (accepted requests only)
-- **PID Controller**: Adaptive coordination by adjusting token refill rate
-
-**Generic Numeric Types**:
-- Generic over `T: Float + Signed + FromPrimitive + Copy`
-- Enables f32/f64 tradeoffs
-- All conversions use `num_traits::from_*` for safety
-
-**Time Handling**:
-- `std::time::Instant` for monotonic timestamps
-- Minimum duration threshold (0.001s / 1ms) for accepted timestamp rate calculations
-
-**External Rate Injection** (critical for distribution):
-- `set_external_accepted_request_rate(rate)` - Add remote accepted rates from other nodes
-- RateLimiter sums local + external accepted rates for PID control
-- This is how nenya-sentinel coordinates across nodes
-
-**PID Controller**:
-- Setpoint = target accepted rate (e.g., 100 RPS)
-- Process variable = actual accepted rate (measured via sliding window)
-- Error = setpoint - actual
-- Output = correction to apply to refill_rate
-- Clamped to min_rate/max_rate bounds
-
-### nenya-sentinel (Future)
-
-**Multi-Tenancy**:
-- `HashMap<String, RateLimiter<f64>>` - One limiter per scope
-- Scopes auto-created on first use
-- Pattern matching: `api#*` matches `api#key123`
-- Each scope has independent PID controller
-
-**Distributed Coordination**:
-1. Local RateLimiter tracks local accepted rate
-2. Gossip protocol shares accepted rates with peers
-3. Manager aggregates peer rates: `sum(peer.scope.accepted_rate)`
-4. Sets external_rate on local limiter: `limiter.set_external_accepted_request_rate(sum)`
-5. PID controller adjusts refill_rate based on total (local + remote) accepted rate
-
-**Configuration Hierarchy**:
-1. Hardcoded defaults
-2. TOML file (`./nenya.toml` or `/etc/nenya/nenya.toml`)
-3. Environment variable overrides
-4. Command-line flags (optional)
+- **HTTP/JSON API, not gRPC** — simplicity and cross-language support
+- **Chitchat for gossip** — anti-entropy (Scuttlebutt) + phi accrual failure
+  detection; better state-propagation reliability than SWIM
+- **Estimation vs. control separation (Milestone 5)**: the planned
+  `RateController` trait receives per-peer `(rate, age)` observations, not a
+  pre-aggregated sum — aggregation strategy is part of what engines compete on
+- **Simulation before tuning**: control-loop changes (gains, engines, gossip
+  parameters) must be evaluated in the deterministic simulator (Milestone 4)
+  before shipping; don't hand-tune against real clusters
+- **Two-tier coordination for per-user scale (Milestone 6)**: gossip only
+  scopes near their limit (promotion at ~50% estimated cluster utilization via
+  `local_rate × num_peers`); the heavy-tailed remainder is enforced locally at
+  `limit / num_peers` with compact state. Per-user throttling at millions of
+  users is the primary use case — never assume all scopes gossip
+- **Transport-agnostic coordination**: gossip is one transport for the core
+  loop (local enforcement + periodic rate sharing + feedback control). The
+  serverless analog is a blackboard store (DynamoDB/ElastiCache/Durable
+  Objects) synced by the embedded library — same engine, same staleness
+  semantics. Keep sync/promotion/decay logic separable from Chitchat
+  specifics; gossip inside frozen, inbound-less function runtimes is a
+  non-goal (serverless uses service mode today, blackboard later)
+- **No invented constants**: tunables like `promote_utilization` ship with
+  simulator-derived defaults (published sweep curves), exposed in config —
+  never bare magic numbers
+- **Upstream quota arbitration is the flagship use case**: `cluster_target`
+  can be an externally imposed provider quota (Bedrock TPM, AgentCore TPS,
+  third-party API limits); scopes = users; the fleet converges under the cap
+  while no user starves the rest. Cost-weighted rates (LLM tokens/sec, not
+  requests/sec) land in Milestone 7.3; the AgentCore integration (8.3) is the
+  flagship and takes precedence over generic Lambda-protection adapters
+  (deferred to Future Work). The soft-limit caveat doesn't apply since the
+  upstream enforces the hard cap
+- **Fail-open clients**: SDKs will admit on sidecar timeout — the rate limiter
+  must never become an availability dependency
+- **Security model**: cluster secret authenticates gossip (Milestone 9, not yet
+  implemented); discovery is unauthenticated (only finds candidates)
+- **No backwards compatibility required**: 0.x, no external users, breaking
+  changes are fine
 
 ## Testing Philosophy
 
-**Current tests** (nenya library):
-- Unit tests in `src/lib.rs::tests` and `src/pid_controller.rs::tests`
-- Focus on correctness of rate limiting and PID algorithms
-- Time-dependent tests use `sleep()` for real behavior
+- Unit tests live in `src/*/tests` modules; integration tests in `tests/`
+- Multi-node integration tests spawn real processes; keep them deterministic and
+  non-interactive (CI runs them)
+- Time-dependent library tests should prefer the explicit-timestamp APIs over
+  `sleep()` where possible
+- From Milestone 4 onward, cluster dynamics (convergence, overshoot, partitions)
+  are tested in the in-process simulator with seeded RNG — same seed must give
+  identical results; real-process tests remain as a reality check
+- No flaky tests tolerated; fast subset must stay under ~30s
 
-**Future tests** (nenya-sentinel):
-- Integration tests spawn real processes
-- Must be deterministic and non-interactive
-- Runnable in CI/CD via `cargo test`
-- Network partition simulation
-- Multi-node coordination verification
+## Milestone Workflow
 
-**CI/CD Requirements**:
-- All tests must pass before merge
-- No test flakiness tolerated
-- Fast execution (<30s for full suite preferred)
-
-## Development Workflow
-
-**Current Status**: Milestones 1-2 complete (HTTP API + Distributed Gossip)
-
-**Roadmap**: See [`docs/roadmap.md`](docs/roadmap.md) for the complete implementation plan
-
-### Iterative Development Process
-
-1. **Check current milestone**: Open `docs/roadmap.md` and find the "Current Milestone" section
-2. **Review architecture**: Read the relevant section in `docs/architecture.md` (referenced in milestone)
-3. **Develop plan**: Use plan mode if needed to break down tasks
-4. **Implement with tests**: Write tests alongside code
-5. **Verify milestone complete**: Run verification commands from roadmap
-   ```bash
-   cargo test          # All tests pass
-   cargo fmt --check   # Code formatted
-   cargo clippy        # No warnings
-   ```
-6. **Commit and push**: Use the suggested commit message from roadmap
-7. **Check off milestone**: Mark `[x] MILESTONE COMPLETE` in `docs/roadmap.md`
-8. **Update status**: Change "Current Milestone" to next milestone
-9. **Move to next milestone**: Repeat process
-
-### Milestone Overview
-
-| Milestone | Status | Deliverable |
-|-----------|--------|-------------|
-| 0 | ✅ Complete | Clean HTTP stack |
-| 1 | ✅ Complete | Working HTTP rate limiter |
-| 2 | ✅ Complete | Distributed coordination |
-| 3 | ⏳ Current | Platform integrations |
-| 4 | 🔜 Next | Cluster authentication |
-| 5 | 🔜 Future | Production-ready v1.0.0 |
-
-See `docs/roadmap.md` for complete details on each milestone.
-
-### Quick Reference
-
-**Before starting work**:
-- Check `docs/roadmap.md` for current milestone and tasks
-- Review `docs/architecture.md` for design context
-
-**While working**:
-- Follow the task checklist in roadmap
-- Write tests alongside implementation
-- Reference architecture doc for design decisions
-
-**After completing milestone**:
-- Run verification commands from roadmap
-- Commit with suggested message
-- Update roadmap status
-
-## Dependencies
-
-**Library** (always included):
-- `num-traits` - Generic numeric operations
-- `log` - Logging
-
-**Binary** (`server` feature, optional):
-- `axum` - HTTP framework
-- `tokio` - Async runtime (specific features, not "full")
-- `serde`, `serde_json` - JSON serialization
-- `toml` - Configuration parsing
-- `tracing`, `tracing-subscriber` - Observability
-- (Future) `chitchat` - Gossip protocol
-- (Future) `bollard`, `kube` - Platform-specific discovery
-
-## Important Constraints
-
-**No backwards compatibility required**: Project is 0.x, no external users yet, breaking changes are fine
-
-**No gRPC**: Removed in Milestone 0, using HTTP/JSON for simplicity
-
-**Single-crate model**: Library + binary in one package with optional `server` feature
-
-**Security model**: Cluster secret required, gossip authenticated, discovery is unauthenticated (just finds candidates)
-
-**Failure modes**: Fail gracefully with stale data during partitions, recover automatically when healed
-
-**Platform support**: Docker Swarm, Kubernetes, bare metal/VMs (no AWS Lambda for now)
+1. Open `docs/roadmap.md`, find the current milestone and its task checklist
+2. Read the referenced architecture sections; plan if non-trivial
+3. Implement with tests alongside
+4. Verify: `cargo test --all-features && cargo fmt -- --check && cargo clippy --all-targets --all-features -- -D warnings`
+5. Commit with the milestone's suggested message (user handles commits unless asked)
+6. Check off the milestone in `docs/roadmap.md`, update its "Current Milestone"
+   section and the table in this file
 
 ## Common Patterns
 
-**Builder pattern**:
+**Builder pattern** (library):
 ```rust
 let limiter = RateLimiterBuilder::new(100.0)
     .min_rate(50.0)
@@ -296,29 +204,13 @@ let limiter = RateLimiterBuilder::new(100.0)
     .build();
 ```
 
-**Pattern matching for scopes**:
-```toml
-[[rate_limits]]
-pattern = "api#premium_*"
-target_rate = 1000.0
-
-[[rate_limits]]
-pattern = "api#*"
-target_rate = 100.0
-
-[[rate_limits]]
-pattern = "*"
-target_rate = 10.0
-```
-Priority: exact match > most specific pattern > default
-
-**Error handling**: Use `Result<T, Error>` with `anyhow` or custom error types, never panic in library code
-
-**Logging**: Use `tracing` macros (`tracing::info!`, `tracing::error!`) with `#[instrument]` for spans
+**Error handling**: `Result<T, Error>` with custom error types; never panic in
+library code. **Logging**: `tracing` macros in server code, `log` in the library.
 
 ## References
 
-- **SWIM Protocol**: "SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol"
 - **Scuttlebutt**: "Efficient Reconciliation and Flow Control for Anti-Entropy Protocols"
 - **Chitchat**: https://quickwit.io/blog/chitchat
-- **PID Control**: Standard control theory, see README.md for algorithm details
+- **PID control**: standard control theory; algorithm steps in README.md
+- **Kalman filtering** (Milestone 5): Welch & Bishop, "An Introduction to the
+  Kalman Filter" — cite authoritative sources for any constants/derivations

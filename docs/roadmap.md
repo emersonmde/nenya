@@ -4,71 +4,48 @@ This document outlines the implementation plan for Nenya distributed rate limiti
 
 ## Current Milestone
 
-**Status**: Milestones 1-2 Complete - Ready for Milestone 3 (Platform Discovery)
+**Status**: Milestones 0-2 Complete - Ready for Milestone 3 (Gossip Correctness Fixes)
 
 **Completed**:
-- ✅ Milestone 0: HTTP stack and distributed coordination foundation
+- ✅ Milestone 0: Single-crate restructure, HTTP stack, distributed coordination foundation
 - ✅ Milestone 1: Single-node HTTP rate limiter with scope management
 - ✅ Milestone 2: Distributed gossip coordination with equal division PID
 
-See Milestone 3 tasks below for next steps.
+See Milestone 3 below for next steps.
 
 ## Principles
 
 - **Iterative development**: Each milestone produces a working, testable system
 - **Test-driven**: Write tests alongside implementation
+- **Simulation before tuning**: Control-loop changes (PID gains, new engines, gossip
+  parameters) must be evaluated in the deterministic simulator before shipping
 - **No regressions**: All tests must pass before completing milestone
 - **Commit at milestone completion**: Push working code at the end of each milestone
 
 ## Workflow
 
-1. Start Claude Code
-2. Identify current milestone from this roadmap
-3. Develop implementation plan (can use plan mode)
-4. Implement tasks with tests
-5. Verify all tests pass: `cargo test && cargo fmt --check && cargo clippy`
-6. Push commit(s) at milestone completion
-7. Check off milestone in this file
-8. Move to next milestone
+1. Identify current milestone from this roadmap
+2. Develop implementation plan (can use plan mode)
+3. Implement tasks with tests
+4. Verify all tests pass: `cargo test && cargo fmt --check && cargo clippy`
+5. Push commit(s) at milestone completion
+6. Check off milestone in this file, update "Current Milestone" section
+7. Move to next milestone
 
 ---
 
 ## Milestone 0: Preparation & Cleanup
 
-- [x] **MILESTONE COMPLETE**
+- [x] **MILESTONE COMPLETE** (commit f0b2889)
 
-**Goal**: Restructure as single-crate with library and binary components, remove gRPC, add HTTP stack.
+Restructured as single-crate (library + optional `server` binary), removed gRPC,
+added HTTP stack (axum, tokio, serde), observability (tracing), and the token
+bucket + PID hybrid rate limiter with external rate injection.
 
-**Architecture Reference**: See [docs/architecture.md](architecture.md) - HTTP API Server section
-
-**Completed Work** (commit f0b2889):
-- [x] Restructured as single-crate (library + optional binary)
-- [x] Added HTTP framework (axum, tokio, serde)
-- [x] Added observability crates (tracing, tracing-subscriber)
-- [x] Created server module structure (api/, config/, gossip/, discovery/)
-- [x] Deprecated separate nenya-sentinel crate
-- [x] Implemented token bucket + PID hybrid rate limiter
-- [x] Added distributed coordination support (equal division PID)
-
-**Deliverable**: ✅ Single-crate structure with library + binary, HTTP stack ready, distributed coordination foundation complete
-
-**Verification**:
-```bash
-# Compilation
-cargo build --features server  # ✅ Passes
-cargo test --lib                # ✅ 51 tests pass
-
-# Library benchmarks (establish performance baseline)
-cargo bench --bench rate_limiter_bench
-cargo bench --bench pid_controller_bench
-```
-
-**Performance Baseline** (library only, verified):
-- Hot path decision: ~40ns (target: <1μs) ✅
-- PID computation: ~1-2ns (target: <100ns) ✅
-- Throughput: 25M decisions/sec single-threaded ✅
-
-**Commit**: f0b2889 "Milestone 0: Restructure as single-crate with library and binary"
+**Performance baseline** (library, verified):
+- Hot path decision: ~40ns (target: <1μs)
+- PID computation: ~1-2ns (target: <100ns)
+- Throughput: 25M decisions/sec single-threaded
 
 ---
 
@@ -76,1036 +53,784 @@ cargo bench --bench pid_controller_bench
 
 - [x] **MILESTONE COMPLETE**
 
-**Goal**: Build a working single-node HTTP rate limiter (no distribution yet).
-
-**Architecture Reference**: See [docs/architecture.md](architecture.md):
-- HTTP API Server section
-- Configuration section
-- Rate Limit Manager section
-
-### Tasks
-
-#### 1.1 Configuration System
-
-- [ ] **Define configuration schema**
-  - Create `config/mod.rs` with config structs
-  - Support TOML file parsing (`toml` crate)
-  - Support environment variable overrides (`envy` or manual)
-  - Implement config file search (./nenya.toml, /etc/nenya/nenya.toml, NENYA_CONFIG)
-
-- [ ] **Cluster secret loading**
-  - Load from file (`/run/secrets/nenya_cluster_secret`)
-  - Load from env (`NENYA_CLUSTER_SECRET`)
-  - Load from TOML (`cluster_secret_file`)
-  - Error if no secret provided
-
-- [ ] **Pattern-based rate limit configs**
-  - Support `[[rate_limits]]` array in TOML
-  - Implement simple wildcard matching (`*` suffix)
-  - Default pattern fallback
-
-**Tests**: Config parsing, pattern matching, secret loading
-
-#### 1.2 HTTP API Server
-
-- [ ] **Basic axum server**
-  - Bind to `127.0.0.1:8080` (localhost only)
-  - Add graceful shutdown on SIGTERM/SIGINT
-  - Add request logging with tracing
-
-- [ ] **POST /should_throttle endpoint**
-  ```rust
-  struct ThrottleRequest { scope: String }
-  struct ThrottleResponse {
-      should_throttle: bool,
-      current_rate: f64,
-      target_rate: f64,
-      accepted_rate: f64,
-  }
-  ```
-  - Parse JSON request
-  - Call rate limit manager
-  - Return JSON response
-
-- [ ] **GET /health endpoint**
-  ```rust
-  struct HealthResponse {
-      healthy: bool,
-      scopes: usize,
-      peers: usize,  // Always 1 in Phase 1
-  }
-  ```
-
-- [ ] **GET /metrics endpoint**
-  - Prometheus text format exporter
-  - Basic metrics (requests_total, up)
-
-**Tests**: HTTP endpoint integration tests using reqwest
-
-#### 1.3 Rate Limit Manager
-
-- [ ] **RateLimitManager struct**
-  - `HashMap<String, RateLimiter<f64>>` for scopes
-  - Pattern matcher for auto-creation
-  - Integration with existing `nenya` crate
-
-- [ ] **should_throttle logic**
-  - Check if scope exists
-  - If not, match pattern and create
-  - Call `limiter.should_throttle()`
-  - Return decision + metadata
-
-- [ ] **Metrics instrumentation**
-  - `nenya_requests_total{scope, throttled}` counter
-  - `nenya_request_rate{scope}` gauge
-  - `nenya_target_rate{scope}` gauge
-
-**Tests**:
-- Scope auto-creation
-- Pattern matching priority
-- Rate limiting behavior (single node)
-- Metrics collection
-
-#### 1.4 Observability
-
-- [ ] **Tracing setup**
-  - Initialize `tracing_subscriber`
-  - Configure log levels from env (RUST_LOG)
-  - Add `#[instrument]` to key functions
-
-- [ ] **Prometheus metrics**
-  - Expose `/metrics` endpoint
-  - Register custom metrics
-  - Update metrics in rate limit manager
-
-**Tests**: Metrics endpoint returns valid Prometheus format
-
-**Deliverable**: Working single-node rate limiter with HTTP API, scope auto-creation, and observability
-
-**Testing Requirements**:
-
-1. **Unit Tests** (existing + new):
-   ```bash
-   cargo test --lib                    # Library tests (170 existing)
-   cargo test -p nenya-sentinel        # Binary tests (new)
-   ```
-
-2. **Integration Tests** (new):
-   ```bash
-   cargo test --test '*'               # HTTP API tests
-   ```
-   - Test POST /should_throttle with various scopes
-   - Test pattern matching (exact, wildcard, default)
-   - Test config loading (TOML, env vars)
-   - Test auto-creation of new scopes
-   - Test health and metrics endpoints
-
-3. **HTTP Micro-Benchmarks** (new):
-   Create `nenya-sentinel/benches/http_api_bench.rs`:
-   ```rust
-   // Benchmark: End-to-end HTTP request latency (without network)
-   // - JSON deserialize
-   // - Manager lookup
-   // - Rate limiter decision
-   // - JSON serialize
-   // - HTTP response
-   //
-   // Target: <1ms p99 (leaves ~960μs budget for HTTP/JSON overhead)
-   ```
-
-   Run benchmarks:
-   ```bash
-   cargo bench -p nenya-sentinel --bench http_api_bench
-
-   # Compare against baseline
-   cargo bench -p nenya-sentinel -- --baseline milestone-0
-   ```
-
-   **Expected Results**:
-   - Handler latency: <500μs p99
-   - Total budget: Library (40ns) + Handler (<500μs) + Network (~500μs) = <1ms
-
-4. **Manual Smoke Test**:
-   ```bash
-   # Start sentinel
-   cargo run -p nenya-sentinel
-
-   # In another terminal, test the API
-   curl -X POST http://localhost:8080/should_throttle \
-     -d '{"scope":"test"}' \
-     -H "Content-Type: application/json"
-   # Should return: {"should_throttle":false,"current_rate":0.0,"target_rate":10.0,"accepted_rate":0.0}
-
-   curl http://localhost:8080/health
-   # Should return: {"healthy":true,"scopes":1,"peers":1}
-
-   curl http://localhost:8080/metrics
-   # Should return Prometheus metrics
-   ```
-
-**Performance Targets (Milestone 1)**:
-- Library decision: ~40ns (established)
-- HTTP handler latency: <500μs p99
-- JSON serialization: <100μs
-- End-to-end: <1ms p99 (excluding network)
-
-**Verification Checklist**:
-```bash
-# 1. All tests pass
-cargo test --all
-
-# 2. Benchmarks meet targets
-cargo bench --all
-
-# 3. No clippy warnings
-cargo clippy --all-targets --all-features -- -D warnings
-
-# 4. Code formatted
-cargo fmt --check
-
-# 5. Manual API test (smoke test)
-# Start server and run curl commands above
-```
-
-**Commit Message**: `Milestone 1: Single-node HTTP rate limiter with scope auto-creation`
+Working single-node HTTP rate limiter:
+- TOML config with env overrides, pattern-based `[[rate_limits]]` scopes
+- `POST /should_throttle`, `GET /health`, `GET /metrics` (Prometheus)
+- `RateLimitManager` with scope auto-creation and pattern priority
+  (exact > most specific wildcard > default)
+- Tracing + metrics instrumentation
 
 ---
 
 ## Milestone 2: Gossip Integration
 
-- [x] **MILESTONE COMPLETE**
+- [x] **MILESTONE COMPLETE** (commit f8e5f74)
 
-**Goal**: Add distributed coordination using Chitchat gossip protocol with equal division PID.
+Distributed coordination via Chitchat gossip with **equal division PID**:
+- Gossip shares per-scope `accepted_rate` (a single f64 per scope per node)
+- Each node computes `cluster_total = local + sum(peers)`, targets
+  `cluster_target / num_nodes`, and adjusts its local refill rate via PID
+- 500ms sync loop: publish local rates → aggregate peer rates →
+  `set_external_accepted_request_rate()` + `set_num_peers()`
+- Conservative PID defaults (Kp=0.5, Ki=0.05, Kd=0.05) safe for 1-2s gossip lag
+- Multi-node integration tests (spawn real processes)
 
-**Architecture Reference**: See [docs/architecture.md](architecture.md):
-- Gossip Protocol section
-- Distributed Coordination explanation
+---
 
-**Distributed Coordination Design**:
-- **Equal Division PID**: Each node computes `cluster_error / num_nodes` and adjusts locally
-  - Gossip shares: `accepted_rate` per scope (not error signal)
-  - Each node independently computes: `cluster_total = local + sum(peers)`
-  - Target per node: `cluster_target / num_nodes`
-  - Signal per node: `cluster_total / num_nodes`
-  - PID adjusts local refill_rate to converge cluster to target
+## Milestone 3: Gossip Correctness Fixes
 
-- **Gossip Topology** (eventual consistency):
-  - Fanout: min(20, cluster_size - 1) random peers per round
-  - Small clusters (≤20): naturally becomes full mesh
-  - Large clusters (>20): random subset of 20 peers
-  - Convergence: ~1-2 rounds (1-2 seconds) even for large clusters
+- [ ] **MILESTONE COMPLETE**
 
-- **Conservative PID Defaults**:
-  - Kp = 0.5 (safe for 1-2s gossip lag)
-  - Ki = 0.05 (moderate integral)
-  - Kd = 0.05 (light damping)
-  - Adaptive tuning deferred to Milestone 6
+**Goal**: Fix known correctness gaps in the gossip aggregation path before building
+on top of it.
+
+**Architecture Reference**: [docs/architecture.md](architecture.md) - Gossip Protocol,
+Failure Modes
 
 ### Tasks
 
-#### 2.1 Chitchat Integration
+#### 3.1 Stale Peer Decay
 
-- [ ] **Add Chitchat dependency**
-  - Add to `nenya-sentinel/Cargo.toml`
-  - Study Chitchat API and examples
+The sync loop (`src/gossip/sync.rs`) currently sums whatever peer states it has,
+with no regard for age. A peer that goes silent (crash, partition) keeps
+contributing its last known rate indefinitely, suppressing local admission with
+phantom load. `ScopeState.timestamp` is already gossiped but unused — use it.
 
-- [ ] **Gossip manager module**
-  - Create `gossip/mod.rs`
-  - Initialize Chitchat cluster
-  - Configure gossip address (bind to `0.0.0.0:8081`)
-  - Configure gossip fanout: `min(20, cluster_size - 1)` random peers
-  - Handle cluster membership events
-  - Track num_peers for equal division calculation
-
-- [ ] **State schema design**
-  - Define gossip state format:
-    ```rust
-    struct NodeState {
-        node_id: String,
-        scopes: HashMap<String, ScopeRates>,
-    }
-    struct ScopeRates {
-        accepted_rate: f64,  // Used for equal division PID
-        timestamp: SystemTime,  // Optional: for future adaptive tuning
-    }
-    ```
-  - Serialize/deserialize with serde
-  - Note: Only `accepted_rate` needed for Milestone 2; timestamp enables future work
-
-- [ ] **State publication**
-  - Periodically publish local scope rates to Chitchat
-  - Update interval: 1 second (configurable)
-
-- [ ] **State consumption**
-  - Subscribe to peer state updates
-  - Aggregate peer rates per scope
-  - Update `external_request_rate` in RateLimitManager
+- [ ] **Age-weighted aggregation**
+  - Full weight for states fresher than `2 × sync_interval`
+  - Linear (or exponential) decay from there to zero at a configurable
+    `stale_timeout` (default: 10s)
+  - Drop peers entirely past `stale_timeout`
+- [ ] **Clock skew handling**
+  - Peer timestamps come from `SystemTime` on other machines; clamp
+    future-dated timestamps to now, and document tolerance assumptions
+  - Consider age-at-receipt tracking (record local `Instant` when a peer state
+    is received) to avoid cross-node clock comparison entirely
+- [ ] **Verify self-exclusion and dead-node removal**
+  - Confirm `get_peer_states()` never includes the local node (double-count)
+  - Confirm Chitchat's failure detector removes dead nodes from the peer set,
+    and that `num_peers` reflects live peers only
 
 **Tests**:
-- State serialization
-- Gossip state aggregation logic (unit tests)
+- Unit: stale peer contributes zero after `stale_timeout`
+- Unit: decay curve is monotonic, full-weight window honored
+- Unit: future-dated timestamps don't produce negative ages or amplified rates
+- Integration: kill one node in a 3-node cluster, verify remaining nodes'
+  external rate drops to reflect only live peers within `stale_timeout`
 
-#### 2.2 Multi-Node Integration Tests
+#### 3.2 Lock Contention in Sync Loop
 
-- [ ] **Test harness**
-  - Create `tests/integration/cluster.rs`
-  - Helper to spawn N sentinel processes
-  - Helper to make HTTP requests to each node
-  - Helper to wait for gossip convergence
+`gossip_sync_loop` takes a write lock on the entire `RateLimitManager` twice per
+500ms tick, serializing against the hot admission path.
 
-- [ ] **Basic gossip test**
-  - Spawn 3 nodes
-  - Make requests to node 1 for scope "test"
-  - Verify node 2 and 3 see updated rates via gossip
-  - Verify distributed throttling works
+- [ ] **Reduce write-lock scope**
+  - Snapshot scope names under a read lock; take short per-mutation write locks
+    (or move to per-limiter locking / `DashMap` if profiling justifies it)
+  - Merge the two write-lock sections (external rate update + peer count update)
+    into one pass
+- [ ] **Benchmark before/after**
+  - Measure p99 `/should_throttle` latency under load with gossip active
+  - Document results; if contention is negligible at realistic scope counts,
+    record that finding and stop (don't over-engineer)
 
-- [ ] **Node join test**
-  - Start 2 nodes
-  - Add 3rd node
-  - Verify new node receives full state
-  - Verify new node participates in rate limiting
+**Tests**: existing tests pass; add a benchmark comparing decision latency with
+gossip loop idle vs. active at 1, 100, and 1000 scopes
 
-- [ ] **Node failure test**
-  - Start 3 nodes
-  - Kill node 1
-  - Verify nodes 2 and 3 detect failure
-  - Verify rate limiting continues with 2 nodes
-
-**Tests**: Multi-node integration tests (spawn real processes)
-
-**Deliverable**: Multi-node distributed rate limiting with gossip coordination
+**Deliverable**: Partition-safe rate aggregation, documented lock behavior
 
 **Verification**:
 ```bash
-# All tests pass including integration tests
-cargo test
-
-# Integration test specifically
-cargo test --test cluster
-
-# Manual verification: Start 3 nodes
-cargo run -p nenya-sentinel -- --gossip-addr 127.0.0.1:8081 &
-cargo run -p nenya-sentinel -- --listen-addr 127.0.0.1:8090 --gossip-addr 127.0.0.1:8091 --seed-nodes 127.0.0.1:8081 &
-cargo run -p nenya-sentinel -- --listen-addr 127.0.0.1:8100 --gossip-addr 127.0.0.1:8101 --seed-nodes 127.0.0.1:8081 &
-
-# Send requests to node 1
-for i in {1..20}; do curl -X POST http://localhost:8080/should_throttle -d '{"scope":"test"}' -H "Content-Type: application/json"; done
-
-# Check node 2 sees the rate
-curl http://localhost:8090/health
-# Should show peers: 3
-
-# Kill all background jobs
-jobs -p | xargs kill
-```
-
-**Testing Requirements**:
-
-1. **Unit & Integration Tests**:
-   ```bash
-   cargo test --all  # Include new gossip tests
-   ```
-   - Test gossip state serialization/deserialization
-   - Test external rate aggregation
-   - Test cluster membership events
-   - Test rate synchronization between nodes
-
-2. **Multi-Node Integration Test** (new):
-   Create `tests/distributed_coordination.rs`:
-   ```rust
-   // Test: 3-node cluster coordinating on shared scope
-   // - Start 3 nodes programmatically
-   // - Send 150 TPS across all nodes (50 each)
-   // - Target: 100 TPS cluster-wide
-   // - Verify: Total accepted ~100 TPS across cluster
-   // - Verify: Gossip propagates rates within 1s
-   ```
-
-3. **Load Tests** (new - basic):
-   Create `load-tests/constant_load.rs`:
-   ```bash
-   # Install wrk2 (constant RPS load generator)
-   # macOS: brew install wrk2
-   # Linux: https://github.com/giltene/wrk2
-
-   # Test: Single node handling constant load
-   wrk2 -t2 -c10 -d30s -R1000 \
-     --latency \
-     -s load-tests/throttle.lua \
-     http://localhost:8080/should_throttle
-
-   # Expected results:
-   # - Latency p50: <1ms
-   # - Latency p99: <5ms
-   # - Latency p99.9: <10ms
-   # - Success rate: 100%
-   ```
-
-   Create `load-tests/throttle.lua`:
-   ```lua
-   wrk.method = "POST"
-   wrk.headers["Content-Type"] = "application/json"
-   wrk.body = '{"scope":"load-test"}'
-   ```
-
-4. **Gossip Overhead Benchmark** (new):
-   Create `nenya-sentinel/benches/gossip_bench.rs`:
-   ```rust
-   // Benchmark: Gossip state update impact on decision latency
-   // - Measure without gossip (baseline)
-   // - Measure with 2 peers gossiping
-   // - Measure with 10 peers gossiping
-   //
-   // Target: Gossip overhead <100μs per decision
-   ```
-
-5. **Network Partition Test** (manual):
-   ```bash
-   # Start 3 nodes
-   # Use iptables/pfctl to block gossip between nodes
-   # Verify: Nodes continue accepting with stale data
-   # Restore network
-   # Verify: Nodes re-sync within 2-3 gossip rounds
-   ```
-
-**Performance Targets (Milestone 2)**:
-- Single-node latency: <1ms p99 (no regression from M1)
-- Gossip overhead: <100μs per decision
-- Rate convergence: <2s for cluster-wide changes
-- Network partition: Graceful degradation, auto-recovery
-
-**Verification Checklist**:
-```bash
-# 1. All tests pass (including new distributed tests)
-cargo test --all
-
-# 2. Benchmarks verify no regression
-cargo bench --all
-
-# 3. Load test: 1K RPS sustained for 30s
-wrk2 -t2 -c10 -d30s -R1000 --latency \
-  -s load-tests/throttle.lua \
-  http://localhost:8080/should_throttle
-# Check: p99 <5ms, success rate 100%
-
-# 4. Multi-node manual test (3 nodes, see above)
-
-# 5. Code quality checks
+cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
+
+# Manual: 3-node cluster, kill node 1, watch node 2/3 external rates decay
 ```
 
-**Commit Message**: `Milestone 2: Distributed rate limiting with Chitchat gossip`
+**Commit Message**: `Milestone 3: Stale peer decay and gossip sync lock fixes`
 
 ---
 
-## Milestone 3: Discovery Implementations
+## Milestone 4: Simulation & Testing Architecture
 
 - [ ] **MILESTONE COMPLETE**
 
-**Goal**: Add automatic peer discovery for Docker Swarm and Kubernetes.
+**Goal**: A deterministic multi-node simulator that becomes the project's primary
+tool for correctness testing, benchmarking, experimentation, and control-loop
+tuning. This is the prerequisite for evaluating alternative engines (Milestone 5)
+— without it, comparisons are anecdotes.
 
-**Architecture Reference**: See [docs/architecture.md](architecture.md):
-- Discovery Layer section
-- Deployment Patterns section
+**Why**: The existing `request_simulator_plot` example exercises one limiter in
+isolation. The interesting dynamics (gossip lag → phase lag → oscillation,
+partition overshoot, convergence after churn) only appear with N nodes and a
+network model. Real multi-process tests are too slow and nondeterministic to
+sweep parameters or run in CI.
 
 ### Tasks
 
-#### 3.1 Discovery Trait
+#### 4.1 Deterministic Simulation Core
 
-- [ ] **Define trait**
-  ```rust
-  #[async_trait]
-  trait PeerDiscovery: Send + Sync {
-      async fn discover_seeds(&self) -> Result<Vec<SocketAddr>>;
-  }
-  ```
+- [ ] **Virtual clock**
+  - Drive limiters via the existing `update_state_at(Instant)` /
+    explicit-timestamp APIs; audit library for any remaining internal
+    `Instant::now()` calls on paths the simulator exercises and lift them
+    to parameters
+  - Simulation advances in fixed ticks (e.g., 10ms); no wall-clock sleeps
+- [ ] **Simulated cluster**
+  - N in-process nodes, each with its own `RateLimiter` + controller
+  - Message-bus gossip model with configurable: propagation delay,
+    jitter (seeded RNG), message loss rate, partitions (arbitrary node groupings)
+  - Reuses the real aggregation/decay logic from Milestone 3 — the simulator
+    must exercise production code, not a reimplementation
+- [ ] **Workload generation**
+  - Seeded, reproducible arrival processes: constant, ramp, step, burst,
+    Poisson, per-node skew (hot node), per-scope skew (hot key)
+- [ ] **Determinism guarantee**
+  - Same seed + same scenario = identical results, byte for byte
+  - This is a hard requirement; it's what makes CI assertions and A/B engine
+    comparisons trustworthy
 
-- [ ] **Static discovery**
-  - Load from `seed_nodes` in config
-  - Load from `NENYA_SEED_NODES` env var
-  - Always available as fallback
+#### 4.2 Scenario Library
 
-**Tests**: Static discovery from config and env vars
+- [ ] **Scenario definition format** (Rust builder or TOML — pick simplest)
+  - Cluster size, workload, target rates, engine + parameters, events timeline
+- [ ] **Core scenarios**:
+  - Steady state: constant load above/below/at target
+  - Step change: load doubles at t=30s
+  - Ramp: 0 → 3× target over 60s
+  - Burst: periodic 10× spikes
+  - Node join / node leave mid-run
+  - Partition and heal (the Milestone 3 fix must show bounded overshoot
+    during partition and re-convergence after heal)
+  - Skewed load: one node receives 90% of traffic
+  - Scale sweep: 2, 5, 10, 50 simulated nodes
 
-#### 3.2 Docker Swarm Discovery
+#### 4.3 Metrics & Analysis
 
-- [ ] **Docker API client**
-  - Use `bollard` crate (Docker API client)
-  - Query services API for task IPs
-  - Filter by service name
+- [ ] **Per-run metrics**
+  - Overshoot: max and time-integrated excess over target
+  - Convergence time after each event (within ±5% band of target)
+  - Oscillation: variance / peak-to-peak of cluster accepted rate at steady state
+  - Fairness: dispersion of per-node accepted rates under uniform load
+  - Undershoot: throughput sacrificed below target
+- [ ] **Output formats**
+  - CSV/JSON time series for offline analysis
+  - Plot generation (extend the existing plotters-based example)
+- [ ] **Benchmark harness**
+  - Run a scenario matrix across engine configs, emit comparison table
+  - This is the tool Milestone 5 uses to judge PID vs. Bayesian
 
-- [ ] **DNS-based discovery**
-  - Query DNS for service name (tasks.<service>.swarm)
-  - Parse DNS responses to get IPs
+#### 4.4 CI Integration
 
-- [ ] **Configuration**
-  ```toml
-  [discovery]
-  method = "docker-swarm"
-  service_name = "nenya-sentinel"
-  ```
+- [ ] **Correctness assertions as tests**
+  - Encode acceptance thresholds per scenario (e.g., "steady state: cluster
+    rate within ±5% of target; step change: converge within 10s; partition:
+    overshoot bounded by `stale_timeout × excess demand`")
+  - Fast subset in `cargo test` (<30s); full matrix behind `--ignored` or a
+    feature flag
+- [ ] **Placement**: `tests/simulation/` + shared code in a `sim` module or
+  dev-dependency-only crate — follow standard Cargo conventions
 
-**Tests**:
-- Mock Docker API responses
-- Integration test with real Docker Swarm (optional, can be manual)
+#### 4.5 Model Checking & Property-Based Verification
 
-#### 3.3 Kubernetes Discovery
+Formal methods complement the simulator; they don't replace it. The division of
+labor: **quantitative dynamics** (convergence time, overshoot, oscillation) are
+continuous-domain properties — simulator territory, model checkers can't
+express them. **Discrete protocol logic** (aggregation bookkeeping, membership
+accounting, staleness transitions) has safety invariants a model checker can
+exhaustively verify over all interleavings, which no finite set of simulation
+seeds can.
 
-- [ ] **K8s API client**
-  - Use `kube` crate
-  - Query endpoints API for pod IPs
-  - Filter by label selector
+- [ ] **Property-based tests** (`proptest`, already a dev-dependency)
+  - Library invariants over arbitrary inputs: token bucket never exceeds
+    capacity, refill rate always within [min, max], decay weight monotonic in
+    age and within [0, 1], PID output always within output_limit
+- [ ] **Model-check the aggregation/membership state machine**
+  ([`stateright`](https://github.com/stateright/stateright) — a Rust model
+  checker, so it exercises the *real* aggregation code rather than a parallel
+  spec that drifts)
+  - Model: nodes publish/receive/lose gossip messages, crash, partition, heal
+  - Safety invariants to verify over all interleavings:
+    - A peer's contribution reaches zero within `stale_timeout` of its last
+      message (no phantom load, ever — not just in tested scenarios)
+    - A node never counts itself, and never counts any peer twice
+    - `num_peers` eventually equals the live peer set after quiescence
+    - External rate is always ≥ 0 and never exceeds the sum of live peers'
+      published rates (given decay weights ≤ 1)
+- [ ] **TLA+ (deferred, narrow scope)**: not used for M4 — the properties above
+  are checkable against real code with stateright, and a separate spec would
+  drift. Reserved for the Milestone 9 auth handshake, where
+  exhaustive adversarial interleaving analysis is the whole point.
 
-- [ ] **DNS-based discovery**
-  - Query headless service DNS
-  - Get all pod IPs
-
-- [ ] **Configuration**
-  ```toml
-  [discovery]
-  method = "kubernetes"
-  namespace = "default"
-  label_selector = "app=nenya"
-  ```
-
-**Tests**:
-- Mock K8s API responses
-- Integration test with real K8s cluster (optional, can be manual)
-
-#### 3.4 mDNS Discovery (Optional)
-
-- [ ] **mDNS implementation**
-  - Use `mdns` crate
-  - Advertise service: `_nenya._tcp.local`
-  - Discover peers via mDNS query
-
-- [ ] **Opt-in only**
-  ```toml
-  [discovery]
-  method = "mdns"
-  service_name = "_nenya._tcp.local"
-  ```
-
-**Tests**: mDNS discovery in isolated network
-
-**Deliverable**: Automatic peer discovery for Docker Swarm and Kubernetes
+**Deliverable**: `cargo test` covers multi-node dynamics deterministically;
+a benchmark harness produces engine comparison tables from scenario runs
 
 **Verification**:
 ```bash
-# All tests pass
-cargo test
-
-# Docker Swarm discovery test (requires Docker)
-# See manual test instructions in architecture.md - Deployment Patterns section
-
-# Kubernetes discovery test (requires K8s cluster)
-# See manual test instructions in architecture.md - Deployment Patterns section
-
-# Static discovery still works
-cargo run -p nenya-sentinel -- --seed-nodes 127.0.0.1:8081
+cargo test --all-features              # includes fast simulation suite
+cargo test -- --ignored                # full scenario matrix
+cargo run --example cluster_sim -- --scenario partition --seed 42 --plot
+# Re-run with same seed: identical output
 ```
 
-**Commit Message**: `Milestone 3: Add Docker Swarm and Kubernetes discovery`
+**Commit Message**: `Milestone 4: Deterministic multi-node simulator and scenario suite`
 
 ---
 
-## Milestone 4: Security & Authentication
+## Milestone 5: Pluggable Control Engine & Bayesian Estimation
 
 - [ ] **MILESTONE COMPLETE**
 
-**Goal**: Secure gossip protocol with cluster secret authentication.
+**Goal**: Make the control engine swappable behind a trait and build three
+candidate engines: PID, pure Bayesian (estimate-and-set), and the Kalman→PID
+hybrid. No candidate can be declared best on paper — the separation principle
+that would make the hybrid provably optimal assumes a linear plant, Gaussian
+noise, and no delay, all of which gossip coordination violates (and LQG-style
+designs have no guaranteed stability margins even when the assumptions hold).
+So all three go through the Milestone 4 scenario matrix.
 
-**Architecture Reference**: See [docs/architecture.md](architecture.md):
-- Security Model section
-- Configuration section (cluster secret loading)
+The engine is always an **explicit config option** — never selected at runtime.
+Benchmarks decide only which value ships as the documented recommended default.
+
+**Architecture Reference**: update [docs/architecture.md](architecture.md) with an
+Engine section as part of this milestone.
 
 ### Tasks
 
-#### 4.1 Cluster Secret Authentication
+#### 5.1 Engine Abstraction
 
-- [ ] **Handshake protocol**
-  - Challenge-response during gossip join
-  - Include HMAC of challenge with cluster secret
-  - Reject nodes with incorrect secret
+- [ ] **Define `RateController` trait** (library, no server deps)
+  - Inputs per update: local accepted rate, per-peer observations
+    `(rate, age)`, live peer count, cluster target, elapsed time
+  - Output: new local refill rate (clamped to min/max by the caller)
+  - The trait boundary is deliberately narrow: engines see observations,
+    not gossip internals
+- [ ] **Port PID behind the trait**
+  - Existing `PIDController` becomes `PidEngine`; zero behavior change,
+    verified by existing tests and simulator baselines
+- [ ] **Config selection**
+  - `engine = "pid" | "bayesian" | "hybrid"` per scope pattern in TOML, with
+    engine-specific parameter tables; explicit config only, no runtime
+    auto-selection
 
-- [ ] **Integration with Chitchat**
-  - Hook into Chitchat's join/authentication
-  - May need to wrap Chitchat transport layer
+#### 5.2 Bayesian Rate Estimator Engine
 
-**Tests**:
-- Node with correct secret joins successfully
-- Node with incorrect secret is rejected
-- Tampered handshake is rejected
+Frame the problem as state estimation: each peer's true rate is a latent
+variable observed through delayed, noisy gossip samples.
 
-#### 4.2 TLS for Gossip (Optional)
+- [ ] **Per-peer estimator**
+  - Model peer rate as a random walk; scalar Kalman filter per (peer, scope)
+  - Observation update on each gossip sample; process noise grows the
+    variance between samples, so **staleness = uncertainty** (this subsumes
+    Milestone 3's decay heuristic with a principled equivalent)
+- [ ] **Global estimate**
+  - Cluster rate = sum of peer means + local rate; total variance = sum of
+    peer variances
+- [ ] **Uncertainty-aware admission**
+  - Compute local refill rate from the estimate's upper confidence bound
+    (configurable z, e.g., admit against `mean + 1σ`): the node is
+    automatically conservative exactly when information is stale (partition,
+    churn) and aggressive when the estimate is tight
+- [ ] **Document the math**
+  - Derivation, assumptions (Gaussian noise, random-walk dynamics), parameter
+    meanings (process noise ↔ how fast peer rates are believed to change)
+  - Cite sources per constants-verification policy (standard Kalman filter
+    references, not blog posts)
+- [ ] **Optional hybrid**: Kalman-filtered global estimate feeding the PID
+  engine — cheap to build once both halves exist; include in the benchmark
+  matrix
 
-- [ ] **TLS transport layer**
-  - Wrap UDP/TCP with TLS
-  - Self-signed certificates or custom CA
-  - Mutual TLS (mTLS) for node-to-node auth
+#### 5.3 Engine Benchmark & Selection
 
-- [ ] **Configuration**
-  ```toml
-  [gossip.tls]
-  enabled = true
-  cert_file = "/path/to/cert.pem"
-  key_file = "/path/to/key.pem"
-  ca_file = "/path/to/ca.pem"
-  ```
+- [ ] **Run the full Milestone 4 scenario matrix** for each engine:
+  - Convergence time, overshoot, oscillation, fairness, partition behavior,
+    noise robustness (high jitter + message loss scenarios)
+  - Parameter sensitivity: how badly does each engine degrade when mistuned?
+- [ ] **Write up results** in `docs/engine-comparison.md` with plots
+- [ ] **Pick the default engine** based on data; keep the other available
+  via config
+- [ ] **Hot-path check**: engine update runs in the sync loop (per second per
+  scope), not per request — verify no regression to the ~40ns decision path
 
-**Tests**: TLS handshake, certificate validation
-
-**Deliverable**: Secure cluster membership with authentication
+**Deliverable**: Two production engines behind one trait, a data-backed default,
+and a written comparison
 
 **Verification**:
 ```bash
-# All tests pass including security tests
-cargo test
-
-# Test with cluster secret
-export NENYA_CLUSTER_SECRET="test-secret-123"
-cargo run -p nenya-sentinel &
-cargo run -p nenya-sentinel -- --listen-addr 127.0.0.1:8090 --gossip-addr 127.0.0.1:8091 --seed-nodes 127.0.0.1:8081 &
-
-# Nodes should join successfully
-curl http://localhost:8080/health  # Should show peers: 2
-
-# Test with wrong secret (should fail to join)
-NENYA_CLUSTER_SECRET="wrong-secret" cargo run -p nenya-sentinel -- --listen-addr 127.0.0.1:8100 --gossip-addr 127.0.0.1:8101 --seed-nodes 127.0.0.1:8081 &
-
-# Original nodes should still show peers: 2 (unauthorized node rejected)
-curl http://localhost:8080/health
-
-# Kill all
-jobs -p | xargs kill
+cargo test --all-features
+cargo run --example engine_benchmark   # emits comparison table
+# docs/engine-comparison.md exists with results and plots
 ```
 
-**Commit Message**: `Milestone 4: Add cluster secret authentication`
+**Commit Message**: `Milestone 5: Pluggable control engines with PID vs Bayesian benchmark`
 
 ---
 
-## Milestone 5: Production Hardening
+## Milestone 6: Per-User Scale — Two-Tier Coordination
 
 - [ ] **MILESTONE COMPLETE**
 
-**Goal**: Make nenya-sentinel production-ready with hardening, performance optimization, and documentation.
+**Goal**: Support millions of per-user scopes per cluster. Per-user distributed
+throttling is the core value proposition — per-client/service limits can often
+be engineered around by the calling team; per-user limits can't. Naive gossip
+replicates every scope to every node and tops out around thousands of scopes.
 
-**Architecture Reference**: See [docs/architecture.md](architecture.md):
-- Failure Modes section
-- Performance Characteristics section
-- Deployment Patterns section
+**Why this can work**: two observations.
+1. Load balancers spread a user's traffic roughly uniformly, so
+   `local_rate × num_nodes` is a good local estimate of that user's cluster
+   rate — each node can cheaply detect which users are anywhere near their limit
+2. API usage is heavy-tailed (Pareto-like): at any instant only a small
+   fraction of users are near their limit. The tail needs no coordination —
+   local enforcement of the equal share `limit / num_nodes` is already accurate
+   for it
+
+**Architecture Reference**: [docs/architecture.md](architecture.md) -
+Two-Tier Coordination section
 
 ### Tasks
 
-#### 5.1 Error Handling
+#### 6.1 Two-Tier Enforcement
 
-- [ ] **Graceful degradation**
-  - Handle gossip failures without crashing
-  - Continue local rate limiting if gossip unavailable
-  - Exponential backoff for discovery retries
+- [ ] **Tail tier (default)**: local-only enforcement of the user's equal share
+  (`limit / num_peers`); no gossip state; compact limiter representation
+  (token bucket only — full engine state allocated on promotion)
+- [ ] **Hot tier**: scopes promoted into full gossip coordination exactly as
+  today
+- [ ] **Promotion**: when estimated cluster utilization crosses a threshold —
+  `local_rate ≥ promote_utilization × limit / num_peers`. `promote_utilization`
+  is per-pattern config; the shipped default is **derived, not invented**: the
+  safe value is roughly `1 − (max ramp during promotion lag + routing-estimate
+  error margin)`, so run a benchmark-harness sweep across Pareto workloads and
+  pick the knee of the promoted-set-size vs. worst-case-overage curve. Publish
+  the curve in the docs so users tuning the knob can see the tradeoff
+- [ ] **Demotion with hysteresis**: sustained estimated utilization below
+  `demote_utilization` (per-pattern config, default derived from the same
+  sweep — wide enough below promotion to prevent flapping) for M seconds
+- [ ] **Transport-agnostic sync logic**: keep promotion/aggregation/decay
+  separable from Chitchat specifics — the same loop must later run against a
+  blackboard store (see Future Work: alternative coordination transports)
+- [ ] **Per-node gossip budget**: hard cap K on gossiped scopes; evict
+  lowest-utilization on overflow and log it (no silent truncation)
 
-- [ ] **Logging and error messages**
-  - Clear error messages for common misconfigurations
-  - Helpful startup logs (bound addresses, discovered peers, etc.)
+#### 6.2 Tail Visibility
 
-**Tests**:
-- Network failures don't crash process
-- Discovery failures fall back to static seeds
+- [ ] **Per-pattern tail aggregate**: each node gossips one number per pattern
+  (sum of unpromoted scope rates) so service-level/global limits still see
+  total cluster volume
+- [ ] **Evaluate (don't assume) a tail sketch**: a count-min sketch of tail
+  rates gossips at fixed size regardless of user count, merges by addition,
+  and answers "approximate cluster rate for ANY user" with one-sided error
+  (overestimates → conservative throttling). Decide from simulator data
+  whether promotion + aggregate suffices or the sketch earns its complexity
 
-#### 5.2 Performance Optimization
+#### 6.3 Memory at Cardinality
 
-- [ ] **Benchmark HTTP throughput**
-  - Use `criterion` for benchmarks
-  - Target: >50k req/sec per node
+- [ ] Compact tail-scope state; measure bytes/scope (target: ~10⁶ tail scopes
+  in the low hundreds of MB)
+- [ ] TTL eviction of idle scopes (pulled forward from production hardening)
+- [ ] Stress benchmark: 1M+ scopes with churn
 
-- [ ] **Optimize gossip overhead**
-  - Tune gossip interval
-  - Compress gossip messages if needed
+#### 6.4 Simulator Validation
 
-- [ ] **Memory profiling**
-  - Test with 10k+ scopes
-  - Ensure no memory leaks
+- [ ] New scenarios: Pareto-distributed user traffic (10⁵–10⁶ users), a user
+  ramping tail → hot → tail, sticky-routing skew (session affinity breaks the
+  uniform-routing estimate — quantify worst-case overage)
+- [ ] Assertions: no unpromoted user exceeds their limit beyond the documented
+  bound; promoted set size ≪ user count; gossip payload bounded by K
+- [ ] Model/property checks: promotion/demotion state machine — no flapping
+  under hysteresis, no scope counted in both the tail aggregate and the hot
+  tier (double count)
 
-**Tests**: Performance benchmarks in CI
+**Error bound to document honestly**: an unpromoted user can only exceed their
+limit via routing skew or during promotion lag (one sync interval + gossip
+propagation). Heavy routing skew itself triggers promotion — the hot node sees
+the elevated local rate — so the exposure is transient. Quantify both in the
+simulator and publish the numbers.
 
-#### 5.3 Operational Features
+**Deliverable**: millions of per-user scopes with bounded gossip payload,
+bounded memory, and a documented worst-case overage bound
 
-- [ ] **Scope cleanup** (optional)
-  - Remove scopes with no requests for N minutes
-  - Configurable TTL
+**Verification**:
+```bash
+cargo test --all-features
+cargo run --example cluster_sim -- --scenario pareto_users --seed 42
+# 1M-scope stress results recorded; promoted-set and payload assertions pass
+```
 
-- [ ] **Graceful shutdown**
-  - Drain in-flight requests
-  - Notify peers before leaving cluster
-  - Clean exit on SIGTERM
-
-- [ ] **Health checks**
-  - `/health` returns unhealthy if no peers (and discovery expected peers)
-  - `/health` returns unhealthy if gossip stale (no updates for >10s)
-
-**Tests**:
-- Graceful shutdown test
-- Health check accuracy
-
-#### 5.4 Documentation
-
-- [ ] **API documentation**
-  - OpenAPI/Swagger spec for HTTP API
-  - Document all config options
-  - Example TOML configs for each platform
-
-- [ ] **Deployment guides**
-  - Docker Compose example
-  - Kubernetes manifests
-  - Systemd service file
-  - AWS ECS task definition
-
-- [ ] **Runbook**
-  - Common issues and solutions
-  - How to rotate cluster secret
-  - How to debug gossip issues
-
-**Deliverable**: Production-ready v1.0.0 release
-
-**Testing Requirements (Comprehensive)**:
-
-1. **All Existing Tests Pass**:
-   ```bash
-   cargo test --all --all-features
-   cargo clippy --all-targets --all-features -- -D warnings
-   cargo fmt --check
-   cargo audit  # No security vulnerabilities
-   ```
-
-2. **Benchmarks Meet Targets**:
-   ```bash
-   # Library benchmarks (baseline: ~40ns decision, ~1-2ns PID)
-   cargo bench --bench rate_limiter_bench
-   cargo bench --bench pid_controller_bench
-
-   # HTTP API benchmarks (target: <500μs handler latency)
-   cargo bench -p nenya-sentinel --bench http_api_bench
-
-   # Gossip benchmarks (target: <100μs overhead)
-   cargo bench -p nenya-sentinel --bench gossip_bench
-
-   # Compare against Milestone 0 baseline
-   cargo bench -- --baseline milestone-0
-   # Verify: No significant regressions
-   ```
-
-3. **Load Testing Suite** (comprehensive):
-
-   **a) Single-Node Constant Load**:
-   ```bash
-   # Start server
-   cargo run --release -p nenya-sentinel &
-
-   # Test: 1K RPS sustained for 5 minutes
-   wrk2 -t4 -c20 -d300s -R1000 \
-     --latency \
-     -s load-tests/throttle.lua \
-     http://localhost:8080/should_throttle
-
-   # Expected results:
-   # - p50: <1ms
-   # - p95: <2ms
-   # - p99: <5ms
-   # - p99.9: <10ms
-   # - p99.99: <50ms
-   # - Success rate: 100%
-   # - Sustained throughput: 1000 RPS
-
-   kill %1  # Stop server
-   ```
-
-   **b) Single-Node High Throughput**:
-   ```bash
-   # Test: Maximum throughput (target: >50K RPS)
-   wrk2 -t8 -c100 -d60s -R100000 \
-     --latency \
-     -s load-tests/throttle.lua \
-     http://localhost:8080/should_throttle
-
-   # Expected: Sustains >50K RPS with p99 <10ms
-   ```
-
-   **c) Multi-Scope Load**:
-   ```bash
-   # Test: 1000 different scopes, 10 RPS each = 10K total RPS
-   # Create load-tests/multi_scope.lua
-   wrk2 -t4 -c40 -d120s -R10000 \
-     --latency \
-     -s load-tests/multi_scope.lua \
-     http://localhost:8080/should_throttle
-
-   # Verify: All scopes properly tracked, no memory leaks
-   ```
-
-   **d) Distributed Load (3 nodes)**:
-   ```bash
-   # Start 3-node cluster (in separate terminals)
-   cargo run --release -p nenya-sentinel -- \
-     --listen-addr 127.0.0.1:8080 --gossip-addr 127.0.0.1:8081 &
-
-   cargo run --release -p nenya-sentinel -- \
-     --listen-addr 127.0.0.1:8090 --gossip-addr 127.0.0.1:8091 \
-     --seed-nodes 127.0.0.1:8081 &
-
-   cargo run --release -p nenya-sentinel -- \
-     --listen-addr 127.0.0.1:8100 --gossip-addr 127.0.0.1:8101 \
-     --seed-nodes 127.0.0.1:8081 &
-
-   # Test: Load distributed across all nodes
-   # Send 333 RPS to each node = 1000 RPS total
-   wrk2 -t2 -c10 -d60s -R333 \
-     --latency -s load-tests/throttle.lua http://localhost:8080/should_throttle &
-   wrk2 -t2 -c10 -d60s -R333 \
-     --latency -s load-tests/throttle.lua http://localhost:8090/should_throttle &
-   wrk2 -t2 -c10 -d60s -R334 \
-     --latency -s load-tests/throttle.lua http://localhost:8100/should_throttle &
-
-   wait  # Wait for all load tests to complete
-
-   # Verify:
-   # - Total cluster accepts ~target rate (accounting for coordination)
-   # - Gossip converges within 2-3s
-   # - No node crashes or hangs
-
-   jobs -p | xargs kill  # Clean up
-   ```
-
-   **e) Burst Load**:
-   ```bash
-   # Test: Normal load with periodic bursts
-   # Create load-tests/burst_load.lua (alternates 500 RPS / 5000 RPS)
-   cargo run --release -p nenya-sentinel &
-
-   wrk2 -t4 -c50 -d180s \
-     --latency \
-     -s load-tests/burst_load.lua \
-     http://localhost:8080/should_throttle
-
-   # Verify: PID adapts to bursts, no crashes
-   kill %1
-   ```
-
-   **f) Ramp-Up Load**:
-   ```bash
-   # Test: Gradual ramp from 100 to 10K RPS over 5 minutes
-   # Create load-tests/ramp_load.sh
-   ./load-tests/ramp_load.sh
-
-   # Verify: Smooth scaling, no memory issues at high load
-   ```
-
-4. **Stress Testing**:
-   ```bash
-   # Test: 10,000 unique scopes under load
-   wrk2 -t8 -c100 -d300s -R50000 \
-     --latency \
-     -s load-tests/stress_scopes.lua \
-     http://localhost:8080/should_throttle
-
-   # Monitor with:
-   # - Memory usage (should be stable, no leaks)
-   # - CPU usage (should be reasonable, <80%)
-   # - Latency (should not degrade over time)
-   ```
-
-5. **Soak Testing** (optional but recommended):
-   ```bash
-   # Test: 24-hour sustained load at moderate rate
-   nohup wrk2 -t4 -c20 -d86400s -R5000 \
-     --latency \
-     -s load-tests/throttle.lua \
-     http://localhost:8080/should_throttle \
-     > soak-test.log 2>&1 &
-
-   # Check after 24 hours:
-   # - No crashes
-   # - No memory leaks
-   # - Latency stable
-   # - All metrics healthy
-   ```
-
-6. **Failure Scenario Testing**:
-   ```bash
-   # a) Network partition recovery
-   # Start 3 nodes, block gossip, verify graceful degradation,
-   # restore network, verify auto-recovery
-
-   # b) Node crash and rejoin
-   # Kill a node, verify cluster continues, restart node,
-   # verify rejoin and sync
-
-   # c) Discovery failure
-   # Disable discovery, verify fallback to static seeds
-
-   # d) Invalid config handling
-   # Test with missing cluster secret, invalid TOML, etc.
-   # Verify clear error messages
-   ```
-
-7. **Documentation Verification**:
-   ```bash
-   # Build release binary
-   cargo build --release -p nenya-sentinel
-
-   # Verify documentation complete
-   ls docs/
-   # Should have: architecture.md, roadmap.md, deployment/
-
-   # Test deployment examples
-   # - Docker Compose: docker-compose up -d
-   # - Kubernetes: kubectl apply -f k8s/
-   # - Systemd: systemctl start nenya
-
-   # Verify runbook accuracy
-   # - Walk through common issues
-   # - Test secret rotation procedure
-   ```
-
-8. **CI/CD Pipeline**:
-   ```bash
-   # Ensure all checks pass in GitHub Actions:
-   # - Tests (all platforms)
-   # - Benchmarks
-   # - Clippy
-   # - Security audit
-   # - Documentation build
-   # - Docker image build
-
-   git push origin main
-   # GitHub Actions should be green
-   ```
-
-**Performance Targets (Milestone 5 - Production)**:
-- Library decision: ~40ns (established)
-- HTTP handler: <500μs p99
-- End-to-end: <5ms p99 (including network)
-- Throughput: >50K RPS per node
-- Gossip overhead: <100μs per decision
-- Memory: Stable under 100MB for 1K scopes
-- CPU: <50% at 10K RPS
-
-**Acceptance Criteria**:
-- ✅ All tests pass (170 library + binary integration + distributed tests)
-- ✅ All benchmarks meet targets
-- ✅ Load tests: 1K RPS for 5min with p99 <5ms
-- ✅ Load tests: >50K RPS sustained for 1min
-- ✅ Multi-node: 3-node cluster coordinates properly
-- ✅ Soak test: 24hr at 5K RPS (no crashes, no leaks)
-- ✅ Documentation complete and accurate
-- ✅ CI/CD green on all checks
-- ✅ Zero clippy warnings, zero audit vulnerabilities
-
-**Commit Message**: `Milestone 5: Production hardening and v1.0.0 preparation`
-
-**Next Steps**: Tag and release v1.0.0, publish Docker images, announce release
+**Commit Message**: `Milestone 6: Two-tier coordination for per-user scale`
 
 ---
 
-## Milestone 6: Advanced Features (Future)
+## Milestone 7: Client SDKs & API Stabilization
 
 - [ ] **MILESTONE COMPLETE**
 
-**Goal**: Additional capabilities based on user feedback and real-world usage.
+**Goal**: Make the "guard clause" trivial in the most popular service languages.
+A transparent proxy is explicitly out of scope for now (see Future Work); thin
+SDKs deliver most of the ergonomics for a fraction of the effort.
 
-**Architecture Reference**: See [docs/architecture.md](architecture.md) - Open Questions / Future Work
+### Tasks
 
-### Potential Features
+#### 7.1 API Contract
 
-- [ ] **Adaptive PID Tuning**
-  - Measure gossip lag via timestamps in gossip messages
-  - Dynamically adjust Kp based on measured lag: `Kp = stability_margin / gossip_lag`
-  - Prevents oscillation in high-lag environments
-  - Optimizes convergence speed in low-lag environments
-  - Use EWMA smoothing to prevent tuner oscillation
-  - Optional: Full Ziegler-Nichols auto-tuning for Ki, Kd
-  - Feature flag to enable/disable
+- [ ] **Stabilize the HTTP API**
+  - Review request/response shapes for forward compatibility
+    (additive-only evolution; version header or `/v1/` prefix)
+  - Write an OpenAPI spec in `docs/api/openapi.yaml`; add a CI check that
+    the spec matches the handlers
+- [ ] **Define client failure policy semantics**
+  - Sidecar unreachable or slow: SDKs default to **fail-open** (admit) with
+    a configurable timeout (default ~5ms) — a rate limiter must not become
+    an availability dependency
+  - Document this tradeoff explicitly
 
-- [ ] **State persistence**
-  - Persist scope state to disk
-  - Faster recovery after restart
-  - SQLite or RocksDB backend
+#### 7.2 SDKs
 
-- [ ] **Dynamic reconfiguration**
-  - Modify rate limits at runtime via API
-  - Persist changes to config file
+Each SDK is deliberately tiny (~100 lines): one call, one middleware/decorator,
+timeout + fail-open, zero heavy dependencies.
 
-- [ ] **Shared capacity pools**
-  - Multiple scopes share a total rate limit
-  - Hierarchical limits (global → service → endpoint)
+The target endpoint is configurable: localhost sidecar by default, or a remote
+nenya service URL ("service mode") — this is how serverless callers (AWS
+Lambda etc.) connect; see Milestone 8.
 
-- [ ] **Priority/weights**
-  - Some scopes get priority over others
-  - Weighted fair queueing
+- [ ] **Rust**: `should_throttle(scope)` client in the nenya crate behind a
+  `client` feature (no server deps); Tower middleware example
+- [ ] **Python**: `pip` package — plain function + decorator + ASGI middleware
+  example (FastAPI/Starlette)
+- [ ] **Node.js/TypeScript**: `npm` package — plain function + Express/Fastify
+  middleware
+- [ ] **Go**: module — plain function + `net/http` middleware
+- [ ] **Java/Kotlin** (stretch): plain client + servlet filter example
 
-- [ ] **Advanced metrics**
-  - Histograms of throttle decisions
-  - P50/P90/P99 latencies
-  - Per-scope PID controller state
+Repository layout: `sdks/<language>/` in this repo (monorepo keeps API and SDKs
+in lockstep while everything is 0.x).
 
-- [ ] **Admin API**
-  - Inspect cluster state
-  - Force scope creation
-  - Manually mark nodes as dead
+- [ ] **SDK conformance tests**
+  - One shared test spec (scenarios as JSON) each SDK runs against a real
+    sidecar binary in CI
+- [ ] **Scope ergonomics**: the scope/partition argument is optional — omitted,
+  the decorator uses a single service-wide scope; provided (static string or
+  per-request lambda), it keys per-client/per-user scopes. Per-client
+  isolation with a default limit and per-key overrides is the existing scope
+  pattern system (`client#*` default + `client#big_corp` override) — document
+  this pairing prominently
+- [ ] **Docs**: per-SDK README with the guard-clause example front and center:
+  ```python
+  @nenya.throttle(scope=lambda req: f"client#{req.client_id}")
+  def handler(req): ...
+  ```
 
-- [ ] **Multi-cluster support**
-  - Run multiple independent clusters on same network
-  - Cluster namespacing
+#### 7.3 Cost-Weighted Limiting (LLM-Aware)
 
-- [ ] **Client libraries**
-  - Python, Go, Node.js, Java HTTP clients
-  - Simplified integration
+Request-count rates are the wrong dimension for LLM-backed APIs: cost varies
+~100× between requests and the scarce resource is an upstream quota (model
+TPM, AgentCore TPS) or dollars. Make cost a first-class rate dimension:
 
-**Note**: These are future enhancements, not required for v1.0.0. Prioritize based on user requests and production needs.
+- [ ] **Library**: sliding window accumulates weights, not counts
+  (weight 1.0 = today's behavior; additive change)
+- [ ] **Post-hoc usage recording**: actual cost (e.g., LLM tokens) is known
+  only after the response — add `POST /record_usage {scope, cost}`; the
+  decision endpoint stays predictive, admitting against the rate of recorded
+  cost
+- [ ] **SDK helpers**: decorator variant that records usage on completion
+- [ ] **Config**: per-pattern `rate_dimension = "requests" | "cost"` with the
+  target in cost units/sec
+- [ ] **Document the flagship pattern — upstream quota arbitration**:
+  `cluster_target` = an externally imposed provider quota (Bedrock model TPM,
+  AgentCore `InvokeAgentRuntime` TPS, Gateway invocations/sec); scopes =
+  users. The fleet collectively converges under the quota (no provider 429s,
+  smoothed demand curve) while no single user starves the rest. The
+  soft-limit caveat doesn't apply here: the upstream enforces the hard cap;
+  nenya's job is fair division and smoothing
+
+**Deliverable**: Published (or publish-ready) SDKs for Rust, Python, Node, Go
+with conformance tests in CI, and cost-weighted limiting end to end
+
+**Verification**:
+```bash
+cargo test --all-features
+./sdks/run-conformance-tests.sh    # spins up sidecar, runs all SDK suites
+```
+
+**Commit Message**: `Milestone 7: Client SDKs (Rust, Python, Node, Go) with conformance suite`
 
 ---
 
-## Testing Strategy Summary
+## Milestone 8: Platform Deployment & Discovery
 
-### Unit Tests
-- Config parsing
-- Pattern matching
-- Rate limiter logic (existing)
-- Gossip state aggregation
+- [ ] **MILESTONE COMPLETE**
 
-### Integration Tests
-- HTTP API endpoints
-- Multi-node gossip
-- Discovery mechanisms
-- Network partitions
-- Node failures
-- Authentication
+**Goal**: The "one line per platform" experience — a container image plus a
+copy-paste snippet for Docker Compose, Docker Swarm, Kubernetes, and AWS ECS,
+with peer discovery handled automatically — plus the flagship AgentCore quota
+arbitration integration (8.3).
 
-### Performance Tests
-- HTTP throughput benchmarks
-- Gossip overhead measurement
-- Memory usage with many scopes
+**Architecture Reference**: [docs/architecture.md](architecture.md) - Discovery
+Layer, Deployment Patterns
 
-### CI/CD Pipeline
-```yaml
-# .github/workflows/rust.yml
-- Run unit tests: cargo test --lib
-- Run integration tests: cargo test --test '*'
-- Run benchmarks: cargo bench
-- Format check: cargo fmt --check
-- Lint: cargo clippy
-- Security audit: cargo audit
-- Build release binary
-```
+### Tasks
 
-### Pre-commit Hooks
+#### 8.1 Discovery Trait & Implementations
+
+**Design principle**: gossip needs only *one* live seed — anti-entropy
+membership propagation enumerates the rest of the cluster. Discovery finds
+candidates, not the full topology. This makes generic DNS the universal
+mechanism and everything else an ergonomic layer on top.
+
+- [ ] **`PeerDiscovery` trait** with provider chaining: configured providers
+  run in order, results are unioned and deduped; if nothing yields a seed,
+  start standalone with a prominent warning (never crash)
+- [ ] **Tier 1 — DNS seed resolution** (the universal path): resolve one
+  configured name to A/AAAA records. One code path covers Kubernetes headless
+  services, Swarm `tasks.<service>`, Compose service names, ECS Cloud Map,
+  and Route53/custom DNS over EC2 or bare-metal nodes
+- [ ] **Tier 2 — static seed list**: config + `NENYA_SEED_NODES` env; always
+  available, always the fallback
+- [ ] **Tier 3 — optional platform providers** (for what DNS can't express):
+  - Kubernetes API (`kube` endpoints + label selector)
+  - EC2 instance tags via the AWS API — the "cloud auto-join" pattern proven
+    by Consul/Nomad (`provider=aws tag_key=...`); covers standalone-EC2
+    deployments with no DNS setup
+  - Docker API (`bollard`) only if Swarm DNS proves insufficient
+- [ ] **mDNS — opt-in only, never an automatic fallback**: multicast is
+  unavailable in most cloud networks (AWS VPCs don't forward it; most K8s
+  CNIs and Docker overlay networks drop it), so as a fallback it would fail
+  silently exactly where people deploy. On flat L2 networks (bare metal,
+  labs) it's a good zero-config option — behind explicit
+  `discovery = "mdns"` config
+- [ ] **Symmetric bootstrap — no special first node**: every node ships
+  identical config (same DNS name / tag query, which includes itself;
+  self-address filtered out). No ordered "start the seed, then the rest"
+  setup — that would break the one-line sidecar ergonomics. When dynamic
+  discovery is used, every live node is a seed; a fixed seed being offline
+  during autoscale is only possible with a static list
+- [ ] **Continuous join, not startup-only**: re-resolution never stops and
+  join retries with backoff, so nodes that cold-start into a singleton
+  cluster (e.g., DNS registration lag) merge automatically once discovery
+  surfaces peers. Discovery failure must never affect already-joined members
+  (membership is gossiped; discovery only matters for joining)
+
+**Tests**: mocked DNS/API responses per provider; provider chaining and
+dedup; standalone fallback on total discovery failure; cold-start race —
+N nodes started simultaneously with lagged/partial DNS answers converge to
+a single cluster
+
+#### 8.2 Packaging
+
+- [ ] **Official Docker image**: multi-arch (amd64/arm64), distroless or
+  scratch base, published via CI on tags
+- [ ] **Per-platform snippets** in `deploy/`, each tested end-to-end:
+  - `deploy/compose/`: one service block to paste into `docker-compose.yml`
+  - `deploy/swarm/`: service definition with Swarm discovery preconfigured
+  - `deploy/kubernetes/`: native sidecar (initContainer with
+    `restartPolicy: Always`, K8s ≥1.28) + headless service manifest
+  - `deploy/ecs/`: task definition with container dependency ordering
+  - `deploy/service/`: **service mode** — nenya as a small standalone regional
+    cluster (e.g., 3 Fargate/ECS tasks behind an NLB) for callers that can't
+    host a sidecar. AWS Lambda and other serverless runtimes call it via the
+    SDK's remote endpoint config; include a working Lambda example
+- [ ] **Zero-config defaults**: sidecar starts useful with no TOML — sane
+  default scope pattern, discovery auto-detected from environment
+  (K8s service account present → kubernetes; ECS metadata endpoint →
+  ecs; else static)
+
+#### 8.3 AgentCore Quota Arbitration (Flagship Integration)
+
+The highest-value integration and the priority serverless target: fleet-wide
+per-user fair division of AgentCore's account/resource-level quotas is a real
+gap with no AWS-native solution (verified July 2026 — quotas are per
+agent/account, WAF and usage plans are too coarse, Spring AI's limiter is
+single-process). Generic Lambda-protection adapters are deliberately deferred
+behind this — see Future Work for the ordering.
+
+- [ ] **End-to-end example**: per-user arbitration of `InvokeAgentRuntime`
+  TPS and Gateway invocation quotas — `cluster_target` = the account quota,
+  scopes = users, cost-weighted (Milestone 7.3) where token counts matter
+- [ ] **SDK guards at the AgentCore call sites** (Python first — the dominant
+  agent language): wrap `InvokeAgentRuntime` / Gateway MCP tool calls with
+  the throttle check + usage recording on completion
+- [ ] **Both caller topologies supported**:
+  - Containers (ECS/K8s services calling AgentCore): sidecar + gossip
+  - Lambda callers, and AgentCore Runtime agents themselves (session-scoped
+    microVMs — no gossip inside, same constraints as Lambda): service mode
+    via the SDK's remote endpoint
+- [ ] **CDK constructs**: `NenyaService` (service-mode cluster: Fargate +
+  NLB) and `NenyaThrottle` (wire SDK endpoint/env into an existing Lambda,
+  ECS service, or agent) — "protect your AgentCore quota" in a few lines
+- [ ] **Runbook**: deriving targets from Service Quotas values, tuning
+  per-user shares, and monitoring upstream 429s as the ground-truth signal
+  that arbitration is working
+
+#### 8.4 End-to-End Platform Tests
+
+- [ ] **Compose**: `docker compose up` a 3-node cluster + demo app in CI
+- [ ] **Kubernetes**: kind-based CI job — deploy, scale 1→3, verify
+  discovery and coordination
+- [ ] **Swarm / ECS**: scripted manual test procedures documented in
+  `deploy/README.md` (CI if practical)
+
+**Deliverable**: `docker pull` + one pasted block = running distributed rate
+limiter on each platform
+
+**Verification**:
 ```bash
-#!/bin/bash
-# .git-hooks-pre-commit (already exists)
-cargo test --all
-cargo fmt --check
-cargo clippy -- -D warnings
+cargo test --all-features
+docker compose -f deploy/compose/demo.yml up   # 3 nodes coordinate
+# kind CI job green
 ```
+
+**Commit Message**: `Milestone 8: Platform deployment packaging and peer discovery`
+
+---
+
+## Milestone 9: Security & Authentication
+
+- [ ] **MILESTONE COMPLETE**
+
+**Goal**: Secure gossip with cluster secret authentication.
+
+**Architecture Reference**: [docs/architecture.md](architecture.md) - Security Model
+
+### Tasks
+
+#### 9.1 Cluster Secret Authentication
+
+- [ ] **Secret loading**: file (`/run/secrets/nenya_cluster_secret`), env
+  (`NENYA_CLUSTER_SECRET`), TOML (`cluster_secret_file`); error if absent
+- [ ] **Message authentication**: HMAC over gossip payloads with the cluster
+  secret; reject unauthenticated/tampered messages
+  (may require wrapping Chitchat's transport layer)
+- [ ] **Join handshake**: challenge-response so nodes with the wrong secret
+  never enter the peer set
+- [ ] **TLA+/model-checked handshake** (recommended): specify the
+  challenge-response protocol and check safety (no unauthenticated node ever
+  enters the peer set) against replay, reordering, and message-drop
+  interleavings before implementing
+
+**Tests**: correct secret joins; wrong secret rejected; tampered payload rejected
+
+#### 9.2 TLS for Gossip (Optional)
+
+- [ ] mTLS transport wrapper with configurable cert/key/CA paths
+
+**Deliverable**: Only authenticated nodes participate in coordination
+
+**Commit Message**: `Milestone 9: Cluster secret authentication`
+
+---
+
+## Milestone 10: Production Hardening & v1.0.0
+
+- [ ] **MILESTONE COMPLETE**
+
+**Goal**: Production-ready release.
+
+**Architecture Reference**: [docs/architecture.md](architecture.md) - Failure
+Modes, Performance Characteristics
+
+### Tasks
+
+#### 10.1 Resilience
+
+- [ ] Graceful degradation: gossip failure → local-only limiting, no crash;
+  discovery failure → static seeds with exponential backoff
+- [ ] Graceful shutdown: drain in-flight requests, notify peers, clean SIGTERM
+- [ ] Health semantics: `/health` unhealthy on stale gossip (>10s) or missing
+  expected peers
+- [ ] Scope TTL cleanup (configurable) to bound memory with high-cardinality
+  scopes
+
+#### 10.2 Performance Validation
+
+- [ ] Load tests (wrk2): 1K RPS × 5min p99 <5ms; max throughput >50K RPS/node;
+  1000-scope multi-scope run; 3-node distributed load; burst and ramp profiles
+- [ ] Stress: 10K scopes under load, stable memory, no leaks
+- [ ] Soak: 24h at 5K RPS, no crashes/leaks/latency drift
+- [ ] Benchmarks vs. Milestone 0 baseline: no regressions
+  (~40ns decision, <500μs handler p99, <100μs gossip overhead)
+
+#### 10.3 Documentation & Release
+
+- [ ] Config reference, runbook (secret rotation, gossip debugging,
+  common failures), per-platform deployment guides (from Milestone 8)
+- [ ] Soft-limit disclosure: document worst-case overshoot
+  (`propagation_delay × excess demand`) and that nenya targets fairness and
+  overload protection, **not** billing-grade quota enforcement
+- [ ] CI/CD: full pipeline green, Docker images published, binaries released,
+  tag v1.0.0
+
+**Performance Targets**:
+- Library decision: ~40ns | HTTP handler: <500μs p99 | End-to-end: <5ms p99
+- Throughput: >50K RPS/node | Memory: <100MB @ 1K scopes | CPU: <50% @ 10K RPS
+
+**Commit Message**: `Milestone 10: Production hardening and v1.0.0 preparation`
+
+---
+
+## Future Work (Post-v1.0)
+
+Deliberately deferred; prioritize from real usage.
+
+- **Resource-based limiting** (CPU/memory): deferred by design. This is
+  admission control, not rate limiting — the rate→resource relationship is
+  nonlinear and workload-dependent, and the systems that do it well (Netflix
+  concurrency-limits, Envoy adaptive concurrency) control *concurrency* with
+  gradient/AIMD, not rate with PID. Likely lands as a sibling engine
+  (target CPU% as setpoint, heavy input filtering) plus a concurrency-limit
+  mode; needs the simulator extended with a load→resource model first.
+- **Transparent proxy mode**: Envoy `ext_authz` adapter over the existing API
+  for zero-code-change integration; standalone reverse-proxy mode if demand
+  exists
+- **Alternative coordination transports (blackboard)**: gossip is one
+  transport for the core loop (local enforcement + periodic rate sharing +
+  feedback control), not the idea itself. The serverless analog embeds the
+  nenya library in the runtime (Lambda layer/extension, Cloudflare Worker)
+  and syncs through a shared store instead of a mesh: DynamoDB item per hot
+  scope with an instance map + TTLs, ElastiCache, or a Durable Object per hot
+  scope. Same engine, same staleness-decay semantics (a frozen environment
+  ages out like a partitioned peer); decisions stay local and in-memory — the
+  store is touched once per sync interval per instance, never per request.
+  Two-tier promotion is load-bearing here: only hot scopes touch the store,
+  which bounds DynamoDB cost (tens of dollars/day at millions-of-users scale
+  — acceptable; cost is not the blocker). **Why deferred anyway**: for
+  LLM-scale workloads (multi-second, dollar-scale requests) service mode's
+  1–3ms hop is noise, so the blackboard's one advantage — zero per-request
+  network — doesn't bind. Build it when a high-QPS, latency-sensitive
+  serverless API demands it. Gossip *inside* function runtimes remains a
+  non-goal (frozen environments, no inbound connections, constant churn)
+- **Lambda + Bedrock API guarding (first follow-up milestone candidate)**:
+  the same arbitration pattern for Lambda services calling Bedrock model APIs
+  directly (quota = model TPM/RPM). Mostly composes shipped pieces — service
+  mode + SDK guard + `NenyaThrottle` + cost-weighted rates. Promote to a
+  milestone once AgentCore integration (8.3) ships
+- **Protecting Lambda autoscaling itself (further future)**: the interception
+  ladder applied to the *hosting* platform rather than the upstream quota.
+  Rungs, cheapest-per-rejected-request first: (1) API Gateway Lambda
+  authorizer calling nenya — rejects before the target Lambda is invoked,
+  saving the invocation and concurrency slot (caveat: authorizer caching is
+  per-identity TTL, so throttle decisions need short/no cache); (2) Lambda
+  layer/extension early return — invocation still billed, but a ~5ms 429 vs.
+  a multi-second handler cuts occupied concurrency ~100–1000× (concurrency =
+  arrival × duration), which is what smooths the autoscaling curve;
+  (3) in-handler guard — saves backend calls only
+- **Multi-cloud adapters**: Cloudflare Workers (Durable Object transport),
+  GCP Cloud Run/Functions and Azure Functions equivalents of the AWS
+  adapters; Terraform/Pulumi alongside CDK. Demand-driven — service mode
+  already works on all of them day one, since it's just an HTTP call
+- **Serverless-optimized clients**: token leasing — the SDK fetches a batched
+  allowance per scope, decrements locally, refreshes asynchronously — to
+  amortize the network hop to a service-mode cluster; an AWS Lambda Extension
+  hosting the lease cache. Service mode (Milestone 8) is the baseline
+  serverless path; leases cut its per-invoke overhead to near zero
+- **Adaptive engine tuning**: measure gossip lag from timestamps, scale gains
+  accordingly (PID), or auto-fit process noise (Bayesian)
+- **Shared capacity pools / hierarchical limits**: scopes drawing from a
+  common budget (global → service → endpoint)
+- **Priority & weighted fairness** between scopes
+- **Dynamic reconfiguration**: runtime limit changes via admin API
+- **State persistence** for fast restart recovery
+- **Multi-cluster namespacing** on shared networks
+- **Additional SDKs** (Java/Kotlin GA, Ruby, PHP) by demand
 
 ---
 
@@ -1113,79 +838,87 @@ cargo clippy -- -D warnings
 
 | Milestone | Key Deliverable | Status |
 |-----------|----------------|--------|
-| 0 | Single-crate + HTTP stack + distributed foundation | ✅ Complete |
-| 1 | Working HTTP rate limiter | ⏳ Ready to Start |
-| 2 | Equal division PID + gossip coordination | 🟡 Library Complete, Binary TODO |
-| 3 | Platform integrations | 🔜 Not Started |
-| 4 | Cluster authentication | 🔜 Not Started |
-| 5 | Production-ready release | 🔜 Not Started |
-| 6 | Advanced features (adaptive PID tuning, etc.) | 🔜 Future |
+| 0 | Single-crate + HTTP stack + limiter foundation | ✅ Complete |
+| 1 | Working HTTP rate limiter | ✅ Complete |
+| 2 | Gossip coordination (equal division PID) | ✅ Complete |
+| 3 | Gossip correctness fixes (stale decay, locking) | ⏳ Current |
+| 4 | Deterministic simulator + scenario/benchmark suite | 🔜 Next |
+| 5 | Pluggable engines: PID vs Bayesian, benchmarked | 🔜 Not Started |
+| 6 | Two-tier coordination for per-user scale (millions of scopes) | 🔜 Not Started |
+| 7 | Client SDKs (Rust, Python, Node, Go) | 🔜 Not Started |
+| 8 | Platform deployment + discovery + AgentCore quota arbitration | 🔜 Not Started |
+| 9 | Cluster authentication | 🔜 Not Started |
+| 10 | Production-ready v1.0.0 | 🔜 Not Started |
 
-**Legend**: ✅ Complete | ⏳ In Progress | 🔜 Not Started
+**Legend**: ✅ Complete | ⏳ Current | 🔜 Not Started
 
 ---
 
 ## Success Criteria
 
-### Milestone 1 Complete
-- Single-node rate limiter works via HTTP API
-- Scope auto-creation functional
-- Metrics exposed
-- All tests passing
-
-### Milestone 2 Complete
-- 3+ nodes coordinate via gossip
-- Distributed throttling accurate within 5% of target
-- Network partitions handled gracefully
-- All tests passing
-
 ### Milestone 3 Complete
-- Docker Swarm discovery working
-- Kubernetes discovery working
-- Auto-discovery functional end-to-end
+- Dead/partitioned peers stop influencing admission within `stale_timeout`
+- Gossip loop lock behavior measured and documented
 - All tests passing
 
 ### Milestone 4 Complete
-- Cluster secret authentication working
-- Unauthorized nodes rejected
-- All tests passing
+- Same seed → byte-identical simulation results
+- Core scenario suite runs in CI under 30s
+- Stateright safety invariants (staleness, no double-count, peer accounting)
+  verified and running in CI
+- Benchmark harness emits engine comparison tables
 
 ### Milestone 5 Complete
-- Performance targets met (>50k req/sec)
-- Production documentation complete
-- Deployment examples working
-- All tests passing
+- PID, Bayesian, and hybrid engines behind one trait, selected by explicit
+  config (no runtime auto-selection)
+- `docs/engine-comparison.md` published with scenario-matrix results
+- Documented default engine value chosen from data, not preference
 
-### v1.0.0 Release Ready
-- All phases complete
-- CI/CD pipeline green
-- Documentation complete
-- Docker image published
-- Binary releases available
-- No known critical bugs
+### Milestone 6 Complete
+- 1M-scope stress benchmark passes with bounded memory and gossip payload
+- Promotion/demotion verified: no flapping under hysteresis, no double-count
+  between tail aggregate and hot tier
+- Worst-case tail overage quantified in the simulator and documented
+
+### Milestone 7 Complete
+- Guard clause is ≤3 lines in Rust, Python, Node, and Go
+- All SDKs pass the shared conformance suite against a real sidecar
+- Fail-open semantics documented and tested
+
+### Milestone 8 Complete
+- One pasted block per platform yields a working cluster
+- Discovery verified end-to-end on Compose and kind (K8s)
+- Zero-config startup works
+- AgentCore arbitration example works end-to-end: per-user fair share under
+  the account quota, validated by the absence of upstream 429s under load
+
+### Milestone 9 Complete
+- Unauthorized nodes cannot join or influence rates
+
+### Milestone 10 / v1.0.0
+- All performance targets met, soak test clean
+- Documentation complete, soft-limit semantics disclosed
+- CI green, images and binaries published
+
+---
 
 ## Risk Mitigation
 
-### Risks
-
-1. **Chitchat learning curve**: Library might be harder to integrate than expected
-   - **Mitigation**: Allocate extra time in Phase 2, study examples thoroughly
-
-2. **Platform-specific discovery complexity**: Docker/K8s APIs might be unreliable
-   - **Mitigation**: Always support static seeds as fallback
-
-3. **Gossip performance**: State propagation might be too slow
-   - **Mitigation**: Tune gossip interval, benchmark early in Phase 2
-
-4. **Authentication complexity**: Securing gossip might require significant effort
-   - **Mitigation**: Start with simple pre-shared key, add TLS as optional
-
-5. **Integration test flakiness**: Timing-dependent tests might be unreliable
-   - **Mitigation**: Use proper synchronization, generous timeouts, retries
-
-## Next Steps
-
-1. Review this roadmap and adjust as needed
-2. Create GitHub issues for each major task
-3. Begin Phase 0: Preparation & Cleanup
-4. Set up project board to track progress
+1. **Simulator fidelity**: simulated gossip may diverge from real Chitchat
+   behavior → keep the multi-process integration tests as a reality check;
+   validate simulator predictions against a real 3-node cluster once per
+   engine change
+2. **Bayesian engine complexity**: Kalman + admission control has more knobs
+   than PID → the parameter-sensitivity sweep in 5.3 is mandatory, not
+   optional; if it's not robustly better, PID stays default
+3. **SDK maintenance surface**: four languages is a commitment → keep SDKs
+   ≤~100 lines, generated conformance tests, no feature creep
+4. **Chitchat transport wrapping** (auth): may be invasive → prototype the
+   HMAC wrapper early in Milestone 9; fall back to network-level isolation
+   guidance if the library fights it
+5. **Platform CI flakiness**: kind/compose jobs can be slow or flaky →
+   generous timeouts, retries, keep them out of the default `cargo test` path
+6. **Uniform-routing assumption (two-tier)**: sticky/session-affinity load
+   balancing skews the `local_rate × N` estimate → skew itself triggers
+   promotion on the hot node, and the sticky-routing simulator scenario
+   quantifies worst-case overage so the bound is measured, not assumed
