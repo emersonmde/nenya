@@ -672,6 +672,19 @@ cargo run --features sim --example cluster_sim -- --scenario pareto_users --seed
 cargo fmt -- --check && cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+**Post-milestone refinements** (same session, commits after 9462075):
+- Sparse-share fixes: 4-token adaptive-capacity floor (starvation +
+  Poisson clump loss on clusters larger than the per-user limit),
+  burst carry-through at promotion (`initial_capacity`)
+- **Evidence-based redesign** of the tier state machine: tail scopes
+  enforce the FULL limit locally; locally-warm scopes publish rates
+  (watch watermark = `demote × limit / n`); promotion requires
+  `local + Σ peers ≥ promote × limit` with nonzero peer evidence.
+  Replaces the `local × n` uniform-routing assumption and the
+  short-lived `tail_burst_fraction` knob. Sticky users: served 0.98 of
+  offered with zero promotions (was 0.40). Unpromoted bound:
+  `limit × (1 + demote)`. See docs/capacity-model.md and docs/tuning.md.
+
 **Commit Message**: `Milestone 6: Two-tier coordination for per-user scale`
 
 ---

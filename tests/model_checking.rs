@@ -177,13 +177,14 @@ impl Model for AggregationModel {
 
 // ===== Two-tier promotion/demotion state machine (Milestone 6.4) =====
 //
-// Exhaustively explores every interleaving of rate changes, clock ticks,
-// and sync passes for one scope on one node, driving the **real**
-// `gossip::tier` decision code (`should_promote` + `DemotionTracker`) in
-// every reachable state. Invariants: demotion honors the hysteresis hold
-// (never fires within `hold` of an above-threshold observation), and the
-// machine cannot flap — the number of tier transitions is bounded by the
-// number of input rate changes plus one.
+// Exhaustively explores every interleaving of rate changes, peer-evidence
+// changes, clock ticks, and sync passes for one scope on one node, driving
+// the **real** `gossip::tier` decision code (`should_promote` +
+// `DemotionTracker`) in every reachable state. Invariants: promotion never
+// fires without peer evidence (a single-node user is never coordinated),
+// demotion honors the hysteresis hold (never fires within `hold` of an
+// above-threshold observation), and the machine cannot flap — the number
+// of tier transitions is bounded by the number of input changes plus one.
 //
 // Estimation noise is deliberately out of scope here (the simulator sweep
 // quantifies it); the model checks the discrete state machine.
@@ -220,6 +221,9 @@ impl RateLevel {
 struct TierState {
     time: u8,
     rate: RateLevel,
+    /// Whether any of the observed rate comes from other nodes (the
+    /// evidence gate on promotion)
+    peer_evidence: bool,
     hot: bool,
     /// Mirror of `DemotionTracker::below_since` (tick granularity); the
     /// real tracker is reconstructed from this and driven through its real
@@ -234,6 +238,9 @@ struct TierState {
     /// Set if a demotion ever fired within `hold` of an above-threshold
     /// sync observation (must be unreachable)
     hysteresis_violated: bool,
+    /// Set if a promotion ever fired without peer evidence (must be
+    /// unreachable)
+    evidence_violated: bool,
     synced_this_tick: bool,
 }
 
@@ -241,6 +248,7 @@ struct TierState {
 enum TierAction {
     Tick,
     SetRate(RateLevel),
+    SetEvidence(bool),
     Sync,
 }
 
@@ -276,12 +284,14 @@ impl Model for TierModel {
         vec![TierState {
             time: 0,
             rate: RateLevel::Low,
+            peer_evidence: false,
             hot: false,
             below_since: None,
             last_high_sync: None,
             transitions: 0,
             rate_changes: 0,
             hysteresis_violated: false,
+            evidence_violated: false,
             synced_this_tick: false,
         }]
     }
@@ -295,6 +305,7 @@ impl Model for TierModel {
                 actions.push(TierAction::SetRate(level));
             }
         }
+        actions.push(TierAction::SetEvidence(!state.peer_evidence));
         if !state.synced_this_tick {
             actions.push(TierAction::Sync);
         }
@@ -309,6 +320,11 @@ impl Model for TierModel {
             }
             TierAction::SetRate(level) => {
                 next.rate = level;
+                next.rate_changes = next.rate_changes.saturating_add(1);
+            }
+            TierAction::SetEvidence(evidence) => {
+                next.peer_evidence = evidence;
+                // An evidence change is an input change for the flap bound
                 next.rate_changes = next.rate_changes.saturating_add(1);
             }
             TierAction::Sync => {
@@ -337,9 +353,19 @@ impl Model for TierModel {
                         next.transitions = next.transitions.saturating_add(1);
                     }
                 } else {
-                    // Promotion path: real threshold test (local × n with
-                    // local = cluster / n — exact rates, uniform routing)
-                    if should_promote(rate / NUM_NODES as f64, NUM_NODES, LIMIT, &self.cfg) {
+                    // Promotion path: real evidence-gated threshold test.
+                    // With evidence, peers carry (n−1)/n of the observed
+                    // rate; without, all of it is local.
+                    let peer = if last.peer_evidence {
+                        rate * (NUM_NODES - 1) as f64 / NUM_NODES as f64
+                    } else {
+                        0.0
+                    };
+                    let local = rate - peer;
+                    if should_promote(local, peer, LIMIT, &self.cfg) {
+                        if !last.peer_evidence {
+                            next.evidence_violated = true;
+                        }
                         next.hot = true;
                         next.below_since = None;
                         next.transitions = next.transitions.saturating_add(1);
@@ -359,6 +385,11 @@ impl Model for TierModel {
             // at/above the demote threshold
             Property::<Self>::always("hysteresis hold respected", |_, state| {
                 !state.hysteresis_violated
+            }),
+            // Promotion never fires without peer evidence — a single-node
+            // user is never pulled into coordination
+            Property::<Self>::always("promotion requires peer evidence", |_, state| {
+                !state.evidence_violated
             }),
             // No flapping: each tier transition needs an input change —
             // constant input yields at most one transition

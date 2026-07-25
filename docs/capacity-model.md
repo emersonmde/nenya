@@ -113,8 +113,9 @@ the two-tier architecture; the measured state (seed 42, M-series, tests in
   (default 60 s, sweeps every TTL/2) bounds the resident set by the
   active-user window: 2M churned users peak at one wave's residency.
 - **Promoted set**: Zipf(1.0) over 100k users at 60× a 10 rps per-user
-  limit promotes 17 scopes (uniform routing; 54 sticky) — the gossip
-  payload is the hot head, not the population.
+  limit promotes 13 scopes under uniform routing (and ~0 under sticky —
+  single-node users generate no peer evidence and need no coordination) —
+  the gossip payload is the warm head, not the population.
 
 ### Is promotion still needed after delta sync? (ablation)
 
@@ -125,9 +126,9 @@ before/after test rather than an assumption
 
 | | two-tier (default) | all-hot (ablated) |
 |---|---|---|
-| RSS | 356 B/scope | 450 B/scope (grows under load) |
-| sync tick (apply+collect, /500 ms) | **1.3 ms** | **218 ms** |
-| replicated keyspace / joiner catch-up | 0 keys | 300k keys ≈ 5.9 MB |
+| RSS | 356 B/scope | 949 B/scope |
+| steady sync tick (apply+collect, /500 ms) | **1.2 ms** | **204 ms** |
+| replicated keyspace / joiner catch-up | ~0 keys | 300k keys ≈ 5.9 MB |
 | steady delta wire (600 rps, 100k users) | ~1 KB/s/peer | ~24 KB/s/peer |
 
 **Verdict: still needed, but the binder moved.** Steady-state wire volume
@@ -145,132 +146,65 @@ users/sec, not user count). What still rules out all-hot at scale:
    users/sec — fine at 600 rps, MB/s at the 10⁵-rps regimes the capacity
    model targets. Two-tier caps all three at the hot-set size K.
 
-## Two-tier defaults (Milestone 6.4 sweep, seed 42)
+## Two-tier defaults (sweep, seed 42 — evidence-based design)
 
 Derivation data from `tier_threshold_sweep` (re-run:
 `cargo test --all-features --release --test simulation tier_threshold_sweep -- --ignored --nocapture`).
+Since the evidence redesign, tail scopes are enforced at the **full
+limit** locally and promotion requires `local + Σ peer rates ≥
+promote_utilization × limit` with nonzero peer evidence; the watch
+watermark (`demote_utilization × limit / n`) controls when a tail
+scope's rate is published as evidence.
 
-**Promotion-estimator window** — noise vs. detection lag (promote=0.5,
-Zipf 100k users, ~10 truly over threshold; negative lag = the 2 rps
-pre-ramp phase promoted spuriously):
+**Promotion-estimator window** (noise → wasted watching/promotion vs.
+detection lag): a 1 s window promotes 41 per 100k Zipf users (~10 truly
+over threshold); 8 s promotes 13 at 1.0 s ramp-promotion lag; wider
+windows shave 1–2 scopes for ~0.5 s more lag. Default **8 s**.
 
-| window | promoted | ramp promotion lag |
-|--------|----------|--------------------|
-| 1s | 78 | −29.3s |
-| 2s | 37 | −7.7s |
-| 3s | 31 | −4.3s |
-| 5s | 22 | −2.6s |
-| **8s** | **17** | **+1.0s** |
-| 12s | 15 | +2.5s |
-| 16s | 13 | +2.9s |
+**Promotion threshold** — overage is structurally bounded at every value
+(unpromoted cluster rate `< limit × (1 + demote_utilization)`: one full
+bucket + n−1 sub-watermark nodes), so the threshold trades hot-set size
+against coordination headroom only:
 
-8 s is the knee: the first window where sub-threshold traffic never
-promotes; wider windows shave 2–4 scopes for 1.5–2 s more lag.
-
-**Promotion threshold** — the expected promoted-set vs. worst-overage knee
-**does not exist**: per-user overage is structurally absent at every
-threshold (an unpromoted scope is capped at `limit / n` per node, so its
-cluster-wide total cannot exceed the limit, and routing skew raises the
-hot node's local estimate, promoting *earlier*). The threshold only trades
-hot-set size against coordination headroom:
-
-| promote | promoted | worst unpromoted rps (limit 10) | sticky worst served/offered | ramp max 1s |
+| promote | promoted (100k users) | worst unpromoted rps (limit 10) | sticky worst served/offered | ramp max 1s |
 |---------|----------|-------------------------------|------------------------------|-------------|
-| 0.3 | 35 | 1.80 | 0.40 | 22 |
-| **0.5** | **17** | **2.53** | **0.40** | **16** |
-| 0.8 | 7 | 5.52 | 0.39 | 16 |
+| 0.3 | 24 | 2.28 | 0.98 | 22 |
+| **0.5** | **13** | **3.67** | **0.98** | **30** |
+| 0.8 | 7 | 5.58 | 0.98 | 30 |
 
-Default 0.5 keeps 2× headroom between promotion and the limit; 0.8 halves
-the hot set with no measured downside in these scenarios (exposed as
-`NENYA_PROMOTE_UTILIZATION` / per-pattern config).
+**Demotion threshold** (also the watch-watermark divisor and the
+unpromoted-bound term): a user parked at the demotion boundary for 300 s
+→ 0 promotions at 0.25, 6 at 0.35, 15–18 at 0.45. Default **0.25**.
 
-**Demotion threshold** — flap resistance (user parked at the demotion
-boundary, 300 s; 3 promotions = one per node = no flap):
-
-| demote | promotions at boundary |
-|--------|------------------------|
-| 0.15 | 0–3 |
-| **0.25** | **3** |
-| 0.35 | 12 |
-| 0.45 | 15–23 |
-
-0.25 is the highest (fastest hot-set shedding) flap-free value. The
-demotion hold (10 s) covers the full information round-trip (sync +
-propagation + control interval); the stateright model
-(`model_check_tier_state_machine`) proves the hysteresis and
-no-flap-under-constant-input properties over all interleavings.
-
-**Tail burst depth + sparse-share floor** (large-cluster follow-up):
-splitting a small per-user limit across a large cluster surfaced two
-defects and one product tradeoff. Defects (both fixed): with per-node
-capacity `share × 1s`, any cluster larger than the per-user rps limit
-gave sub-token buckets that could **never admit anything** (and never
-promote, since the estimator counts accepts) — and even after promotion,
-a one-token adaptive bucket lost ~40% of a Poisson stream to clumping.
-The adaptive capacity now floors at 4 tokens (swept 1/2/4/8 → served
+**Sparse-share floor**: splitting a small per-user limit across a large
+cluster once starved scopes outright (sub-token adaptive capacities) and
+then lost ~40% of a Poisson stream to single-token clumping. The
+adaptive bucket capacity floors at 4 tokens (swept 1/2/4/8 → served
 0.62/0.84/0.94/0.97 for an 8 rps user on 25 nodes; service-scale
-scenarios unchanged; 4 is the knee).
+scenarios unchanged). Fixed-point measurements of the evidence design:
+8 rps user on 25 nodes served 0.94 of offered; autoscale (service
+L=300) join overshoot 3079 vs the 4000 budget; a 20-request single-node
+burst admits the full 10-token limit bucket with no promotion.
 
-The tradeoff — concentrated-burst tolerance vs. cold-bucket spike — is
-the `tail_burst_fraction` knob (per-node tail capacity
-`max(share, frac × limit) × 1s`). Depth changes neither long-run
-admission (refill stays at the fair share) nor steady per-user overage
-(flat at every fraction); it trades how much of a client burst one node
-absorbs against the `n × frac × limit` worst-case spike for a
-synchronized spread burst:
+**Routing strategies — sticky is now the good case**: with full-limit
+tail buckets and evidence-gated promotion, session-affinity users are
+served at ~0.98 of offered with no promotion at all (they cannot exceed
+the limit through one bucket). Uniform/round-robin/least-loaded spread
+traffic generates evidence and coordinates normally
+(`test_routing_strategies_preserve_two_tier_invariants` asserts the
+unpromoted bound under all four policies). The promotion-lag transient
+for a spread step is `min(offered, n × limit)` for ~1 second (the
+`user_ramp` scenario measures it).
 
-| frac | 20-req burst via 1 node (limit 10, 10 nodes) | autoscale join overshoot (service L=300, budget <4000) |
-|------|------|------|
-| 0.0 (share only) | 1/20 | 2452 |
-| 0.25 | 2/20 | 2452 |
-| **0.5** | **5/20** | **2698** |
-| 1.0 | 10/20 | 2793 |
-
-Shipped default 0.5: aligned with the promotion threshold (one node
-absorbs bursts up to the utilization level where coordination takes
-over; a burst that trips promotion carries its remaining tail tokens
-into the promoted limiter rather than being truncated). The direction of
-the trade is deliberately toward usability — premature throttling of
-legitimate bursts is a chronic, per-customer cost, while the spread-burst
-spike is bounded, once-per-refill-period, and the sustained many-scope
-flood it hints at is unwinnable by per-user limits regardless (that is
-the service-level cap's job). Per-user-focused deployments can set
-`NENYA_TAIL_BURST_FRACTION=1.0` for Redis-style full-limit burst
-semantics; DDoS-sensitive ones can lower it toward 0.
-
-**Routing strategies — measured, only stickiness matters**: the promotion
-estimate assumes uniform routing, so four load-balancer policies were
-compared on the same Zipf population (`test_routing_strategies_preserve_two_tier_invariants`,
-seed 42, 100k users, 60× a 10 rps limit):
-
-| routing | promoted | worst unpromoted rps | head user rps (offered ~50) | node CV |
-|---------|----------|----------------------|------------------------------|---------|
-| uniform | 17 | 2.53 | 10.28 | 0.015 |
-| round-robin | 17 | 3.33 | 10.40 | 0.002 |
-| least-loaded (adverse feedback) | 17 | 3.15 | 10.40 | 0.001 |
-| sticky | 42 | 1.22 | 3.52 | 0.017 |
-
-Round-robin is just a lower-variance uniform. Least-loaded — modeled
-adversarially as "route every arrival to the node with the lowest
-trailing-1s *accepted* rate", i.e. a throttling node's fast 429s attract
-more traffic — turns out to act as an equalizer, indistinguishable from
-round-robin: per-user capping doesn't create the node-level asymmetry the
-feedback loop would need. Static skew is bracketed by the
-uniform/sticky endpoints. The only policy that changes outcomes is full
-session affinity, and its failure mode is *under-service* (head user
-capped at the ~`limit/n` equal-division share, 3.5 of 10 rps), not
-overage — the same engine-side property noted below, addressable by
-demand-weighted division, not by tier policy.
-
-**Count-min sketch — evaluated and rejected**: a mergeable sketch of tail
-rates would answer "approximate cluster rate for any user" at fixed gossip
-size. The simulator data shows promotion + per-pattern tail aggregate
-already suffices: unpromoted overage is zero in both uniform and sticky
-routing, so the sketch's conservative-overestimate property has nothing to
-protect. The remaining gap — sticky mid-band users are served ~40% of
-offered (capped at the equal share until promotion) — is an *equal
-division* property that a sketch cannot fix; demand-weighted division
-(the Bayesian engine's niche) is the lever for that. No sketch ships.
+**Compact tail sketches (count-min / Bloom) — evaluated, not shipped**:
+under the previous share-based design there was nothing for a sketch to
+protect (overage was structurally zero). Under the evidence design the
+question is live in one specific regime: clusters with more concurrently
+warm *spread* users than the gossip budget K, where dropped watch
+entries weaken the evidence channel and the unpromoted bound degrades
+toward per-node enforcement for the dropped scopes. Until that regime is
+demonstrated, per-scope watch keys + the budget are simpler and
+sufficient; revisit with data if it materializes.
 
 ## Sizing formula (per node)
 

@@ -4,13 +4,12 @@
 //! arm emulates no tail tier (promotion threshold ~0, unbounded budget).
 //!
 //! Measured 2026-07 (seed 42, M-series, release, 300k scopes, 2 peers):
-//! - RSS: 356 B/scope tail vs 450 B/scope hot at 2 accepts each (hot
-//!   grows further under load: timestamp deque + per-peer observation
-//!   vectors)
-//! - Sync tick (apply + collect, every 500 ms): 1.3 ms two-tier vs
-//!   218 ms all-hot — 44% of the tick budget at 300k scopes and O(scopes
-//!   × peers); extrapolates past the whole tick at ~1M scopes, all under
-//!   the manager write lock
+//! - RSS: 356 B/scope tail vs 949 B/scope hot (engine + peer-observation
+//!   vectors + timestamp deque)
+//! - Steady sync tick (apply + collect, every 500 ms): 1.2 ms two-tier vs
+//!   204 ms all-hot — 40% of the tick budget at 300k scopes and O(scopes
+//!   × peers) under the manager write lock; the one-time promote pass is
+//!   another 273 ms
 //! - Publish set: 0 keys (nothing near limit) vs 300k keys ≈ 5.9 MB of
 //!   replicated keyspace every node must hold per peer and every joiner
 //!   must catch up (~1.5 min at 64 KB/round on Linux; stalls on default
@@ -18,7 +17,7 @@
 //! - Steady delta wire: ~400 value-changing scopes/s at 600 rps over
 //!   100k Zipf users (~24 KB/s/peer) — modest, but proportional to
 //!   distinct active users/sec, i.e. it scales with traffic; two-tier
-//!   caps it at the hot set (~1 KB/s)
+//!   caps it at the published set
 //!
 //! Verdict: promotion is still required, but the binder moved — delta
 //! sync fixed the original retransmit-everything cost; what remains is
@@ -52,19 +51,21 @@ fn manager(promote: f64, demote: f64, budget: usize) -> RateLimitManager {
 }
 
 #[test]
-#[ignore = "ablation measurement (~1s release, ~300MB RSS); run with --ignored --nocapture --test-threads=1"]
+#[ignore = "ablation measurement (~2s release, ~500MB RSS); run with --ignored --nocapture --test-threads=1"]
 fn ablation_all_hot_memory_and_sync_cpu() {
     const N: usize = 300_000;
-    for (name, promote, budget) in [
-        ("two-tier (default)", 0.5, 1000usize),
-        ("all-hot (ablated)", 1e-9, usize::MAX),
+    // Peers reporting a scope IS the promotion evidence, so the arms are
+    // distinguished by what peers report: liveness-only (two-tier reality:
+    // peers publish just their small hot/watched sets) vs every scope
+    // (the ablated all-hot world).
+    for (name, promote, budget, peers_report_all) in [
+        ("two-tier (default)", 0.5, 1000usize, false),
+        ("all-hot (ablated)", 1e-9, usize::MAX, true),
     ] {
         let mut mgr = manager(promote, promote * 0.5, budget);
         let start = Instant::now();
         let rss_before = rss_kb();
         let wall = Instant::now();
-        // Two requests per scope (promotion test sees a nonzero estimate
-        // on the second request), spread over a virtual second
         for i in 0..N {
             let now = start + Duration::from_nanos(i as u64 * 1000);
             let scope = format!("user:{:08x}", i);
@@ -72,16 +73,12 @@ fn ablation_all_hot_memory_and_sync_cpu() {
             mgr.should_throttle_at(&scope, now + Duration::from_nanos(200));
         }
         let create = wall.elapsed();
-        let rss_after = rss_kb();
 
-        // One sync tick's manager-side cost with 2 peers each reporting
-        // every hot scope (what full gossip would deliver)
-        let hot = mgr.num_hot_scopes();
-        let peer_rates: HashMap<String, f64> = (0..N)
-            .filter(|_| hot > 0)
-            .take(hot.min(N))
-            .map(|i| (format!("user:{:08x}", i), 3.3))
-            .collect();
+        let peer_rates: HashMap<String, f64> = if peers_report_all {
+            (0..N).map(|i| (format!("user:{:08x}", i), 3.3)).collect()
+        } else {
+            HashMap::new()
+        };
         let observations: Vec<PeerObservation> = (0..2)
             .map(|p| PeerObservation {
                 node_id: format!("peer{}", p),
@@ -95,25 +92,32 @@ fn ablation_all_hot_memory_and_sync_cpu() {
             Duration::from_millis(500),
             Duration::from_secs(10),
         );
+        // First apply includes evidence-based promotion (one-time);
+        // second apply is the steady per-tick cost
         let now = start + Duration::from_secs(2);
         let wall = Instant::now();
         mgr.apply_peer_observations(&observations, &aggregated, now);
+        let apply_first = wall.elapsed();
+        let wall = Instant::now();
+        mgr.apply_peer_observations(&observations, &aggregated, now + Duration::from_millis(500));
         let apply = wall.elapsed();
         let wall = Instant::now();
-        let (rates, tails) = mgr.collect_gossip_rates(now + Duration::from_millis(500));
+        let (rates, tails) = mgr.collect_gossip_rates(now + Duration::from_secs(1));
         let collect = wall.elapsed();
+        let rss_after = rss_kb();
         let publish_bytes: usize = rates
             .iter()
             .map(|(s, _)| "s:".len() + s.len() + "3.300".len())
             .sum();
 
         println!(
-            "{}: {} scopes ({} hot), {} B/scope RSS, create {:.0} ns/scope, sync tick: apply={:?} collect={:?}, publish set {} keys (~{} KB), tails {}",
+            "{}: {} scopes ({} hot), {} B/scope RSS, create {:.0} ns/scope, promote-pass {:?}, steady sync tick: apply={:?} collect={:?}, publish set {} keys (~{} KB), tails {}",
             name,
             mgr.num_scopes(),
             mgr.num_hot_scopes(),
             (rss_after.saturating_sub(rss_before)) * 1024 / N,
             create.as_nanos() as f64 / N as f64,
+            apply_first,
             apply,
             collect,
             rates.len(),
@@ -122,7 +126,6 @@ fn ablation_all_hot_memory_and_sync_cpu() {
         );
     }
 }
-
 #[test]
 #[ignore = "ablation measurement (~1s release); run with --ignored --nocapture"]
 fn ablation_wire_churn_with_delta_sync() {

@@ -77,12 +77,6 @@ pub struct ScopePattern {
     /// `tier::DEFAULT_DEMOTE_HOLD`.
     #[serde(default)]
     pub demote_hold_secs: Option<f64>,
-
-    /// Tail burst depth as a fraction of the limit (per-node bucket
-    /// capacity = `max(share, fraction × target_rate) × 1 s`, floored at
-    /// one token). Defaults to `tier::DEFAULT_TAIL_BURST_FRACTION`.
-    #[serde(default)]
-    pub tail_burst_fraction: Option<f64>,
 }
 
 #[cfg(feature = "server")]
@@ -106,7 +100,6 @@ impl ScopePattern {
             promote_utilization: None,
             demote_utilization: None,
             demote_hold_secs: None,
-            tail_burst_fraction: None,
         }
     }
 
@@ -129,9 +122,6 @@ impl ScopePattern {
                 .unwrap_or(defaults.demote_hold),
             gossip_budget,
             estimator_window: defaults.estimator_window,
-            tail_burst_fraction: self
-                .tail_burst_fraction
-                .unwrap_or(defaults.tail_burst_fraction),
         }
     }
 
@@ -322,8 +312,13 @@ pub struct RateLimitManager {
     /// (stamped by the sync loop; reporting/visibility only)
     cluster_tail_rates: HashMap<String, f64>,
 
-    /// Number of scopes currently in the hot tier (gossiped)
+    /// Number of scopes currently in the hot tier (engine coordination)
     hot_count: usize,
+
+    /// Tail scopes currently publishing their rate (locally warm — above
+    /// the watch watermark); pruned each sync. Their gossiped rates are
+    /// the peer evidence promotion requires.
+    watched: std::collections::HashSet<String>,
 
     /// Live peer count from the node-level gossip membership view, stamped
     /// by the sync loop each tick; tail scopes derive their equal share
@@ -380,6 +375,7 @@ impl RateLimitManager {
             tail_windows: vec![RateWindow::new(Instant::now())],
             cluster_tail_rates: HashMap::new(),
             hot_count: 0,
+            watched: std::collections::HashSet::new(),
             live_peers: 0,
             promotion_floor: 0.0,
             gossip_budget: TierConfig::default().gossip_budget,
@@ -519,18 +515,18 @@ impl RateLimitManager {
     fn create_promoted_limiter(
         &self,
         pattern: &ScopePattern,
-        share: f64,
+        initial_refill: f64,
         tail_tokens: f64,
         now: Instant,
     ) -> RateLimiter<f64> {
         // Carry the tail bucket's depth through the tier switch (floored
         // at one token like the adaptive allowance): promotion often
-        // fires mid-burst, and a share-sized fresh bucket would truncate
-        // the burst the tail tier had already granted
-        let capacity = tail_tokens.max(share).max(1.0);
+        // fires mid-burst, and a small fresh bucket would truncate the
+        // burst the tail tier had already granted
+        let capacity = tail_tokens.max(initial_refill).max(1.0);
         self.limiter_builder(pattern)
             .initial_timestamp(now)
-            .initial_refill_rate(share)
+            .initial_refill_rate(initial_refill)
             .initial_capacity(capacity)
             .initial_tokens_frac((tail_tokens / capacity).clamp(0.0, 1.0))
             .build()
@@ -542,10 +538,8 @@ impl RateLimitManager {
     fn create_entry(&self, pattern_idx: usize, now: Instant) -> ScopeEntry {
         let pattern = &self.patterns[pattern_idx];
         if pattern.distributed {
-            let share = pattern.target_rate / (1 + self.live_peers) as f64;
             let tier_cfg = pattern.tier_config(self.gossip_budget);
-            let capacity =
-                crate::gossip::tier::tail_capacity(share, pattern.target_rate, &tier_cfg);
+            let capacity = crate::gossip::tier::tail_capacity(pattern.target_rate);
             ScopeEntry::Tail {
                 tail: TailScope::new(now, capacity, tier_cfg.estimator_window),
                 pattern_idx,
@@ -570,72 +564,40 @@ impl RateLimitManager {
             self.scopes.insert(scope.to_string(), entry);
         }
 
-        // Tail tier: run the promotion test, then either promote into the
-        // hot tier (and fall through to the full-limiter path) or enforce
-        // the equal share locally
+        // Tail tier: enforce the FULL limit locally (a single-node user
+        // cannot exceed the limit through one bucket, so nothing below
+        // the limit is capped without evidence of multi-node activity —
+        // promotion happens in the sync pass, where peer observations
+        // live). Locally-warm scopes join the watched set so their rates
+        // gossip as promotion evidence.
         if let Some(&ScopeEntry::Tail { pattern_idx, .. }) = self.scopes.get(scope) {
             let pattern = &self.patterns[pattern_idx];
             let tier_cfg = pattern.tier_config(self.gossip_budget);
             let limit = pattern.target_rate;
             let num_nodes = 1 + self.live_peers;
-            let share = limit / num_nodes as f64;
+            let capacity = crate::gossip::tier::tail_capacity(limit);
+            let watch_floor = crate::gossip::tier::watch_threshold(limit, num_nodes, &tier_cfg);
 
-            let (promote, tail_tokens, local_rate_before) = {
-                let Some(ScopeEntry::Tail { tail, .. }) = self.scopes.get_mut(scope) else {
-                    unreachable!("checked above");
-                };
-                let local_rate = tail.local_rate(now);
-                let wants_promotion = should_promote(local_rate, num_nodes, limit, &tier_cfg);
-                // When the hot tier is at its budget, only scopes hotter
-                // than the current floor may promote (see promotion_floor)
-                let admitted = self.hot_count < self.gossip_budget
-                    || (local_rate * num_nodes as f64 / limit) >= self.promotion_floor;
-                (wants_promotion && admitted, tail.tokens(), local_rate)
+            let Some(ScopeEntry::Tail { tail, .. }) = self.scopes.get_mut(scope) else {
+                unreachable!("checked above");
             };
-
-            if promote {
-                let limiter = self.create_promoted_limiter(
-                    &self.patterns[pattern_idx],
-                    share,
-                    tail_tokens,
-                    now,
-                );
-                tracing::debug!(
-                    scope,
-                    local_rate = local_rate_before,
-                    num_nodes,
-                    "promoting scope to hot tier"
-                );
-                self.scopes.insert(
-                    scope.to_string(),
-                    ScopeEntry::Hot {
-                        limiter: Box::new(limiter),
-                        pattern_idx,
-                        demotion: DemotionTracker::default(),
-                    },
-                );
-                self.hot_count += 1;
-                // fall through to the full-limiter path below
-            } else {
-                let Some(ScopeEntry::Tail { tail, .. }) = self.scopes.get_mut(scope) else {
-                    unreachable!("checked above");
-                };
-                let capacity = crate::gossip::tier::tail_capacity(share, limit, &tier_cfg);
-                let admitted = tail.try_admit(now, share, capacity);
-                let local_accepted_rate = tail.local_rate(now);
-                if admitted {
-                    // Maintain the per-pattern tail aggregate incrementally
-                    // (a sync-time scan over the tail set would defeat the
-                    // compact-tier design)
-                    self.tail_windows[pattern_idx].record(now);
+            let admitted = tail.try_admit(now, limit, capacity);
+            let local_accepted_rate = tail.local_rate(now);
+            if admitted {
+                // Maintain the per-pattern tail aggregate incrementally
+                // (a sync-time scan over the tail set would defeat the
+                // compact-tier design)
+                self.tail_windows[pattern_idx].record(now);
+                if local_accepted_rate >= watch_floor {
+                    self.watched.insert(scope.to_string());
                 }
-                return ThrottleDecision {
-                    should_throttle: !admitted,
-                    local_accepted_rate,
-                    refill_rate: share,
-                    num_peers: self.live_peers,
-                };
             }
+            return ThrottleDecision {
+                should_throttle: !admitted,
+                local_accepted_rate,
+                refill_rate: limit,
+                num_peers: self.live_peers,
+            };
         }
 
         let (ScopeEntry::Local(limiter) | ScopeEntry::Hot { limiter, .. }) =
@@ -752,8 +714,10 @@ impl RateLimitManager {
                 let target = self.patterns[*pattern_idx].target_rate;
                 ScopeSnapshot {
                     target_rate: target,
+                    // Tail scopes are enforced at the full limit locally;
+                    // coordination engages only on peer evidence
+                    refill_rate: target,
                     local_accepted_rate: tail.local_rate_at(now),
-                    refill_rate: target / (1 + self.live_peers) as f64,
                     num_peers: self.live_peers,
                     external_rate: 0.0,
                     tier: "tail",
@@ -798,12 +762,12 @@ impl RateLimitManager {
         self.live_peers = aggregated.live_peers;
         self.cluster_tail_rates = aggregated.tail_rates.clone();
 
-        // 1. Peer-triggered promotion: a peer gossiping a scope we hold in
-        // the tail tier means the scope is hot somewhere — promote so our
-        // local rate joins the coordination round. Gated on the observed
-        // cluster rate clearing the *demotion* threshold: without the gate,
-        // staggered demotion flaps (node A demotes, node B's not-yet-
-        // removed key re-promotes A, and so on around the ring).
+        // 1. Evidence-based promotion: the observed cluster rate (local
+        // estimate + staleness-weighted peer sum) crosses the promotion
+        // threshold with nonzero peer evidence. Without peer evidence a
+        // scope stays tail no matter how hot locally — one full-limit
+        // bucket already caps it, and equal division would only crush a
+        // single-node user.
         let peer_scopes: Vec<String> = aggregated
             .scope_rates
             .keys()
@@ -815,23 +779,39 @@ impl RateLimitManager {
                 continue;
             };
             let pattern = &self.patterns[pattern_idx];
+            let limit = pattern.target_rate;
             let tier_cfg = pattern.tier_config(self.gossip_budget);
             let peer_rate = aggregated.scope_rates.get(&scope).copied().unwrap_or(0.0);
             let local_rate = match self.scopes.get(&scope) {
                 Some(ScopeEntry::Tail { tail, .. }) => tail.local_rate_at(now),
                 _ => 0.0,
             };
-            if peer_rate + local_rate < tier_cfg.demote_utilization * pattern.target_rate {
+            if !should_promote(local_rate, peer_rate, limit, &tier_cfg) {
                 continue;
             }
-            let share = self.patterns[pattern_idx].target_rate / (1 + self.live_peers) as f64;
+            // At the gossip budget, only scopes above the current floor
+            // may take a hot slot (prevents evict/promote thrash)
+            if self.hot_count >= self.gossip_budget
+                && (local_rate + peer_rate) / limit < self.promotion_floor
+            {
+                continue;
+            }
+            // Refill continuity: start at the measured local rate (at
+            // least the equal share); the engine adjusts from there
+            let refill0 = local_rate.max(limit / (1 + self.live_peers) as f64);
             let Some(ScopeEntry::Tail { tail, .. }) = self.scopes.get_mut(&scope) else {
                 continue;
             };
             let tokens = tail.tokens();
             let limiter =
-                self.create_promoted_limiter(&self.patterns[pattern_idx], share, tokens, now);
-            tracing::debug!(scope, "promoting scope to hot tier (gossiped by peer)");
+                self.create_promoted_limiter(&self.patterns[pattern_idx], refill0, tokens, now);
+            tracing::debug!(
+                scope,
+                local_rate,
+                peer_rate,
+                "promoting scope to hot tier (peer evidence)"
+            );
+            self.watched.remove(&scope);
             self.scopes.insert(
                 scope,
                 ScopeEntry::Hot {
@@ -958,11 +938,13 @@ impl RateLimitManager {
             return;
         };
         let pattern_idx = *pattern_idx;
-        let share = self.patterns[pattern_idx].target_rate / (1 + self.live_peers) as f64;
+        let limit = self.patterns[pattern_idx].target_rate;
         let est_window = self.patterns[pattern_idx]
             .tier_config(self.gossip_budget)
             .estimator_window;
-        let tokens = limiter.tokens().min(share);
+        let tokens = limiter
+            .tokens()
+            .min(crate::gossip::tier::tail_capacity(limit));
         tracing::debug!(scope, reason, "demoting scope to tail tier");
         self.scopes.insert(
             scope.to_string(),
@@ -984,7 +966,7 @@ impl RateLimitManager {
         &mut self,
         now: Instant,
     ) -> (Vec<(String, f64)>, Vec<(String, f64)>) {
-        let mut rates = Vec::with_capacity(self.hot_count);
+        let mut rates = Vec::with_capacity(self.hot_count + self.watched.len());
         for (name, entry) in self.scopes.iter_mut() {
             match entry {
                 ScopeEntry::Local(limiter) => {
@@ -995,6 +977,53 @@ impl RateLimitManager {
                     rates.push((name.clone(), limiter.local_accepted_request_rate()));
                 }
                 ScopeEntry::Tail { .. } => {}
+            }
+        }
+        // Watched tail scopes publish their rates as promotion evidence;
+        // prune the ones that cooled below the watermark or left the tier
+        let mut cooled: Vec<String> = Vec::new();
+        for name in &self.watched {
+            match self.scopes.get(name) {
+                Some(ScopeEntry::Tail { tail, pattern_idx }) => {
+                    let pattern = &self.patterns[*pattern_idx];
+                    let floor = crate::gossip::tier::watch_threshold(
+                        pattern.target_rate,
+                        1 + self.live_peers,
+                        &pattern.tier_config(self.gossip_budget),
+                    );
+                    let rate = tail.local_rate_at(now);
+                    if rate >= floor {
+                        rates.push((name.clone(), rate));
+                    } else {
+                        cooled.push(name.clone());
+                    }
+                }
+                _ => cooled.push(name.clone()),
+            }
+        }
+        for name in cooled {
+            self.watched.remove(&name);
+        }
+        // The gossip budget caps the whole published (hot + watched) set;
+        // watched entries rank by rate/limit and lose slots first
+        if rates.len() > self.gossip_budget {
+            let ranked: Vec<(String, f64)> = rates
+                .iter()
+                .map(|(name, rate)| {
+                    let limit = self.match_pattern(name).target_rate;
+                    (name.clone(), rate / limit.max(f64::MIN_POSITIVE))
+                })
+                .collect();
+            let dropped = budget_evictions(ranked, self.gossip_budget);
+            tracing::warn!(
+                dropped = dropped.len(),
+                budget = self.gossip_budget,
+                "gossip budget overflow: dropping lowest-rate published scopes"
+            );
+            let drop: std::collections::HashSet<&String> = dropped.iter().collect();
+            rates.retain(|(name, _)| !drop.contains(name));
+            for name in &dropped {
+                self.watched.remove(name);
             }
         }
         // One aggregate per active distributed pattern
@@ -1052,7 +1081,6 @@ mod tests {
             promote_utilization: None,
             demote_utilization: None,
             demote_hold_secs: None,
-            tail_burst_fraction: None,
         };
 
         assert_eq!(pattern.matches("api#premium"), PatternMatch::Exact);
@@ -1080,7 +1108,6 @@ mod tests {
             promote_utilization: None,
             demote_utilization: None,
             demote_hold_secs: None,
-            tail_burst_fraction: None,
         };
 
         assert_eq!(pattern.matches("api#premium"), PatternMatch::Wildcard);
@@ -1148,7 +1175,6 @@ mod tests {
             promote_utilization: None,
             demote_utilization: None,
             demote_hold_secs: None,
-            tail_burst_fraction: None,
         });
 
         manager.add_pattern(ScopePattern {
@@ -1168,7 +1194,6 @@ mod tests {
             promote_utilization: None,
             demote_utilization: None,
             demote_hold_secs: None,
-            tail_burst_fraction: None,
         });
 
         // Exact match should take priority
@@ -1209,7 +1234,6 @@ mod tests {
             promote_utilization: None,
             demote_utilization: None,
             demote_hold_secs: None,
-            tail_burst_fraction: None,
         });
 
         manager.add_pattern(ScopePattern {
@@ -1229,7 +1253,6 @@ mod tests {
             promote_utilization: None,
             demote_utilization: None,
             demote_hold_secs: None,
-            tail_burst_fraction: None,
         });
 
         // Most specific wildcard should match

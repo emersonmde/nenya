@@ -17,19 +17,27 @@
 //!    enforcement of the equal share `limit / num_nodes` is already accurate
 //!    for it.
 //!
-//! State machine per scope:
-//! - **Tail** (default): a compact token bucket enforcing the equal share,
-//!   plus a two-bucket sliding-window rate estimate for the promotion test.
-//!   No gossip state, no control engine.
-//! - **Hot**: a full `RateLimiter` with a control engine, published via
-//!   gossip exactly like every scope was before Milestone 6. Entered when
-//!   the estimated cluster utilization crosses `promote_utilization`, or
-//!   when a peer starts gossiping the scope (coordination only works if all
-//!   nodes carrying the scope publish their local rates). Left when the
-//!   *observed* cluster rate (local + decayed peer sum) stays below
-//!   `demote_utilization` for `demote_hold` (hysteresis), or when the
-//!   per-node gossip budget K overflows and this scope has the lowest
-//!   utilization (logged, never silent).
+//! State machine per scope (evidence-based, not assumption-based: a scope
+//! is only capped below the full limit once gossip *shows* multi-node
+//! activity — a single-node user cannot exceed the limit through one
+//! bucket, so coordination without peer evidence would only hurt them):
+//! - **Tail** (default): a compact token bucket enforcing the FULL limit
+//!   locally, plus a two-bucket sliding-window rate estimate. No gossip
+//!   state, no control engine. Bounded contribution: a silent node stays
+//!   below the watch watermark.
+//! - **Watched** (still tail-enforced): once the local rate crosses
+//!   [`watch_threshold`] (`demote_utilization × limit / n`), the node
+//!   publishes the scope's rate — bytes only, no engine. This is how
+//!   spread activity becomes visible.
+//! - **Hot**: a full `RateLimiter` with a control engine. Entered only on
+//!   evidence: `local + Σ peer rates ≥ promote_utilization × limit` with
+//!   a nonzero peer contribution. Left when the observed cluster rate
+//!   stays below `demote_utilization × limit` for `demote_hold`
+//!   (hysteresis), or on gossip-budget eviction (logged, never silent).
+//!
+//! Worst case for an unpromoted scope: one node serving the full limit
+//! plus `n − 1` silent nodes each below the watermark — cluster rate
+//! `< limit × (1 + demote_utilization)`, independent of cluster size.
 
 use std::time::{Duration, Instant};
 
@@ -38,28 +46,30 @@ use std::time::{Duration, Instant};
 /// continuous across the tier switch; not an independent tunable.
 pub const TAIL_WINDOW: Duration = Duration::from_secs(1);
 
-/// Default promotion threshold (fraction of estimated cluster utilization).
+/// Default promotion threshold (fraction of the limit that the observed
+/// cluster rate — local + staleness-weighted peer sum — must reach, with
+/// nonzero peer evidence, before a scope is promoted into engine
+/// coordination).
 ///
-/// Simulator-derived (Milestone 6.4 sweep, `--ignored` test
-/// `tier_threshold_sweep` in tests/simulation.rs, seed 42; tables published
-/// in docs/capacity-model.md). Key finding: the expected promoted-set-size
-/// vs. worst-case-overage knee does not exist — per-user overage is
-/// structurally absent at every threshold in {0.3..0.8} (an unpromoted
-/// scope is capped at `limit / n` per node, so its cluster total cannot
-/// exceed the limit; skew triggers promotion on the hot node), and the
-/// ramp transient is flat (~1.6 × limit worst 1 s window) beyond 0.3. The
-/// threshold therefore only trades promoted-set size (35 → 7 scopes per
-/// 100k Zipf users across the sweep) against coordination headroom — how
-/// far below the limit a ramping user is already under engine control.
-/// 0.5 keeps 2× headroom at 17 promoted per 100k users; raising it toward
-/// 0.8 halves the hot set with no measured downside in these scenarios.
+/// Simulator-derived (`tier_threshold_sweep`, seed 42; tables in
+/// docs/capacity-model.md). Overage is structurally bounded at every
+/// threshold in {0.3..0.8} — an unpromoted scope is capped at the full
+/// limit by its busiest node's bucket plus `n − 1` silent nodes below the
+/// watch watermark (`< limit × (1 + demote_utilization)` total) — so the
+/// threshold only trades promoted-set size (24 → 7 per 100k Zipf users
+/// across the sweep) against coordination headroom before the limit.
+/// 0.5 keeps 2× headroom at 13 promoted per 100k users.
 pub const DEFAULT_PROMOTE_UTILIZATION: f64 = 0.5;
 
-/// Default demotion threshold. From the same sweep (flap axis): the
-/// highest value with zero measured flapping — a user parked exactly at
-/// the demotion boundary for 300 s produces 3 promotion events (exactly
-/// one per node) at 0.25, versus 12 at 0.35 and 23 at 0.45. Higher is
-/// better for hot-set shedding, so 0.25 is the knee.
+/// Default demotion threshold — doubles as the watch watermark divisor
+/// (see [`watch_threshold`]) and therefore also sets the unpromoted
+/// overage bound `limit × (1 + demote_utilization)`.
+///
+/// From the flap axis of the sweep (seed 42): a user parked at the
+/// demotion boundary for 300 s produces 0 promotions at 0.25 (3 — one
+/// per node — just above it), versus 6 at 0.35 and 15–18 at 0.45.
+/// Higher is better for hot-set shedding and a tighter unpromoted bound
+/// would want it *lower*, so 0.25 balances the two.
 pub const DEFAULT_DEMOTE_UTILIZATION: f64 = 0.25;
 
 /// Default demotion hold (hysteresis). Must exceed the full round-trip of
@@ -84,39 +94,15 @@ pub const DEFAULT_SCOPE_TTL: Duration = Duration::from_secs(60);
 
 /// Default promotion-estimator window (see `TierConfig::estimator_window`).
 ///
-/// Simulator-derived (Milestone 6.4 sweep, seed 42): at sparse rates the
-/// promotion threshold is only a handful of requests per window, so short
-/// windows read Poisson clumps as sustained rates — a 1 s window promotes
-/// 78 scopes per 100k Zipf users (~10 truly over threshold) and promotes a
-/// 2 rps user 29 s before it ever ramps. 8 s is the first window with no
-/// spurious promotion of the sub-threshold phase (17 promoted, 1.0 s
-/// promotion lag); 12/16 s shave only 2–4 more scopes while adding 1.5–2 s
-/// of lag.
+/// Simulator-derived (seed 42): short windows read Poisson clumps at
+/// sparse rates as sustained load — a 1 s window watches/promotes 41
+/// scopes per 100k Zipf users (~10 truly over threshold) and flags a
+/// 2 rps user 20 s before it ever ramps; 8 s promotes 13 with a 1.0 s
+/// promotion lag, and wider windows shave 1–2 scopes for ~0.5 s more
+/// lag. The peer-evidence gate makes promotion much less noise-sensitive
+/// than the pre-evidence design, but the window still bounds spurious
+/// *watching* (wasted gossip bytes).
 pub const DEFAULT_TAIL_ESTIMATOR_WINDOW: Duration = Duration::from_secs(8);
-
-/// Default tail burst depth as a fraction of the limit (per-node bucket
-/// capacity = `max(share, tail_burst_fraction × limit) × 1 s`, floored at
-/// one token — the floor removes the sub-token starvation edge on
-/// clusters larger than the per-user rps limit).
-///
-/// Simulator-derived (`tier_threshold_sweep` axis 4, seed 42; tables in
-/// docs/capacity-model.md). Depth doesn't change long-run admission
-/// (refill stays at the fair share; deeper buckets refill proportionally
-/// slower) or steady per-user overage (flat at every fraction) — it
-/// trades how much of a *concentrated* burst one node absorbs
-/// (`fraction × limit`) against the worst-case cold-bucket spike for a
-/// synchronized, perfectly spread burst (`n × fraction × limit` per
-/// scope, at most once per bucket-refill period). 0.5 admits half a
-/// page-load-style burst through one node, keeps the service-pattern
-/// join burst inside the Milestone 5 budget (autoscale 2698 vs the 4000
-/// ceiling; 1.0 measures 2793), and matches the promotion threshold —
-/// one node absorbs bursts up to the utilization level at which
-/// coordination takes over, and a burst big enough to trip promotion
-/// carries its remaining tail tokens into the promoted limiter instead
-/// of being truncated. Per-user-focused deployments can raise it to 1.0
-/// for full Redis-style per-user burst semantics; DDoS-sensitive ones
-/// can lower it toward 0.
-pub const DEFAULT_TAIL_BURST_FRACTION: f64 = 0.5;
 
 /// Default per-node cap on gossiped scopes. Bounds the per-link gossip
 /// payload at `K × bytes_per_scope × 2/s` regardless of user count (see
@@ -149,16 +135,6 @@ pub struct TierConfig {
     /// reads two clumped arrivals as 2 rps and spuriously promotes users
     /// far below their limit). Sweep-derived default.
     pub estimator_window: Duration,
-
-    /// Tail burst depth as a fraction of the limit: per-node bucket
-    /// capacity is `max(share, tail_burst_fraction × limit) × 1 s`,
-    /// floored at one token. Refill stays at the fair share, so this
-    /// trades *concentrated*-burst tolerance (a client bursting through
-    /// one node) against the worst-case cold-bucket spike
-    /// (`n × capacity` for a perfectly spread synchronized burst); the
-    /// long-run admission volume is depth-independent. Sweep-derived
-    /// default.
-    pub tail_burst_fraction: f64,
 }
 
 impl Default for TierConfig {
@@ -169,7 +145,6 @@ impl Default for TierConfig {
             demote_hold: DEFAULT_DEMOTE_HOLD,
             gossip_budget: DEFAULT_GOSSIP_BUDGET,
             estimator_window: DEFAULT_TAIL_ESTIMATOR_WINDOW,
-            tail_burst_fraction: DEFAULT_TAIL_BURST_FRACTION,
         }
     }
 }
@@ -197,12 +172,6 @@ impl TierConfig {
         }
         if self.estimator_window.is_zero() {
             return Err("estimator_window must be positive".to_string());
-        }
-        if !(0.0..=1.0).contains(&self.tail_burst_fraction) {
-            return Err(format!(
-                "tail_burst_fraction must be in [0, 1], got {}",
-                self.tail_burst_fraction
-            ));
         }
         Ok(())
     }
@@ -365,22 +334,35 @@ impl TailScope {
     }
 }
 
-/// Per-node tail bucket capacity in tokens: one second of the greater of
-/// the fair share and the configured burst fraction of the limit, floored
-/// at one token so a bucket can always eventually admit (see
-/// [`DEFAULT_TAIL_BURST_FRACTION`] for the starvation edge this floor
-/// removes).
-pub fn tail_capacity(share: f64, limit: f64, cfg: &TierConfig) -> f64 {
-    (share.max(cfg.tail_burst_fraction * limit) * TAIL_WINDOW.as_secs_f64()).max(1.0)
+/// Per-node tail bucket capacity in tokens: one second at the FULL limit
+/// (an unpromoted scope is allowed its entire limit through one node —
+/// evidence of multi-node activity, not an assumption about routing, is
+/// what engages coordination), floored at one token so a bucket can
+/// always eventually admit.
+pub fn tail_capacity(limit: f64) -> f64 {
+    (limit * TAIL_WINDOW.as_secs_f64()).max(1.0)
 }
 
-/// Should a tail scope be promoted into gossip coordination?
+/// Local-rate watermark above which a tail scope's rate is published
+/// (watched): `demote_utilization × limit / num_nodes`. Publishing costs
+/// bytes, not enforcement, so the watermark is deliberately low — it is
+/// what bounds an unpromoted scope's cluster rate at
+/// `limit × (1 + demote_utilization)`: one node at the full limit plus
+/// `n − 1` silent nodes each below this watermark. Reuses
+/// `demote_utilization` so no separate constant exists to tune.
+pub fn watch_threshold(limit: f64, num_nodes: usize, cfg: &TierConfig) -> f64 {
+    cfg.demote_utilization * limit / num_nodes.max(1) as f64
+}
+
+/// Should a scope be promoted into engine coordination?
 ///
-/// `local_rate × num_nodes` estimates the scope's cluster-wide rate under
-/// the uniform-routing assumption; routing skew only *over*-estimates on the
-/// hot node, which promotes earlier — conservative in the right direction.
-pub fn should_promote(local_rate: f64, num_nodes: usize, limit: f64, cfg: &TierConfig) -> bool {
-    local_rate * num_nodes.max(1) as f64 >= cfg.promote_utilization * limit
+/// Evidence-based: the observed cluster rate (local + staleness-weighted
+/// peer sum) must cross the promotion threshold AND some of it must come
+/// from other nodes. A single-node user cannot exceed the limit through
+/// one bucket, so promotion without peer evidence would only re-divide a
+/// limit they already respect (and equal division would crush them).
+pub fn should_promote(local_rate: f64, peer_rate: f64, limit: f64, cfg: &TierConfig) -> bool {
+    peer_rate > 0.0 && local_rate + peer_rate >= cfg.promote_utilization * limit
 }
 
 /// Demotion hysteresis: tracks how long a hot scope's *observed* cluster
@@ -512,50 +494,34 @@ mod tests {
     }
 
     #[test]
-    fn test_tail_capacity_floor_prevents_starvation() {
-        // Sub-token shares (cluster larger than the per-user limit) must
-        // still be admissible: capacity floors at one token
-        let cfg = TierConfig {
-            tail_burst_fraction: 0.0,
-            ..TierConfig::default()
-        };
-        let share = 0.2; // limit 10, 50 nodes
-        let capacity = tail_capacity(share, 10.0, &cfg);
-        assert!(capacity >= 1.0, "capacity {} below one token", capacity);
-
-        let start = Instant::now();
-        let mut tail = TailScope::new(start, capacity, TAIL_WINDOW);
-        assert!(
-            tail.try_admit(start, share, capacity),
-            "a fresh sub-token-share bucket must admit its first request"
-        );
-        // And keeps admitting at the share rate: one token every 5s
-        assert!(!tail.try_admit(start + Duration::from_secs(1), share, capacity));
-        assert!(tail.try_admit(start + Duration::from_secs(6), share, capacity));
+    fn test_tail_capacity_full_limit_with_token_floor() {
+        assert_eq!(tail_capacity(10.0), 10.0);
+        assert_eq!(tail_capacity(300.0), 300.0);
+        // Sub-token limits still floor at one token so admission is possible
+        assert_eq!(tail_capacity(0.2), 1.0);
     }
 
     #[test]
-    fn test_tail_capacity_burst_fraction() {
-        let cfg = TierConfig::default(); // tail_burst_fraction 0.5
-                                         // Large cluster: fraction of the limit dominates the share
-        assert_eq!(tail_capacity(0.4, 10.0, &cfg), 5.0);
-        // Small cluster: the share dominates
-        assert_eq!(tail_capacity(100.0, 300.0, &cfg), 150.0);
-        assert_eq!(tail_capacity(200.0, 300.0, &cfg), 200.0);
+    fn test_watch_threshold_scales_with_nodes() {
+        let c = cfg(); // demote 0.25
+        assert!((watch_threshold(10.0, 5, &c) - 0.5).abs() < 1e-12);
+        assert!((watch_threshold(10.0, 25, &c) - 0.1).abs() < 1e-12);
+        // Defensive: zero nodes treated as one
+        assert!((watch_threshold(10.0, 0, &c) - 2.5).abs() < 1e-12);
     }
 
     #[test]
-    fn test_promotion_threshold() {
+    fn test_promotion_requires_peer_evidence() {
         let c = cfg();
-        let limit = 300.0;
-        // 3 nodes: promote at local ≥ 0.5 × 300 / 3 = 50
-        assert!(!should_promote(49.9, 3, limit, &c));
-        assert!(should_promote(50.0, 3, limit, &c));
-        // Single node (no peers yet): promote at 150
-        assert!(!should_promote(149.0, 1, limit, &c));
-        assert!(should_promote(150.0, 1, limit, &c));
-        // num_nodes 0 treated as 1 (defensive)
-        assert!(should_promote(150.0, 0, limit, &c));
+        let limit = 10.0;
+        // A single-node user at (or over) the threshold with no peer
+        // evidence must NOT promote — one bucket already caps them
+        assert!(!should_promote(9.0, 0.0, limit, &c));
+        // Combined evidence over the threshold with peer contribution → promote
+        assert!(should_promote(3.0, 2.0, limit, &c));
+        assert!(should_promote(0.5, 4.5, limit, &c));
+        // Combined below the threshold: no promotion even with evidence
+        assert!(!should_promote(2.0, 2.9, limit, &c));
     }
 
     #[test]

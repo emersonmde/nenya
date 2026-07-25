@@ -26,7 +26,8 @@ no coordinator.
 
 1. **[`docs/roadmap.md`](docs/roadmap.md)** — check the "Current Milestone" section; this drives all work
 2. **[`docs/architecture.md`](docs/architecture.md)** — design details; each section is marked Implemented or Planned
-3. This file — commands, structure, conventions
+3. **[`docs/tuning.md`](docs/tuning.md)** — operator-facing configuration guidance (keep it free of internal algorithm knobs)
+4. This file — commands, structure, conventions
 
 **Current milestone: 7 — Client SDKs & API Stabilization.**
 Stabilize the HTTP API (OpenAPI spec, versioning), then thin fail-open SDKs
@@ -139,9 +140,10 @@ nenya-sentinel/         # Deprecation stub only — the binary is now `nenya` it
 
 **Server** (feature `server`):
 - `api::RateLimitManager`: tiered scope map (`local` non-distributed /
-  `tail` compact equal-share / `hot` full limiter + gossip), scopes
+  `tail` compact full-limit bucket / `hot` full limiter + gossip), scopes
   auto-created via pattern match (exact > most specific wildcard > `*`
-  default); distributed scopes start tail and promote per `gossip::tier`
+  default); distributed scopes start tail and promote on peer evidence
+  per `gossip::tier`
 - `gossip::gossip_sync_loop`: every 500ms — aggregate peer observations,
   run tier maintenance (peer-triggered promotion, demotion hysteresis,
   budget eviction, TTL sweep), publish hot-scope keys + per-pattern tail
@@ -165,13 +167,14 @@ nenya-sentinel/         # Deprecation stub only — the binary is now `nenya` it
 - **Simulation before tuning**: control-loop changes (gains, engines, gossip
   parameters) must be evaluated in the deterministic simulator (Milestone 4)
   before shipping; don't hand-tune against real clusters
-- **Two-tier coordination for per-user scale (Milestone 6, implemented)**:
-  gossip only scopes near their limit (promotion at sweep-derived 50%
-  estimated cluster utilization via `local_rate × num_peers` over an 8s
-  estimator window); the heavy-tailed remainder is enforced locally at
-  `limit / num_peers` with compact state (~360 B/scope measured at 1M).
-  Per-user throttling at millions of users is the primary use case — never
-  assume all scopes gossip
+- **Two-tier coordination for per-user scale (Milestone 6, implemented;
+  evidence-based)**: tail scopes are enforced at the FULL limit locally
+  with compact state (~360 B/scope at 1M); locally-warm scopes publish
+  their rates (watch watermark `demote × limit / n`); engine coordination
+  engages only when local + peer-observed rates cross the promotion
+  threshold with nonzero peer evidence. Single-node (sticky) users never
+  promote — one bucket already caps them. Unpromoted bound:
+  `limit × (1 + demote_utilization)`. Never assume all scopes gossip
 - **Transport-agnostic coordination**: gossip is one transport for the core
   loop (local enforcement + periodic rate sharing + feedback control). The
   serverless analog is a blackboard store (DynamoDB/ElastiCache/Durable

@@ -133,12 +133,25 @@ mod tests {
         pattern.distributed = true;
         mgr.set_default_pattern(pattern);
 
-        // Drive enough accepted traffic inside one estimator window (8s)
-        // to cross the promotion threshold (0.5 × 100 rps with no peers)
+        // Promotion is evidence-based: drive some local traffic, then
+        // feed a fabricated peer observation so the combined rate crosses
+        // the promotion threshold and the scope goes hot
         let start = std::time::Instant::now();
         for i in 0..600 {
             mgr.should_throttle_at("test-scope", start + Duration::from_millis(i * 10));
         }
+        let evidence = vec![crate::gossip::aggregate::PeerObservation {
+            node_id: "peer-1".to_string(),
+            age: Duration::from_millis(100),
+            scope_rates: [("test-scope".to_string(), 60.0)].into_iter().collect(),
+            tail_rates: Default::default(),
+        }];
+        let aggregated = crate::gossip::aggregate::aggregate_peer_rates(
+            &evidence,
+            Duration::from_millis(500),
+            Duration::from_secs(10),
+        );
+        mgr.apply_peer_observations(&evidence, &aggregated, start + Duration::from_secs(6));
         assert_eq!(mgr.scope_tier("test-scope"), Some("hot"));
 
         mgr.get_limiter_mut("test-scope")

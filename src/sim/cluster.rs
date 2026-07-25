@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use crate::engine::{BayesianEngine, EngineKind, HybridEngine, PeerRate, PidEngine};
 use crate::gossip::aggregate::{aggregate_peer_rates, PeerObservation};
 use crate::gossip::tier::{
-    budget_evictions, should_promote, tail_capacity, DemotionTracker, RateWindow, TailScope,
-    TierConfig,
+    budget_evictions, should_promote, tail_capacity, watch_threshold, DemotionTracker, RateWindow,
+    TailScope, TierConfig,
 };
 use crate::pid_controller::PIDControllerBuilder;
 use crate::{RateLimiter, RateLimiterBuilder};
@@ -246,6 +246,9 @@ struct SimNode {
     tail_window: RateWindow,
     /// Trailing accepted rate across all scopes (LeastLoaded routing input)
     accept_window: RateWindow,
+    /// Tail scopes currently publishing their rate (locally warm — above
+    /// the watch watermark); pruned each sync
+    watched: std::collections::BTreeSet<String>,
     /// Sim time of the last idle-scope TTL sweep
     last_ttl_sweep: Duration,
     /// Fractional-arrival accumulator per scope (deterministic arrivals)
@@ -368,6 +371,7 @@ impl SimCluster {
                 promotion_floor: 0.0,
                 tail_window: RateWindow::new(start),
                 accept_window: RateWindow::new(start),
+                watched: std::collections::BTreeSet::new(),
                 last_ttl_sweep: Duration::ZERO,
                 accum: BTreeMap::new(),
                 rng: root_rng.fork(),
@@ -486,6 +490,7 @@ impl SimCluster {
                 node.live_peers = 0;
                 node.hot_count = 0;
                 node.promotion_floor = 0.0;
+                node.watched.clear();
                 node.tail_window = RateWindow::new(now);
             }
             SimEvent::NodeUp(i) => {
@@ -500,6 +505,7 @@ impl SimCluster {
                 node.live_peers = 0;
                 node.hot_count = 0;
                 node.promotion_floor = 0.0;
+                node.watched.clear();
                 node.tail_window = RateWindow::new(now);
             }
             SimEvent::Partition(groups) => {
@@ -614,10 +620,6 @@ impl SimCluster {
                     counts.offered += 1;
                     *self.scope_offered.entry(scope.clone()).or_default() += 1;
                     let outcome = admit_one(&self.cfg, node, &scope, now);
-                    if outcome.promoted {
-                        self.ever_hot.insert(scope.clone());
-                        *self.promotion_count.entry(scope.clone()).or_default() += 1;
-                    }
                     if outcome.admitted {
                         counts.accepted += 1;
                         counts.per_node_accepted[i] += 1;
@@ -679,10 +681,6 @@ impl SimCluster {
                     *self.scope_offered.entry(scope.clone()).or_default() += 1;
                     let node = &mut self.nodes[node_idx];
                     let outcome = admit_one(&self.cfg, node, &scope, now);
-                    if outcome.promoted {
-                        self.ever_hot.insert(scope.clone());
-                        *self.promotion_count.entry(scope.clone()).or_default() += 1;
-                    }
                     if outcome.admitted {
                         counts.accepted += 1;
                         counts.per_node_accepted[node_idx] += 1;
@@ -732,20 +730,30 @@ impl SimCluster {
             node.live_peers = aggregated.live_peers;
             let share = limit / (1 + node.live_peers) as f64;
 
-            // Step 2: peer-triggered promotion — a peer gossiping a scope we
-            // hold in the tail tier means it is hot somewhere; our local rate
-            // must join the coordination round
+            // Step 2: evidence-based promotion — the observed cluster rate
+            // (local estimate + staleness-weighted peer sum) crosses the
+            // promotion threshold with nonzero peer evidence. A scope with
+            // no peer evidence stays tail no matter how hot locally: one
+            // full-limit bucket already caps it.
             for scope in aggregated.scope_rates.keys() {
                 if let Some(SimScope::Tail { tail }) = node.scopes.get_mut(scope) {
-                    // Gate on the demotion threshold (mirrors the server):
-                    // a dying scope's not-yet-removed peer key must not
-                    // re-promote it during staggered demotion
                     let peer_rate = aggregated.scope_rates.get(scope).copied().unwrap_or(0.0);
-                    if peer_rate + tail.local_rate_at(now) < tier_cfg.demote_utilization * limit {
+                    let local_rate = tail.local_rate_at(now);
+                    if !should_promote(local_rate, peer_rate, limit, &tier_cfg) {
+                        continue;
+                    }
+                    let combined = local_rate + peer_rate;
+                    if node.hot_count >= tier_cfg.gossip_budget
+                        && combined / limit < node.promotion_floor
+                    {
                         continue;
                     }
                     let tokens = tail.tokens();
-                    let limiter = make_hot_limiter(&self.cfg, now, share, tokens);
+                    // Refill continuity: start at the measured local rate
+                    // (at least the equal share); the engine adjusts from
+                    // there
+                    let refill0 = local_rate.max(share);
+                    let limiter = make_hot_limiter(&self.cfg, now, refill0, tokens);
                     node.scopes.insert(
                         scope.clone(),
                         SimScope::Hot {
@@ -753,6 +761,7 @@ impl SimCluster {
                             demotion: DemotionTracker::default(),
                         },
                     );
+                    node.watched.remove(scope);
                     node.hot_count += 1;
                     self.ever_hot.insert(scope.clone());
                     *self.promotion_count.entry(scope.clone()).or_default() += 1;
@@ -791,7 +800,7 @@ impl SimCluster {
                 }
             }
             for scope in &demote {
-                demote_sim_scope(node, scope, share, now, tier_cfg.estimator_window);
+                demote_sim_scope(node, scope, limit, now, tier_cfg.estimator_window);
             }
 
             // Step 4: gossip budget — evict lowest-utilization hot scopes
@@ -800,7 +809,7 @@ impl SimCluster {
                 let evicted: std::collections::HashSet<&String> = evictions.iter().collect();
                 utilizations.retain(|(name, _)| !evicted.contains(name));
                 for scope in &evictions {
-                    demote_sim_scope(node, scope, share, now, tier_cfg.estimator_window);
+                    demote_sim_scope(node, scope, limit, now, tier_cfg.estimator_window);
                 }
             }
             node.promotion_floor = if node.hot_count >= tier_cfg.gossip_budget {
@@ -830,12 +839,37 @@ impl SimCluster {
                 });
             }
 
-            // Step 5: refresh and collect hot-tier rates for publishing
+            // Step 5: refresh and collect the publish set — hot scopes
+            // plus watched tail scopes (locally warm; their rates are the
+            // evidence peers promote on). Watched entries that cooled
+            // below the watermark or left the tail tier are pruned.
             let mut local_rates = HashMap::new();
             for (scope, entry) in node.scopes.iter_mut() {
                 if let SimScope::Hot { limiter, .. } = entry {
                     limiter.update_state_at(now);
                     local_rates.insert(scope.clone(), limiter.local_accepted_request_rate());
+                }
+            }
+            let watch_floor = watch_threshold(limit, 1 + node.live_peers, &tier_cfg);
+            let scopes = &node.scopes;
+            node.watched.retain(|scope| match scopes.get(scope) {
+                Some(SimScope::Tail { tail }) => tail.local_rate_at(now) >= watch_floor,
+                _ => false,
+            });
+            for scope in &node.watched {
+                if let Some(SimScope::Tail { tail }) = node.scopes.get(scope) {
+                    local_rates.insert(scope.clone(), tail.local_rate_at(now));
+                }
+            }
+            // Gossip budget also caps the published (hot + watched) set
+            if local_rates.len() > tier_cfg.gossip_budget {
+                let ranked: Vec<(String, f64)> = local_rates
+                    .iter()
+                    .map(|(scope, rate)| (scope.clone(), rate / limit))
+                    .collect();
+                for scope in budget_evictions(ranked, tier_cfg.gossip_budget) {
+                    local_rates.remove(&scope);
+                    node.watched.remove(&scope);
                 }
             }
             (local_rates, node.tail_window.rate(now))
@@ -894,82 +928,56 @@ impl SimCluster {
 /// Outcome of one admission attempt.
 struct AdmitOutcome {
     admitted: bool,
-    /// The scope was promoted to the hot tier by this request
-    promoted: bool,
 }
 
 /// Admit one request on a node through its tiered scope entry,
-/// auto-creating the scope in the tail tier and running the promotion test
-/// exactly as the server's `RateLimitManager::should_throttle_at` does.
+/// auto-creating the scope in the tail tier, exactly as the server's
+/// `RateLimitManager::should_throttle_at` does. Tail scopes are enforced
+/// at the FULL limit; promotion is evidence-based and happens only in the
+/// sync pass (it needs peer observations).
 fn admit_one(cfg: &SimConfig, node: &mut SimNode, scope: &str, now: Instant) -> AdmitOutcome {
     let limit = cfg.cluster_target;
     let num_nodes = 1 + node.live_peers;
-    let share = limit / num_nodes as f64;
 
     if !node.scopes.contains_key(scope) {
-        let capacity = tail_capacity(share, limit, &cfg.tier);
         node.scopes.insert(
             scope.to_string(),
             SimScope::Tail {
-                tail: TailScope::new(now, capacity, cfg.tier.estimator_window),
+                tail: TailScope::new(now, tail_capacity(limit), cfg.tier.estimator_window),
             },
         );
     }
 
-    let promote_tokens = match node.scopes.get_mut(scope).expect("just inserted") {
+    let admitted = match node.scopes.get_mut(scope).expect("just inserted") {
         SimScope::Tail { tail } => {
-            let local_rate = tail.local_rate(now);
-            let wants = should_promote(local_rate, num_nodes, limit, &cfg.tier);
-            let admitted = node.hot_count < cfg.tier.gossip_budget
-                || (local_rate * num_nodes as f64 / limit) >= node.promotion_floor;
-            if wants && admitted {
-                Some(tail.tokens())
-            } else {
-                None
-            }
-        }
-        SimScope::Hot { .. } => None,
-    };
-
-    if let Some(tokens) = promote_tokens {
-        let limiter = make_hot_limiter(cfg, now, share, tokens);
-        node.scopes.insert(
-            scope.to_string(),
-            SimScope::Hot {
-                limiter: Box::new(limiter),
-                demotion: DemotionTracker::default(),
-            },
-        );
-        node.hot_count += 1;
-    }
-
-    let promoted = promote_tokens.is_some();
-    let admitted = match node.scopes.get_mut(scope).expect("entry exists") {
-        SimScope::Tail { tail } => {
-            let capacity = tail_capacity(share, limit, &cfg.tier);
-            let admitted = tail.try_admit(now, share, capacity);
+            let admitted = tail.try_admit(now, limit, tail_capacity(limit));
             if admitted {
                 node.tail_window.record(now);
+                // Watch: a locally-warm tail scope publishes its rate so
+                // spread activity becomes visible cluster-wide
+                if tail.local_rate(now) >= watch_threshold(limit, num_nodes, &cfg.tier) {
+                    node.watched.insert(scope.to_string());
+                }
             }
             admitted
         }
         SimScope::Hot { limiter, .. } => !limiter.should_throttle_at(now),
     };
-    AdmitOutcome { admitted, promoted }
+    AdmitOutcome { admitted }
 }
 
 /// Demote a hot sim scope back to the tail tier, carrying its token balance
 fn demote_sim_scope(
     node: &mut SimNode,
     scope: &str,
-    share: f64,
+    limit: f64,
     now: Instant,
     estimator_window: Duration,
 ) {
     let Some(SimScope::Hot { limiter, .. }) = node.scopes.get(scope) else {
         return;
     };
-    let tokens = limiter.tokens().min(share);
+    let tokens = limiter.tokens().min(tail_capacity(limit));
     node.scopes.insert(
         scope.to_string(),
         SimScope::Tail {
