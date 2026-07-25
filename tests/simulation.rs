@@ -217,6 +217,143 @@ fn test_scale_sweep_small() {
     }
 }
 
+#[test]
+fn test_autoscale_absorbs_rapid_joins() {
+    let r = scenario::autoscale().run(SEED);
+
+    // Each joining node cold-starts with a full cluster-target-sized bucket
+    // and admits a burst (~250 excess requests/join measured — see the
+    // cold-start fair-share roadmap item). Bound the total; tighten this
+    // when cold-start initialization is fixed.
+    assert!(
+        r.summary.integrated_overshoot < 12_000.0,
+        "autoscale overshoot {:.0} exceeds join-burst budget",
+        r.summary.integrated_overshoot
+    );
+
+    // After the last join (t=57s) the 30-node cluster must settle
+    let converge = convergence_after(&r, "node29_up").expect("must converge after final join");
+    assert!(
+        converge <= 30.0,
+        "post-scale-up convergence took {:.1}s",
+        converge
+    );
+
+    let mean = steady_mean(&r);
+    assert!(
+        (mean - r.target).abs() <= r.target * 0.05,
+        "steady mean {:.1} outside band after scale-up",
+        mean
+    );
+}
+
+#[test]
+fn test_mass_outage_recovers_like_single_leave() {
+    let r = scenario::mass_outage().run(SEED);
+
+    // Staleness decay runs per-peer in parallel: losing 5 of 10 nodes at
+    // once must recover on the same stale_timeout + settle budget as a
+    // single leave (measured 12.5s)
+    let converge = convergence_after(&r, "node9_down").expect("must re-converge after mass outage");
+    assert!(
+        converge <= 20.0,
+        "mass-outage re-convergence took {:.1}s",
+        converge
+    );
+
+    let mean = steady_mean(&r);
+    assert!((mean - r.target).abs() <= r.target * 0.05);
+}
+
+#[test]
+fn test_lossy_network_stays_stable() {
+    let r = scenario::lossy().run(SEED);
+
+    // 30% gossip loss must not visibly degrade control: the PID's feedback
+    // signal is the local rate, so loss only delays membership awareness
+    let converge = convergence_after(&r, "start").expect("must converge under loss");
+    assert!(
+        converge <= 10.0,
+        "convergence took {:.1}s at 30% loss",
+        converge
+    );
+
+    let mean = steady_mean(&r);
+    assert!((mean - r.target).abs() <= r.target * 0.05);
+    assert!(
+        r.summary.integrated_overshoot < 2_500.0,
+        "loss inflated overshoot to {:.0}",
+        r.summary.integrated_overshoot
+    );
+}
+
+#[test]
+fn test_high_gossip_lag_stays_stable() {
+    let r = scenario::laggy().run(SEED);
+
+    // 2s ± 1s gossip lag (4 sync intervals): the documented claim is that
+    // the conservative gains tolerate this; measured cost is ~1s slower
+    // initial convergence and no oscillation
+    let converge = convergence_after(&r, "start").expect("must converge under lag");
+    assert!(
+        converge <= 12.0,
+        "convergence took {:.1}s at 2s lag",
+        converge
+    );
+
+    let mean = steady_mean(&r);
+    assert!((mean - r.target).abs() <= r.target * 0.05);
+    assert!(
+        r.summary.steady_stddev < r.target * 0.05,
+        "lag caused oscillation: stddev {:.1}",
+        r.summary.steady_stddev
+    );
+}
+
+#[test]
+fn test_congestion_blackout_bounded_and_recovers() {
+    let r = scenario::congestion().run(SEED);
+
+    // Full gossip blackout from t=30s under 2× load: once records decay
+    // past stale_timeout each node sees zero live peers and re-targets the
+    // full cluster target. The cluster over-admits — that MUST happen (it
+    // is the documented soft-limit worst case)...
+    let blackout: Vec<&nenya::sim::Sample> = r
+        .samples
+        .iter()
+        .filter(|s| s.t > 50.0 && s.t <= 60.0)
+        .collect();
+    let blackout_mean =
+        blackout.iter().map(|s| s.accepted_rate).sum::<f64>() / blackout.len() as f64;
+    assert!(
+        blackout_mean >= r.target * 1.5,
+        "expected over-admission during blackout, got {:.1}",
+        blackout_mean
+    );
+
+    // ...but it is bounded by the offered load (nodes cannot admit more
+    // than arrives) — the blackout cannot amplify beyond demand
+    for s in &blackout {
+        assert!(
+            s.accepted_rate <= s.offered_rate * 1.05 + 1.0,
+            "t={:.1}: accepted {:.1} exceeded offered {:.1}",
+            s.t,
+            s.accepted_rate,
+            s.offered_rate
+        );
+    }
+
+    // Link drains at t=60s: gossip resumes and the cluster re-converges
+    // within one stale-free settle (measured 5.0s)
+    let converge = convergence_after(&r, "gossip_loss_0pct")
+        .expect("must re-converge after congestion clears");
+    assert!(
+        converge <= 15.0,
+        "post-congestion re-convergence took {:.1}s",
+        converge
+    );
+}
+
 // ===== Full matrix (slow subset) =====
 
 #[test]
@@ -255,6 +392,35 @@ fn test_scale_50() {
     );
     let mean = steady_mean(&r);
     assert!((mean - r.target).abs() <= r.target * 0.05);
+}
+
+#[test]
+#[ignore = "high-rate regime check (~2s release, ~10s debug); run with --ignored"]
+fn test_high_rate_regime_1m_tps() {
+    // Control dynamics are rate-invariant (the PID sees rates, not
+    // requests), so high-tps runs add nothing to the fast suite — but this
+    // periodic check guards the things that DO scale with absolute rate:
+    // sliding-window memory (one Instant per accepted request per
+    // update_interval), token-bucket arithmetic at large magnitudes, and
+    // arrival-generation cost. Measured at Milestone 4: identical dynamics
+    // from 300 rps to 10M rps (+0.8% steady bias, 6.5s convergence).
+    let mut s = scenario::scale(3);
+    s.cfg = s.cfg.with_cluster_target(1_000_000.0);
+    s.workloads[0].pattern = nenya::sim::LoadPattern::Constant { rate: 2_000_000.0 };
+
+    let r = s.run(SEED);
+    let converge = convergence_after(&r, "start").expect("1M tps run must converge");
+    assert!(
+        converge <= 10.0,
+        "convergence took {:.1}s at 1M tps",
+        converge
+    );
+    let mean = steady_mean(&r);
+    assert!(
+        (mean - r.target).abs() <= r.target * 0.05,
+        "steady mean {:.0} outside ±5% of 1M tps target",
+        mean
+    );
 }
 
 #[test]

@@ -188,7 +188,10 @@ cargo run --features sim --example cluster_sim -- --matrix --seed 42
 Artifacts land in `target/sim/` by default (`--out` to change). The
 simulation test suite (`tests/simulation.rs`) asserts the roadmap's
 acceptance thresholds — convergence within the ±5% band, bounded partition
-overshoot, post-heal recovery — against these same scenarios in CI.
+overshoot, post-heal recovery — against these same scenarios in CI. Scaling
+laws and sizing coefficients (nodes, scopes, rates, memory) are documented
+in [docs/capacity-model.md](docs/capacity-model.md), re-derivable via the
+`tests/capacity.rs` suite.
 
 ## Development
 

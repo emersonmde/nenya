@@ -433,6 +433,33 @@ variable observed through delayed, noisy gossip samples.
 - [ ] **Hot-path check**: engine update runs in the sync loop (per second per
   scope), not per request — verify no regression to the ~40ns decision path
 
+#### 5.4 Simulator-Driven Control Fixes
+
+Defects and scaling laws surfaced by Milestone 4's capacity sweeps
+(measurements and re-run instructions in
+[docs/capacity-model.md](capacity-model.md)); each follows the anti-windup
+precedent: sweep in the simulator, ship the derived default.
+
+- [ ] **Rate-estimator floor at sparse per-node shares**: below ~5 rps/node
+  fair share, the 1s sliding-window estimator mostly sees an empty window,
+  under-measures, and the PID over-admits ~0.6 rps/node (measured +98%
+  steady overshoot at 0.75 rps/node share; <2% at 100 rps/node). Candidate
+  fixes: adaptive/longer measurement window at low rates, EWMA or
+  inter-arrival estimator. Critical for Milestone 6 (per-user shares are
+  tiny by design). Characterized by
+  `capacity_per_node_share_floor_characterization` — flip that test when
+  fixed
+- [ ] **Gain scheduling vs. fleet size**: convergence ≈ 0.7s × nodes at
+  fixed gains (equal division hands each node error/n). Candidate: scale
+  integral gain with `1 + num_peers` to restore n-independent settling;
+  sweep for stability margins before shipping
+- [ ] **Cold-start fair-share initialization**: a joining node starts with
+  `bucket_capacity = cluster_target` tokens and `refill = cluster_target`,
+  admitting a ~full-bucket burst per join (~250 excess requests/join in the
+  autoscale scenario; 27 rapid joins cost 8093 requests of overshoot vs a
+  ~1300 baseline). Candidate: initialize bucket and refill at
+  `target / (num_peers + 1)`; sweep for slow-start cost on legitimate joins
+
 **Deliverable**: Two production engines behind one trait, a data-backed default,
 and a written comparison
 
@@ -493,6 +520,20 @@ Two-Tier Coordination section
   blackboard store (see Future Work: alternative coordination transports)
 - [ ] **Per-node gossip budget**: hard cap K on gossiped scopes; evict
   lowest-utilization on overflow and log it (no silent truncation)
+- [ ] **Per-scope gossip keys + compact encoding**: today the whole
+  `GossipState` is one JSON blob under a single chitchat key, so any change
+  retransmits everything — defeating Scuttlebutt's per-key delta sync.
+  Measured baseline (Milestone 4): ~115 bytes/scope, dominated by the
+  serde-JSON `SystemTime` (~60 bytes) that is only ever used as an opaque
+  change marker. Move to one chitchat key per gossiped scope (anti-entropy
+  then ships only changed scopes) and a compact value encoding; a version
+  counter can replace the timestamp outright. Note: gossip cost scales with
+  scopes × peers and is independent of tps — this item and the budget above
+  are what make the hot tier cheap. Before quoting any scope ceiling, verify
+  on a **real** 2-node cluster at ~10k scopes that the current monolithic
+  blob propagates at all: chitchat gossips over UDP with MTU-bounded
+  messages, and the simulator's abstract transport cannot answer this
+  (see docs/capacity-model.md)
 
 #### 6.2 Tail Visibility
 
@@ -830,6 +871,17 @@ Modes, Performance Characteristics
 - [ ] Soak: 24h at 5K RPS, no crashes/leaks/latency drift
 - [ ] Benchmarks vs. Milestone 0 baseline: no regressions
   (~40ns decision, <500μs handler p99, <100μs gossip overhead)
+- [ ] Simulator high-rate regime run (`cargo test --all-features --release --
+  --ignored test_high_rate_regime_1m_tps`) as part of perf-validation rituals.
+  Milestone 4 measurements to compare against: dynamics rate-invariant from
+  300 rps through 10M tps (+0.8% steady bias, 6.5s convergence); simulator
+  sustains ~100M simulated requests/s; memory is the first wall (~86MB RSS
+  at 1M tps, ~9.7GB at 100M tps) because the sliding window stores one
+  16-byte `Instant` per accepted request per `update_interval` and
+  `bucket_capacity` defaults to a full cluster-second of tokens. If embedded
+  high-rate use (≫100K accepted rps/node) becomes real, replace the
+  timestamp window with a fixed-bucket counting estimator — until then the
+  O(rate) window is fine at sidecar rates
 
 #### 10.3 Documentation & Release
 

@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use super::cluster::{SimCluster, SimConfig, SimEvent};
+use super::cluster::{GossipModel, SimCluster, SimConfig, SimEvent};
 use super::metrics::{summarize, RunResult, Sample};
 use super::workload::{ArrivalProcess, LoadPattern, SineComponent, Workload};
 
@@ -292,6 +292,90 @@ pub fn sinusoidal() -> Scenario {
     .duration(Duration::from_secs(120))
 }
 
+/// Rapid scale-up: 3 → 30 nodes, one join per second starting at t=30s,
+/// under 2× target load. Exercises repeated setpoint changes and the
+/// cold-start admission burst (each fresh node starts with a full
+/// cluster-target-sized token bucket — see the cold-start roadmap item).
+pub fn autoscale() -> Scenario {
+    let cfg = SimConfig {
+        num_nodes: 30,
+        initially_down: (3..30).collect(),
+        ..SimConfig::default()
+    };
+    let rate = cfg.cluster_target * 2.0;
+    let mut s = Scenario::new("autoscale", cfg, constant(rate)).duration(Duration::from_secs(120));
+    for (k, node) in (3..30).enumerate() {
+        s = s.event(Duration::from_secs(30 + k as u64), SimEvent::NodeUp(node));
+    }
+    s
+}
+
+/// Broad outage: half of a 10-node cluster crashes simultaneously at t=30s
+/// under 2× target load. Staleness decay runs per-peer in parallel, so
+/// recovery should take the same stale_timeout + settle as a single leave.
+pub fn mass_outage() -> Scenario {
+    let cfg = SimConfig {
+        num_nodes: 10,
+        ..SimConfig::default()
+    };
+    let rate = cfg.cluster_target * 2.0;
+    let mut s =
+        Scenario::new("mass_outage", cfg, constant(rate)).duration(Duration::from_secs(120));
+    for node in 5..10 {
+        s = s.event(Duration::from_secs(30), SimEvent::NodeDown(node));
+    }
+    s
+}
+
+/// Degraded network: 30% of gossip messages lost for the whole run, 2×
+/// target load. The current PID uses only the local rate as its feedback
+/// signal, so loss delays membership awareness but cannot destabilize the
+/// loop; Milestone 5 estimation engines consume gossip observations
+/// directly and are expected to be more sensitive — this is their noise-
+/// robustness baseline.
+pub fn lossy() -> Scenario {
+    let cfg = SimConfig {
+        gossip: GossipModel {
+            loss: 0.3,
+            ..GossipModel::default()
+        },
+        ..SimConfig::default()
+    };
+    let rate = cfg.cluster_target * 2.0;
+    Scenario::new("lossy", cfg, constant(rate)).duration(Duration::from_secs(90))
+}
+
+/// High gossip lag: 2s ± 1s propagation delay (4 sync intervals), 2×
+/// target load. Validates the documented claim that the conservative gains
+/// tolerate multi-second gossip lag.
+pub fn laggy() -> Scenario {
+    let cfg = SimConfig {
+        gossip: GossipModel {
+            delay: Duration::from_secs(2),
+            jitter: Duration::from_secs(1),
+            ..GossipModel::default()
+        },
+        ..SimConfig::default()
+    };
+    let rate = cfg.cluster_target * 2.0;
+    Scenario::new("laggy", cfg, constant(rate)).duration(Duration::from_secs(90))
+}
+
+/// Congestion coupling: user traffic saturates the links, so gossip blacks
+/// out completely from t=30s to t=60s while 2× target load continues. Once
+/// records decay past stale_timeout each node sees zero live peers and
+/// re-targets the full cluster target — the soft-limit worst case, here
+/// triggered *by* the overload itself. The link drains at t=60s and the
+/// cluster must re-converge.
+pub fn congestion() -> Scenario {
+    let cfg = SimConfig::default();
+    let rate = cfg.cluster_target * 2.0;
+    Scenario::new("congestion", cfg, constant(rate))
+        .event(Duration::from_secs(30), SimEvent::GossipLoss(1.0))
+        .event(Duration::from_secs(60), SimEvent::GossipLoss(0.0))
+        .duration(Duration::from_secs(120))
+}
+
 /// Steady 2× target load on an n-node cluster (scale sweep).
 pub fn scale(num_nodes: usize) -> Scenario {
     let cfg = SimConfig {
@@ -316,6 +400,11 @@ pub fn library() -> Vec<Scenario> {
         partition_heal(),
         skewed_load(),
         sinusoidal(),
+        autoscale(),
+        mass_outage(),
+        lossy(),
+        laggy(),
+        congestion(),
         scale(2),
         scale(5),
         scale(10),

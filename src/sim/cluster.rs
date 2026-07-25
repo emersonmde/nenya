@@ -132,6 +132,12 @@ pub enum SimEvent {
 
     /// Remove all partitions
     Heal,
+
+    /// Change the gossip message-loss probability mid-run. Models network
+    /// congestion coupling: when user traffic saturates the links, gossip
+    /// degrades exactly when coordination matters most (set 1.0 for a full
+    /// gossip blackout, back to the baseline to model the queue draining).
+    GossipLoss(f64),
 }
 
 impl SimEvent {
@@ -141,6 +147,7 @@ impl SimEvent {
             SimEvent::NodeUp(i) => format!("node{}_up", i),
             SimEvent::Partition(groups) => format!("partition_{:?}", groups),
             SimEvent::Heal => "heal".to_string(),
+            SimEvent::GossipLoss(p) => format!("gossip_loss_{:.0}pct", p * 100.0),
         }
     }
 }
@@ -301,6 +308,9 @@ impl SimCluster {
                 for g in self.group.iter_mut() {
                     *g = 0;
                 }
+            }
+            SimEvent::GossipLoss(p) => {
+                self.cfg.gossip.loss = p.clamp(0.0, 1.0);
             }
         }
     }
