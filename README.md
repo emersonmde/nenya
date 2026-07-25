@@ -14,14 +14,30 @@
 ## Features
 
 - **PID-based adaptive control**: Adjusts rate limits in real-time based on measured throughput
-- **Distributed coordination**: Equal division PID algorithm for cluster-wide rate limiting
+- **Distributed coordination without a coordinator**: nodes converge on
+  cluster-wide limits through gossip (Chitchat/Scuttlebutt) plus local
+  feedback control — no Redis, no owner-hashing, no central service
+- **Per-user scale**: millions of per-user scopes per cluster via
+  evidence-based two-tier coordination — a scope is enforced locally at its
+  full limit and only enters gossip coordination when peer-observed rates
+  show multi-node activity (~360 B per idle-ish user, measured at 1M
+  scopes; see [docs/capacity-model.md](docs/capacity-model.md))
 - **Pluggable control engines**: PID (default), Bayesian (per-peer Kalman
   estimation with uncertainty-aware admission), and a Kalman→PID hybrid —
   explicit config, benchmarked head-to-head in
   [docs/engine-comparison.md](docs/engine-comparison.md)
 - **Token bucket + sliding window hybrid**: Fast per-request decisions with accurate rate measurement
-- **AIMD-inspired tuning**: Conservative PID gains optimized for distributed systems (kp=0.5, ki=0.02, kd=0.08)
+- **Derived defaults**: every shipped tunable (control gains, tier
+  thresholds, estimator windows) comes from a published simulator sweep,
+  not hand-picking — the data lives in
+  [docs/capacity-model.md](docs/capacity-model.md)
 - **Generic over numeric types**: Works with f32, f64, or custom numeric types
+
+**Honest positioning**: gossip-based limits are *soft* — worst-case
+overshoot ≈ coordination lag × excess demand. Nenya targets fairness and
+overload protection (its flagship use case is fair per-user division of an
+upstream quota that enforces its own hard cap); it is not billing-grade
+quota enforcement. The measured bounds are documented, not assumed.
 
 ## Installation
 
@@ -69,7 +85,24 @@ NENYA_SEED_NODES=127.0.0.1:8081 \
 nenya
 ```
 
-**Status:** HTTP API and distributed gossip coordination complete. See [docs/roadmap.md](docs/roadmap.md) for upcoming features.
+**Status:** Milestones 0–6 complete: HTTP API, distributed gossip
+coordination, deterministic multi-node simulator, pluggable control
+engines, and per-user scale via evidence-based two-tier coordination. See
+[docs/roadmap.md](docs/roadmap.md) for what's next (client SDKs).
+
+## Documentation
+
+- [docs/tuning.md](docs/tuning.md) — **start here to deploy**: configure
+  from things you know (limits, nodes, users, traffic shape, LB config);
+  no internal algorithm knowledge required
+- [docs/architecture.md](docs/architecture.md) — design details, each
+  section marked Implemented or Planned
+- [docs/capacity-model.md](docs/capacity-model.md) — measured scaling
+  ceilings, sweep-derived defaults with their derivation tables, the
+  all-hot ablation, and real-UDP wire findings
+- [docs/engine-comparison.md](docs/engine-comparison.md) — PID vs
+  Bayesian vs hybrid engine benchmark across the scenario matrix
+- [docs/roadmap.md](docs/roadmap.md) — milestone plan and history
 
 ### Examples
 
@@ -175,7 +208,8 @@ milliseconds, and the same seed always produces byte-identical artifacts.
 
 ```sh
 # List scenarios (steady state, step, ramp, burst, join/leave,
-# partition + heal, skewed load, scale sweep, sinusoidal)
+# partition + heal, skewed load, scale sweep, sinusoidal, and the
+# per-user two-tier set: pareto_users, sticky_users, user_ramp)
 cargo run --features sim --example cluster_sim -- --list
 
 # Run one scenario; writes CSV + JSON time series and an SVG chart
@@ -240,12 +274,38 @@ Standard PID control loop:
 ### Distributed Mode (Equal Division PID)
 
 For cluster-wide rate limiting:
-- Each node gets an equal share: `cluster_target / num_nodes`
-- Nodes exchange their accepted rates via gossip
-- PID uses total cluster rate (local + remote) as feedback signal
+- Each node targets an equal share, `cluster_target / live_nodes`, using
+  its *local* accepted rate as the feedback signal
+- Nodes exchange per-scope accepted rates via gossip; peer observations
+  drive liveness (staleness-decayed) and are the input to the estimation
+  engines
 - Automatically rebalances when nodes join/leave
 
-Example: 1000 RPS cluster target with 10 nodes → each node targets 100 RPS. If a node sees the cluster is accepting 1100 RPS total, it reduces its local target proportionally.
+Example: 1000 RPS cluster target with 10 nodes → each node targets 100
+RPS; a node that stops hearing from a peer re-divides the target among
+the survivors once the peer's gossiped rate decays.
+
+### Per-User Scale (Evidence-Based Two-Tier Coordination)
+
+Per-user limits at large cardinality don't gossip every scope — and most
+scopes never need coordination at all:
+
+- **Tail (default)**: each scope is enforced at its **full limit** by a
+  compact local token bucket (~48 B of state; no control engine, no
+  gossip). A user whose traffic lands on one node cannot exceed the limit,
+  so nothing is capped below the limit on assumption alone.
+- **Watched**: a locally-warm scope publishes its rate (bytes only) so
+  spread activity becomes visible to peers.
+- **Hot**: full engine coordination engages only when local + peer-observed
+  rates cross the promotion threshold *with nonzero peer evidence*.
+
+An unpromoted scope's cluster-wide rate is bounded at
+`limit × (1 + demote_utilization)` (1.25× at defaults), independent of
+cluster size. Session-affinity ("sticky") users are the best case: served
+at ~0.98 of offered with no coordination traffic. Thresholds are
+simulator-derived; the sweep tables, the promotion/demotion model-checking
+results, and the 1M-scope memory measurements are in
+[docs/capacity-model.md](docs/capacity-model.md).
 
 ### PID Algorithm
 
