@@ -269,8 +269,11 @@ pub struct ScopeSnapshot {
 #[cfg(feature = "server")]
 #[derive(Debug)]
 enum ScopeEntry {
-    /// Non-distributed pattern: full limiter, never gossiped
-    Local(RateLimiter<f64>),
+    /// Non-distributed pattern: full limiter, never gossiped.
+    /// Boxed so the enum's size is the compact tail variant's, not the
+    /// ~quarter-KB limiter's — with 10⁶ tail scopes the difference is
+    /// hundreds of MB.
+    Local(Box<RateLimiter<f64>>),
 
     /// Distributed pattern below its promotion threshold: compact local
     /// enforcement of the equal share, no gossip state
@@ -278,7 +281,7 @@ enum ScopeEntry {
 
     /// Distributed pattern in full gossip coordination
     Hot {
-        limiter: RateLimiter<f64>,
+        limiter: Box<RateLimiter<f64>>,
         pattern_idx: usize,
         demotion: DemotionTracker,
     },
@@ -343,6 +346,11 @@ pub struct RateLimitManager {
     /// startup via `set_gossip_timing`
     sync_interval: Duration,
     stale_timeout: Duration,
+
+    /// Idle-scope TTL (see `tier::DEFAULT_SCOPE_TTL` for the derivation);
+    /// sweeps run every TTL/2 from the sync-loop apply pass
+    scope_ttl: Duration,
+    last_ttl_sweep: Instant,
 }
 
 #[cfg(feature = "server")]
@@ -371,7 +379,14 @@ impl RateLimitManager {
             // Production defaults (Config::from_env); see set_gossip_timing
             sync_interval: Duration::from_millis(500),
             stale_timeout: Duration::from_secs(10),
+            scope_ttl: crate::gossip::tier::DEFAULT_SCOPE_TTL,
+            last_ttl_sweep: Instant::now(),
         }
+    }
+
+    /// Set the idle-scope TTL. Call once at startup.
+    pub fn set_scope_ttl(&mut self, ttl: Duration) {
+        self.scope_ttl = ttl.max(Duration::from_millis(1));
     }
 
     /// Align engine staleness/liveness horizons with the configured gossip
@@ -519,7 +534,7 @@ impl RateLimitManager {
                 pattern_idx,
             }
         } else {
-            ScopeEntry::Local(self.create_limiter_from_pattern(pattern))
+            ScopeEntry::Local(Box::new(self.create_limiter_from_pattern(pattern)))
         }
     }
 
@@ -577,7 +592,7 @@ impl RateLimitManager {
                 self.scopes.insert(
                     scope.to_string(),
                     ScopeEntry::Hot {
-                        limiter,
+                        limiter: Box::new(limiter),
                         pattern_idx,
                         demotion: DemotionTracker::default(),
                     },
@@ -680,7 +695,9 @@ impl RateLimitManager {
         self.scopes
             .iter_mut()
             .filter_map(|(name, entry)| match entry {
-                ScopeEntry::Local(l) | ScopeEntry::Hot { limiter: l, .. } => Some((name, l)),
+                ScopeEntry::Local(l) | ScopeEntry::Hot { limiter: l, .. } => {
+                    Some((name, l.as_mut()))
+                }
                 ScopeEntry::Tail { .. } => None,
             })
     }
@@ -787,7 +804,7 @@ impl RateLimitManager {
             self.scopes.insert(
                 scope,
                 ScopeEntry::Hot {
-                    limiter,
+                    limiter: Box::new(limiter),
                     pattern_idx,
                     demotion: DemotionTracker::default(),
                 },
@@ -853,6 +870,37 @@ impl RateLimitManager {
 
         // 4. Refresh the promotion admission floor (min utilization among
         // the scopes that *kept* their slots)
+        // 5. TTL sweep: evict idle scopes (tail scopes are behaviorally
+        // lossless to evict once idle past the estimator window; local
+        // scopes lose only a long-stale control state; hot scopes demote
+        // first and age out as tail)
+        if now.saturating_duration_since(self.last_ttl_sweep) >= self.scope_ttl / 2 {
+            self.last_ttl_sweep = now;
+            let ttl = self.scope_ttl;
+            let before = self.scopes.len();
+            self.scopes.retain(|_, entry| match entry {
+                ScopeEntry::Tail { tail, .. } => {
+                    now.saturating_duration_since(tail.last_activity()) < ttl
+                }
+                ScopeEntry::Local(limiter) => limiter
+                    .last_accept_at()
+                    .map(|at| now.saturating_duration_since(at) < ttl)
+                    .unwrap_or(false),
+                ScopeEntry::Hot { .. } => true,
+            });
+            let evicted = before - self.scopes.len();
+            if evicted > 0 {
+                tracing::debug!(
+                    evicted,
+                    remaining = self.scopes.len(),
+                    "TTL-evicted idle scopes"
+                );
+                if evicted > self.scopes.len() {
+                    self.scopes.shrink_to_fit();
+                }
+            }
+        }
+
         self.promotion_floor = if self.hot_count >= self.gossip_budget {
             let floor = utilizations
                 .iter()

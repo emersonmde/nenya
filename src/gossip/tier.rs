@@ -56,6 +56,21 @@ pub const DEFAULT_DEMOTE_UTILIZATION: f64 = 0.25;
 /// scope is never demoted on a single stale/quiet observation window.
 pub const DEFAULT_DEMOTE_HOLD: Duration = Duration::from_secs(10);
 
+/// Default TTL for idle scopes (no accepted request within this window →
+/// evicted at the next sweep; sweeps run every TTL/2).
+///
+/// Evicting an idle *tail* scope is behaviorally lossless once it has been
+/// idle longer than `2 × TAIL_WINDOW`: the bucket refills to its full
+/// share burst within one window anyway and the rate estimate has decayed
+/// to zero, so recreation on the next request reproduces the exact state.
+/// The knob therefore only trades recreation/allocation churn for
+/// periodic users against idle-set memory (`memory ≈ users active within
+/// TTL × bytes/scope`); 60 s keeps minute-scale periodic users allocated
+/// while bounding the idle set at roughly a minute of unique traffic. Hot
+/// scopes are never TTL-evicted directly — an idle hot scope demotes
+/// through the hysteresis first and then ages out as a tail scope.
+pub const DEFAULT_SCOPE_TTL: Duration = Duration::from_secs(60);
+
 /// Default per-node cap on gossiped scopes. Bounds the per-link gossip
 /// payload at `K × bytes_per_scope × 2/s` regardless of user count (see
 /// docs/capacity-model.md for the wire math the cap is derived from).

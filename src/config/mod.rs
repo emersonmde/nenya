@@ -26,6 +26,7 @@
 //!   the promotion threshold)
 //! - `NENYA_DEMOTE_HOLD_SECS`: Demotion hysteresis hold in seconds
 //! - `NENYA_GOSSIP_BUDGET`: Per-node hard cap on gossiped (hot-tier) scopes
+//! - `NENYA_SCOPE_TTL_SECS`: Idle-scope TTL in seconds (default 60)
 
 use std::env;
 use std::net::SocketAddr;
@@ -131,6 +132,9 @@ pub struct Config {
 
     /// Per-node hard cap on gossiped (hot-tier) scopes
     pub gossip_budget: usize,
+
+    /// Idle-scope TTL (no accepted request within this window → evicted)
+    pub scope_ttl: Duration,
 }
 
 #[cfg(feature = "server")]
@@ -307,6 +311,11 @@ impl Config {
         let demote_utilization = parse_positive("NENYA_DEMOTE_UTILIZATION")?;
         let demote_hold_secs = parse_positive("NENYA_DEMOTE_HOLD_SECS")?;
 
+        let scope_ttl = Duration::from_secs_f64(
+            parse_positive("NENYA_SCOPE_TTL_SECS")?
+                .unwrap_or(crate::gossip::tier::DEFAULT_SCOPE_TTL.as_secs_f64()),
+        );
+
         let gossip_budget: usize = match env::var("NENYA_GOSSIP_BUDGET") {
             Ok(s) => s.parse().map_err(|_| {
                 ConfigError::InvalidValue(
@@ -356,6 +365,7 @@ impl Config {
             demote_utilization,
             demote_hold_secs,
             gossip_budget,
+            scope_ttl,
         })
     }
 
@@ -389,6 +399,7 @@ impl Config {
             demote_utilization: None,
             demote_hold_secs: None,
             gossip_budget: crate::gossip::tier::DEFAULT_GOSSIP_BUDGET,
+            scope_ttl: crate::gossip::tier::DEFAULT_SCOPE_TTL,
         }
     }
 }
@@ -422,6 +433,7 @@ mod tests {
         env::remove_var("NENYA_DEMOTE_UTILIZATION");
         env::remove_var("NENYA_DEMOTE_HOLD_SECS");
         env::remove_var("NENYA_GOSSIP_BUDGET");
+        env::remove_var("NENYA_SCOPE_TTL_SECS");
     }
 
     #[test]

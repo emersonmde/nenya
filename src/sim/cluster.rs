@@ -118,6 +118,9 @@ pub struct SimConfig {
     /// promoted into gossip coordination by the same policy code the
     /// server runs.
     pub tier: TierConfig,
+
+    /// Idle-scope TTL (mirrors the production default; sweeps every TTL/2)
+    pub scope_ttl: Duration,
 }
 
 impl Default for SimConfig {
@@ -147,6 +150,7 @@ impl Default for SimConfig {
             gossip: GossipModel::default(),
             initially_down: Vec::new(),
             tier: TierConfig::default(),
+            scope_ttl: crate::gossip::tier::DEFAULT_SCOPE_TTL,
         }
     }
 }
@@ -216,7 +220,9 @@ enum SimScope {
         tail: TailScope,
     },
     Hot {
-        limiter: RateLimiter<f64>,
+        /// Boxed so the enum stays tail-sized (mirrors the server's
+        /// `ScopeEntry`; per-user scenarios hold 10⁵+ entries per node)
+        limiter: Box<RateLimiter<f64>>,
         demotion: DemotionTracker,
     },
 }
@@ -236,6 +242,8 @@ struct SimNode {
     /// Tail aggregate for the node's single implicit pattern (summed
     /// accepted rate of unpromoted scopes, maintained on the admit path)
     tail_window: RateWindow,
+    /// Sim time of the last idle-scope TTL sweep
+    last_ttl_sweep: Duration,
     /// Fractional-arrival accumulator per scope (deterministic arrivals)
     accum: BTreeMap<String, f64>,
     rng: SplitMix64,
@@ -297,6 +305,7 @@ impl SimCluster {
                 hot_count: 0,
                 promotion_floor: 0.0,
                 tail_window: RateWindow::new(start),
+                last_ttl_sweep: Duration::ZERO,
                 accum: BTreeMap::new(),
                 rng: root_rng.fork(),
             };
@@ -536,7 +545,7 @@ impl SimCluster {
                     node.scopes.insert(
                         scope.clone(),
                         SimScope::Hot {
-                            limiter,
+                            limiter: Box::new(limiter),
                             demotion: DemotionTracker::default(),
                         },
                     );
@@ -601,6 +610,19 @@ impl SimCluster {
             } else {
                 0.0
             };
+
+            // Step 4b: TTL sweep — evict idle tail scopes (behaviorally
+            // lossless past the estimator window; hot scopes demote first)
+            if t.saturating_sub(node.last_ttl_sweep) >= self.cfg.scope_ttl / 2 {
+                node.last_ttl_sweep = t;
+                let ttl = self.cfg.scope_ttl;
+                node.scopes.retain(|_, entry| match entry {
+                    SimScope::Tail { tail } => {
+                        now.saturating_duration_since(tail.last_activity()) < ttl
+                    }
+                    SimScope::Hot { .. } => true,
+                });
+            }
 
             // Step 5: refresh and collect hot-tier rates for publishing
             let mut local_rates = HashMap::new();
@@ -700,7 +722,7 @@ fn admit_one(cfg: &SimConfig, node: &mut SimNode, scope: &str, now: Instant) -> 
         node.scopes.insert(
             scope.to_string(),
             SimScope::Hot {
-                limiter,
+                limiter: Box::new(limiter),
                 demotion: DemotionTracker::default(),
             },
         );

@@ -405,6 +405,14 @@ impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 
         self.tokens
     }
 
+    /// Timestamp of the most recent accepted request, if any — the
+    /// activity signal for idle-scope TTL eviction (`last_refill` /
+    /// `last_updated` won't do: background state refreshes advance them
+    /// without any traffic).
+    pub fn last_accept_at(&self) -> Option<Instant> {
+        self.accepted_request_timestamps.back().copied()
+    }
+
     /// Returns the current accepted request rate (combined local + external).
     pub fn accepted_request_rate(&self) -> T {
         self.local_accepted_request_rate + self.external_accepted_request_rate

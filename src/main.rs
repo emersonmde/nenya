@@ -47,6 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     manager.set_gossip_timing(config.sync_interval, config.stale_timeout);
     manager.set_gossip_budget(config.gossip_budget);
+    manager.set_scope_ttl(config.scope_ttl);
 
     if gossip_enabled {
         tracing::info!(
