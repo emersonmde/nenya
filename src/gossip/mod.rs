@@ -1,8 +1,10 @@
 //! Gossip protocol for distributed coordination
 //!
-//! Chitchat integration and cluster state management
+//! Chitchat integration and cluster state management. The `aggregate`
+//! submodule is transport-agnostic and is also compiled for the `sim`
+//! feature so the deterministic simulator exercises the production
+//! aggregation/decay logic.
 
-#[cfg(feature = "server")]
 pub mod aggregate;
 
 #[cfg(feature = "server")]
@@ -14,7 +16,6 @@ pub mod manager;
 #[cfg(feature = "server")]
 pub mod sync;
 
-#[cfg(feature = "server")]
 pub use aggregate::{aggregate_peer_rates, staleness_weight, AggregatedRates, PeerObservation};
 
 #[cfg(feature = "server")]

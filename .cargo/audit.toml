@@ -2,13 +2,4 @@
 # https://github.com/rustsec/rustsec/blob/main/cargo-audit/audit.toml.example
 
 [advisories]
-# quick-xml <0.41 advisories, reachable only through wayland-scanner →
-# eframe/egui, which are dev-dependencies of the plotting example
-# (build-time code generation for Linux Wayland support; never compiled
-# into the library or the server binary).
-# The GUI examples and their egui/eframe dependency tree are removed in
-# Milestone 4 (roadmap 4.6) — delete both ignores then.
-ignore = [
-    "RUSTSEC-2026-0194", # quick-xml: quadratic runtime on duplicate attribute check
-    "RUSTSEC-2026-0195", # quick-xml: unbounded namespace allocation DoS
-]
+ignore = []

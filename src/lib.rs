@@ -59,11 +59,15 @@ pub mod api;
 #[cfg(feature = "server")]
 pub mod config;
 
-#[cfg(feature = "server")]
+#[cfg(any(feature = "server", feature = "sim"))]
 pub mod gossip;
 
 #[cfg(feature = "server")]
 pub(crate) mod discovery;
+
+// ===== Deterministic multi-node simulator (feature `sim`) =====
+#[cfg(feature = "sim")]
+pub mod sim;
 
 /// Token bucket rate limiter with sliding window measurement and PID controller for adaptive coordination.
 ///

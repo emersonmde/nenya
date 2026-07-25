@@ -250,26 +250,53 @@ fraction of users are near their limit at any instant.
   so exposure is transient. Bounds are quantified in the simulator
   (Pareto-traffic and sticky-routing scenarios) and documented, not assumed.
 
-## Deterministic Simulator — [Planned — Milestone 4]
+## Deterministic Simulator — [Implemented, Milestone 4]
 
 The primary tool for correctness testing, benchmarking, and control-loop
-experimentation. Real multi-process tests are too slow and nondeterministic to
-sweep parameters; the interesting dynamics (gossip lag → phase lag →
-oscillation, partition overshoot, convergence after churn) need N nodes and a
-network model.
+experimentation (`src/sim/`, feature `sim`, no added dependencies). Real
+multi-process tests are too slow and nondeterministic to sweep parameters;
+the interesting dynamics (gossip lag → phase lag → oscillation, partition
+overshoot, convergence after churn) need N nodes and a network model.
 
-- **Virtual clock**: fixed ticks driving the library's explicit-timestamp APIs;
-  no wall-clock sleeps
-- **Simulated cluster**: N in-process nodes; message-bus gossip with
-  configurable delay, jitter, loss, and partitions; must exercise the *real*
-  aggregation/decay code, not a reimplementation
-- **Seeded workloads**: constant/ramp/step/burst/Poisson, per-node and per-scope
-  skew — same seed → byte-identical results
-- **Metrics**: overshoot, convergence time, oscillation, fairness, undershoot
-- **Artifact output**: CSV/JSON time series plus static SVG/PNG charts —
-  reproducible and shareable. Replaces the egui realtime dashboard example,
-  which is removed (with its whole dependency tree) as part of Milestone 4
-- **CI**: scenario acceptance thresholds as tests (fast subset <30s)
+- **Virtual clock**: `base Instant + tick × index` (10ms default tick)
+  driving the library's explicit-timestamp APIs; no wall-clock sleeps — a
+  60s scenario runs in milliseconds
+- **Simulated cluster** (`sim::cluster`): N in-process nodes with real
+  `RateLimiter`s constructed exactly as `RateLimitManager` builds them;
+  message-bus gossip with configurable delay, jitter, loss, and partitions;
+  each node runs the `gossip_sync_loop` sequence against the *real*
+  `gossip::aggregate` decay code (compiled under both `server` and `sim`)
+- **Seeded workloads** (`sim::workload`): constant/step/ramp/burst/sinusoidal
+  patterns × deterministic or Poisson arrivals, per-node skew weights. RNG is
+  an in-repo SplitMix64 (Vigna's public-domain reference), so the stream can
+  never shift under a dependency bump — same seed → byte-identical CSV/JSON
+- **Scenario library** (`sim::scenario`): steady below/at/above, step, ramp,
+  burst, join, leave, partition+heal, skew, sinusoidal, scale 2/5/10/50
+- **Metrics** (`sim::metrics`): max + integrated overshoot, per-event
+  convergence time (±5% band, 5s hold, 2s smoothing), steady-state
+  oscillation, fairness CV, integrated undershoot
+- **Artifacts**: CSV/JSON time series plus static SVG charts
+  (`examples/cluster_sim.rs`, plotters SVG backend only); the egui realtime
+  dashboard examples and their dependency tree are removed
+- **Benchmark harness**: `cluster_sim --matrix` emits a markdown comparison
+  table across all scenarios; gains and the anti-windup clamp are
+  overridable per run — this is the A/B tool for Milestone 5 engines
+- **CI** (`tests/simulation.rs`): scenario acceptance thresholds as tests
+  (fast subset ~0.1s); full matrix + 50-node sweep behind `--ignored`.
+  `tests/model_checking.rs` (stateright) exhaustively verifies the
+  aggregation bookkeeping invariants (no phantom load past `stale_timeout`,
+  each peer counted exactly once with exactly its decay weight, correct
+  live-peer count after quiescence) over all message interleavings of a
+  small cluster; `tests/property_sim.rs` (proptest) covers decay-weight and
+  token-bucket invariants over arbitrary inputs
+
+**First finding**: the scenario matrix exposed unbounded PID integral windup
+in the production limiter defaults — a partitioned minority (fair share above
+its offered load) wound up its integral term and overshot for ~60s after
+heal. Production scope limiters now ship with an anti-windup clamp
+(`error_limit = 0.2 × target`, `ScopePattern::get_error_limit`), the 0.2
+derived from a simulator sweep of {0.1, 0.2, 0.5}: post-heal re-convergence
+dropped to ~5s with marginal trade-offs between the three values.
 
 ## Control Engines — [Planned — Milestone 5]
 
@@ -459,10 +486,10 @@ Measured where noted; otherwise targets.
 
 - **Unit**: library algorithms, pattern matching, config, gossip state
   serialization, aggregation/decay logic
-- **Simulation [Planned — Milestone 4]**: all cluster dynamics (convergence,
-  overshoot, oscillation, partitions, churn) as deterministic seeded scenarios
-  with CI acceptance thresholds
-- **Model checking & properties [Planned — Milestone 4]**: `proptest` for
+- **Simulation [Implemented — Milestone 4]**: all cluster dynamics
+  (convergence, overshoot, oscillation, partitions, churn) as deterministic
+  seeded scenarios with CI acceptance thresholds (`tests/simulation.rs`)
+- **Model checking & properties [Implemented — Milestone 4]**: `proptest` for
   library invariants; `stateright` (Rust model checker, runs against the real
   aggregation code) to exhaustively verify discrete safety invariants over all
   message interleavings — no phantom load past `stale_timeout`, no

@@ -4,15 +4,18 @@ This document outlines the implementation plan for Nenya distributed rate limiti
 
 ## Current Milestone
 
-**Status**: Milestones 0-3 Complete - Ready for Milestone 4 (Simulation & Testing Architecture)
+**Status**: Milestones 0-4 Complete - Ready for Milestone 5 (Pluggable Control Engine & Bayesian Estimation)
 
 **Completed**:
 - ✅ Milestone 0: Single-crate restructure, HTTP stack, distributed coordination foundation
 - ✅ Milestone 1: Single-node HTTP rate limiter with scope management
 - ✅ Milestone 2: Distributed gossip coordination with equal division PID
 - ✅ Milestone 3: Gossip correctness fixes (stale peer decay, sync loop locking)
+- ✅ Milestone 4: Deterministic multi-node simulator, scenario/benchmark suite,
+  property tests + stateright model checking (plus first simulator-derived
+  production fix: PID anti-windup clamp)
 
-See Milestone 4 below for next steps.
+See Milestone 5 below for next steps.
 
 ## Principles
 
@@ -170,7 +173,7 @@ cargo fmt --check
 
 ## Milestone 4: Simulation & Testing Architecture
 
-- [ ] **MILESTONE COMPLETE**
+- [x] **MILESTONE COMPLETE**
 
 **Goal**: A deterministic multi-node simulator that becomes the project's primary
 tool for correctness testing, benchmarking, experimentation, and control-loop
@@ -187,31 +190,31 @@ sweep parameters or run in CI.
 
 #### 4.1 Deterministic Simulation Core
 
-- [ ] **Virtual clock**
+- [x] **Virtual clock**
   - Drive limiters via the existing `update_state_at(Instant)` /
     explicit-timestamp APIs; audit library for any remaining internal
     `Instant::now()` calls on paths the simulator exercises and lift them
     to parameters
   - Simulation advances in fixed ticks (e.g., 10ms); no wall-clock sleeps
-- [ ] **Simulated cluster**
+- [x] **Simulated cluster**
   - N in-process nodes, each with its own `RateLimiter` + controller
   - Message-bus gossip model with configurable: propagation delay,
     jitter (seeded RNG), message loss rate, partitions (arbitrary node groupings)
   - Reuses the real aggregation/decay logic from Milestone 3 — the simulator
     must exercise production code, not a reimplementation
-- [ ] **Workload generation**
+- [x] **Workload generation**
   - Seeded, reproducible arrival processes: constant, ramp, step, burst,
     Poisson, per-node skew (hot node), per-scope skew (hot key)
-- [ ] **Determinism guarantee**
+- [x] **Determinism guarantee**
   - Same seed + same scenario = identical results, byte for byte
   - This is a hard requirement; it's what makes CI assertions and A/B engine
     comparisons trustworthy
 
 #### 4.2 Scenario Library
 
-- [ ] **Scenario definition format** (Rust builder or TOML — pick simplest)
+- [x] **Scenario definition format** (Rust builder or TOML — pick simplest)
   - Cluster size, workload, target rates, engine + parameters, events timeline
-- [ ] **Core scenarios**:
+- [x] **Core scenarios**:
   - Steady state: constant load above/below/at target
   - Step change: load doubles at t=30s
   - Ramp: 0 → 3× target over 60s
@@ -224,30 +227,30 @@ sweep parameters or run in CI.
 
 #### 4.3 Metrics & Analysis
 
-- [ ] **Per-run metrics**
+- [x] **Per-run metrics**
   - Overshoot: max and time-integrated excess over target
   - Convergence time after each event (within ±5% band of target)
   - Oscillation: variance / peak-to-peak of cluster accepted rate at steady state
   - Fairness: dispersion of per-node accepted rates under uniform load
   - Undershoot: throughput sacrificed below target
-- [ ] **Output formats — artifacts, not a live GUI**
+- [x] **Output formats — artifacts, not a live GUI**
   - CSV/JSON time series per run for offline analysis
   - Static chart rendering to SVG/PNG (e.g., the `plotters` crate — no GUI
     stack), so results are reproducible and shareable in PRs/docs instead of
     eyeballed on a realtime dashboard
-- [ ] **Benchmark harness**
+- [x] **Benchmark harness**
   - Run a scenario matrix across engine configs, emit comparison table
   - This is the tool Milestone 5 uses to judge PID vs. Bayesian
 
 #### 4.4 CI Integration
 
-- [ ] **Correctness assertions as tests**
+- [x] **Correctness assertions as tests**
   - Encode acceptance thresholds per scenario (e.g., "steady state: cluster
     rate within ±5% of target; step change: converge within 10s; partition:
     overshoot bounded by `stale_timeout × excess demand`")
   - Fast subset in `cargo test` (<30s); full matrix behind `--ignored` or a
     feature flag
-- [ ] **Placement**: `tests/simulation/` + shared code in a `sim` module or
+- [x] **Placement**: `tests/simulation/` + shared code in a `sim` module or
   dev-dependency-only crate — follow standard Cargo conventions
 
 #### 4.5 Model Checking & Property-Based Verification
@@ -260,11 +263,11 @@ accounting, staleness transitions) has safety invariants a model checker can
 exhaustively verify over all interleavings, which no finite set of simulation
 seeds can.
 
-- [ ] **Property-based tests** (`proptest`, already a dev-dependency)
+- [x] **Property-based tests** (`proptest`, already a dev-dependency)
   - Library invariants over arbitrary inputs: token bucket never exceeds
     capacity, refill rate always within [min, max], decay weight monotonic in
     age and within [0, 1], PID output always within output_limit
-- [ ] **Model-check the aggregation/membership state machine**
+- [x] **Model-check the aggregation/membership state machine**
   ([`stateright`](https://github.com/stateright/stateright) — a Rust model
   checker, so it exercises the *real* aggregation code rather than a parallel
   spec that drifts)
@@ -276,7 +279,7 @@ seeds can.
     - `num_peers` eventually equals the live peer set after quiescence
     - External rate is always ≥ 0 and never exceeds the sum of live peers'
       published rates (given decay weights ≤ 1)
-- [ ] **TLA+ (deferred, narrow scope)**: not used for M4 — the properties above
+- [x] **TLA+ (deferred, narrow scope)**: not used for M4 — the properties above
   are checkable against real code with stateright, and a separate spec would
   drift. Reserved for the Milestone 9 auth handshake, where
   exhaustive adversarial interleaving analysis is the whole point.
@@ -287,24 +290,51 @@ The egui/eframe realtime dashboard (`request_simulator_plot`) was the manual
 tuning tool; scripted scenarios with rendered artifacts replace it with
 something reproducible, CI-checkable, and shareable.
 
-- [ ] Port any load patterns unique to the example into simulator scenarios
+- [x] Port any load patterns unique to the example into simulator scenarios
   before deleting anything
-- [ ] Remove `request_simulator_plot` and the dashboard; drop the
+- [x] Remove `request_simulator_plot` and the dashboard; drop the
   egui/eframe/egui_plot dev-dependencies
-- [ ] Remove the quick-xml ignores from `.cargo/audit.toml` — they exist only
+- [x] Remove the quick-xml ignores from `.cargo/audit.toml` — they exist only
   for the eframe dependency tree (this also clears most of the audit
   "unmaintained" warnings)
-- [ ] Update README: Request Simulator section → simulator usage and sample
+- [x] Update README: Request Simulator section → simulator usage and sample
   output artifacts
 
 **Deliverable**: `cargo test` covers multi-node dynamics deterministically;
 a benchmark harness produces engine comparison tables from scenario runs
 
+**Implementation notes**:
+- `src/sim/` behind a new no-dependency `sim` feature; `gossip::aggregate`
+  now compiles under `server` *and* `sim` so the simulator runs the
+  production decay code. RNG is an in-repo SplitMix64 (Vigna's reference
+  implementation) so the stream can never shift under a dependency bump.
+- Kept non-GUI examples: `request_simulator` (single-limiter terminal demo)
+  and `cluster_load_generator` (drives real clusters). Removed
+  `request_simulator_plot` and `cluster_visualizer` plus the whole
+  egui/eframe tree; charts are now static SVGs from `cluster_sim --plot`
+  (plotters, SVG backend only).
+- The stateright model bounds state (2 peers, 7-tick horizon, ≤1 in-flight
+  message per peer) for exhaustive search (~4.5k states); "no partition"
+  in the model because a partition is indistinguishable from message loss
+  at the observer, which is modeled.
+- **Finding (fixed)**: the scenario matrix exposed unbounded PID integral
+  windup in production limiter defaults — a partitioned minority whose fair
+  share exceeds its offered load winds up its integral and overshoots for
+  ~60s after heal. `ScopePattern` now applies `error_limit = 0.2 × target`
+  (sweep of {0.1, 0.2, 0.5}: all bound windup, marginal trade-offs; 0.2 is
+  the midpoint). Post-heal re-convergence: never→6s in the partition
+  scenario; ramp integrated overshoot 8238→860 requests.
+- Milestone-4 matrix at seed 42 (defaults), for future comparison: partition
+  overshoot 9506 req (bound: 12000), leave re-convergence 12.0s
+  (stale_timeout + PID settle), scale_50 convergence 42.5s, skew never
+  converges (equal division cannot serve a 90% hot node — known limitation,
+  addressed by demand-weighted division work in Milestone 5+).
+
 **Verification**:
 ```bash
 cargo test --all-features              # includes fast simulation suite
-cargo test -- --ignored                # full scenario matrix
-cargo run --example cluster_sim -- --scenario partition --seed 42 --plot
+cargo test --all-features -- --ignored # full scenario matrix
+cargo run --features sim --example cluster_sim -- --scenario partition --seed 42 --plot
 # Re-run with same seed: identical output
 ```
 

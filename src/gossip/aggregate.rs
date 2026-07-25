@@ -14,7 +14,6 @@ use std::time::Duration;
 
 /// A single peer's most recent per-scope rates, with the locally measured age
 /// of that observation.
-#[cfg(feature = "server")]
 #[derive(Debug, Clone)]
 pub struct PeerObservation {
     /// Peer node identifier
@@ -29,7 +28,6 @@ pub struct PeerObservation {
 }
 
 /// Result of aggregating peer observations
-#[cfg(feature = "server")]
 #[derive(Debug, Clone, Default)]
 pub struct AggregatedRates {
     /// Sum of age-weighted peer rates per scope
@@ -51,7 +49,6 @@ pub struct AggregatedRates {
 ///
 /// Degenerate configurations (`stale_timeout <= 2 × sync_interval`) collapse
 /// to a hard cutoff at `stale_timeout`.
-#[cfg(feature = "server")]
 pub fn staleness_weight(age: Duration, sync_interval: Duration, stale_timeout: Duration) -> f64 {
     if age >= stale_timeout {
         return 0.0;
@@ -74,7 +71,6 @@ pub fn staleness_weight(age: Duration, sync_interval: Duration, stale_timeout: D
 
 /// Aggregate peer observations into per-scope external rates, weighting each
 /// peer's contribution by freshness and dropping peers past `stale_timeout`.
-#[cfg(feature = "server")]
 pub fn aggregate_peer_rates(
     peers: &[PeerObservation],
     sync_interval: Duration,
@@ -97,7 +93,7 @@ pub fn aggregate_peer_rates(
     result
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

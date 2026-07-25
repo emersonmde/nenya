@@ -1,0 +1,268 @@
+//! Deterministic multi-node simulation tests (Milestone 4.4).
+//!
+//! These encode the roadmap's acceptance thresholds as CI assertions. All
+//! runs use fixed seeds and the in-process simulator, so failures are
+//! reproducible exactly. The fast subset below runs in a few seconds; the
+//! full scenario matrix and the 50-node sweep are `#[ignore]`d (run with
+//! `cargo test --all-features -- --ignored`).
+//!
+//! Threshold provenance:
+//! - ±5% band and hold window: roadmap Milestone 4 acceptance criteria
+//! - leave/partition convergence bounds: stale_timeout (10s, the time for a
+//!   silent peer's gossiped rate to fully decay) plus PID settling margin
+//! - the initial ~1s overshoot spike in every scenario is the token buckets
+//!   draining from full (production initializes buckets at capacity) and is
+//!   deliberately not asserted against
+
+#![cfg(feature = "sim")]
+
+use nenya::sim::scenario;
+use nenya::sim::RunResult;
+
+const SEED: u64 = 42;
+
+/// Mean cluster accepted rate over the final quarter of the run.
+fn steady_mean(r: &RunResult) -> f64 {
+    let n = r.samples.len();
+    let steady = &r.samples[n - n / 4..];
+    steady.iter().map(|s| s.accepted_rate).sum::<f64>() / steady.len() as f64
+}
+
+fn convergence_after(r: &RunResult, label: &str) -> Option<f64> {
+    r.summary
+        .convergence
+        .iter()
+        .find(|c| c.label == label)
+        .unwrap_or_else(|| panic!("no convergence anchor '{}' in {:?}", label, r.summary))
+        .time_to_converge
+}
+
+#[test]
+fn test_determinism_same_seed_identical_output() {
+    // The partition scenario exercises everything: Poisson arrivals, gossip
+    // jitter, events, staleness decay
+    let a = scenario::partition_heal().run(SEED);
+    let b = scenario::partition_heal().run(SEED);
+    assert_eq!(a.to_csv(), b.to_csv(), "same seed must be byte-identical");
+    assert_eq!(a.to_json(), b.to_json());
+
+    let c = scenario::partition_heal().run(SEED + 1);
+    assert_ne!(
+        a.to_csv(),
+        c.to_csv(),
+        "different seeds should differ (sanity check that the seed is used)"
+    );
+}
+
+#[test]
+fn test_steady_above_holds_target() {
+    let r = scenario::steady_above().run(SEED);
+
+    let converge = convergence_after(&r, "start").expect("steady_above must converge");
+    assert!(
+        converge <= 10.0,
+        "convergence took {:.1}s (limit 10s)",
+        converge
+    );
+
+    let mean = steady_mean(&r);
+    assert!(
+        (mean - r.target).abs() <= r.target * 0.05,
+        "steady mean {:.1} outside ±5% of target {:.1}",
+        mean,
+        r.target
+    );
+
+    let cv = r.summary.fairness_cv.expect("3 nodes carried traffic");
+    assert!(cv < 0.05, "unfair split under uniform load: CV {:.3}", cv);
+}
+
+#[test]
+fn test_steady_below_throttles_nothing() {
+    let r = scenario::steady_below().run(SEED);
+    assert_eq!(
+        r.summary.integrated_overshoot, 0.0,
+        "load below target can never overshoot"
+    );
+    // Total demand over the run; sacrificing more than 1% of it means the
+    // limiter throttled requests it had no reason to throttle
+    let total_offered: f64 = r.samples.iter().map(|s| s.offered_rate).sum::<f64>() * 0.5; // 500ms samples
+    assert!(
+        r.summary.integrated_undershoot < total_offered * 0.01,
+        "throttled {:.0} of {:.0} offered requests under target",
+        r.summary.integrated_undershoot,
+        total_offered
+    );
+}
+
+#[test]
+fn test_step_change_reconverges() {
+    let r = scenario::step_change().run(SEED);
+
+    let converge = convergence_after(&r, "start").expect("must converge initially");
+    assert!(
+        converge <= 10.0,
+        "initial convergence took {:.1}s",
+        converge
+    );
+
+    // After the step at t=30s the run has 60s to settle; the final quarter
+    // must be back in the ±5% band
+    let mean = steady_mean(&r);
+    assert!(
+        (mean - r.target).abs() <= r.target * 0.05,
+        "post-step steady mean {:.1} outside ±5% of {:.1}",
+        mean,
+        r.target
+    );
+}
+
+#[test]
+fn test_node_join_absorbed() {
+    let r = scenario::node_join().run(SEED);
+    let converge = convergence_after(&r, "node2_up").expect("must re-converge after join");
+    // A joining node is visible to peers within one gossip round; allow
+    // three PID update intervals of settling on top
+    assert!(
+        converge <= 15.0,
+        "join re-convergence took {:.1}s",
+        converge
+    );
+
+    let mean = steady_mean(&r);
+    assert!((mean - r.target).abs() <= r.target * 0.05);
+}
+
+#[test]
+fn test_node_leave_absorbed_after_decay() {
+    let r = scenario::node_leave().run(SEED);
+    let converge = convergence_after(&r, "node2_down").expect("must re-converge after leave");
+    // Lower bound on recovery is stale_timeout (10s): survivors only claim
+    // the dead node's share once its gossiped rate fully decays. Allow 10s
+    // of PID settling on top.
+    assert!(
+        converge <= 20.0,
+        "leave re-convergence took {:.1}s (stale_timeout is 10s)",
+        converge
+    );
+
+    let mean = steady_mean(&r);
+    assert!((mean - r.target).abs() <= r.target * 0.05);
+}
+
+#[test]
+fn test_partition_overshoot_bounded_and_heals() {
+    let r = scenario::partition_heal().run(SEED);
+
+    // During a partition each side independently converges toward the full
+    // cluster target (it cannot know better — gossip-based limits are soft).
+    // The worst case is therefore 2× target; assert we never exceed it plus
+    // the ±5% band once initial convergence is done (10s — the same limit
+    // the start-convergence assertions use; the first seconds are the full
+    // token buckets draining).
+    let worst_case = r.target * 2.0;
+    for s in r.samples.iter().filter(|s| s.t > 10.0) {
+        assert!(
+            s.accepted_rate <= worst_case * 1.05,
+            "t={:.1}: accepted {:.1} exceeds partition worst case {:.1}",
+            s.t,
+            s.accepted_rate,
+            worst_case
+        );
+    }
+
+    // Total overshoot is bounded by excess demand × partition duration
+    // (300 rps excess × 40s here) — the roadmap's soft-limit bound
+    let bound = 300.0 * 40.0;
+    assert!(
+        r.summary.integrated_overshoot <= bound,
+        "integrated overshoot {:.0} exceeds stale-decay bound {:.0}",
+        r.summary.integrated_overshoot,
+        bound
+    );
+
+    // After heal the cluster must re-converge (this is the regression test
+    // for integral windup: without the anti-windup clamp the minority side
+    // stays ~40% over its share for the rest of the run)
+    let converge = convergence_after(&r, "heal").expect("must re-converge after heal");
+    assert!(
+        converge <= 15.0,
+        "post-heal convergence took {:.1}s",
+        converge
+    );
+
+    let cv = r.summary.fairness_cv.expect("5 nodes carried traffic");
+    assert!(cv < 0.05, "fairness not restored after heal: CV {:.3}", cv);
+}
+
+#[test]
+fn test_scale_sweep_small() {
+    for nodes in [2, 5, 10] {
+        let r = scenario::scale(nodes).run(SEED);
+        let converge = convergence_after(&r, "start")
+            .unwrap_or_else(|| panic!("scale_{} did not converge", nodes));
+        assert!(
+            converge <= 15.0,
+            "scale_{} convergence took {:.1}s",
+            nodes,
+            converge
+        );
+        let mean = steady_mean(&r);
+        assert!(
+            (mean - r.target).abs() <= r.target * 0.05,
+            "scale_{} steady mean {:.1} outside band",
+            nodes,
+            mean
+        );
+    }
+}
+
+// ===== Full matrix (slow subset) =====
+
+#[test]
+#[ignore = "full scenario matrix; run with --ignored"]
+fn test_full_matrix_all_scenarios_run() {
+    for s in scenario::library() {
+        let r = s.run(SEED);
+        assert!(!r.samples.is_empty(), "{} produced no samples", r.scenario);
+        // Every scenario's steady state must stay at or below the target
+        // band ceiling except burst (spikes land inside the steady window)
+        // and skew (equal division cannot serve a 90% hot node — documented
+        // limitation until demand-weighted division lands in Milestone 5+)
+        if r.scenario != "burst" && r.scenario != "skew" {
+            let mean = steady_mean(&r);
+            assert!(
+                mean <= r.target * 1.05,
+                "{}: steady mean {:.1} above target band",
+                r.scenario,
+                mean
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "50-node sweep; run with --ignored"]
+fn test_scale_50() {
+    let r = scenario::scale(50).run(SEED);
+    let converge = convergence_after(&r, "start").expect("scale_50 did not converge");
+    // Convergence slows with node count (each node's share of the error
+    // shrinks); at 50 nodes the observed value is ~42s
+    assert!(
+        converge <= 55.0,
+        "scale_50 convergence took {:.1}s",
+        converge
+    );
+    let mean = steady_mean(&r);
+    assert!((mean - r.target).abs() <= r.target * 0.05);
+}
+
+#[test]
+#[ignore = "determinism across the whole library; run with --ignored"]
+fn test_full_matrix_determinism() {
+    for s in scenario::library() {
+        let a = s.run(SEED);
+        let b = s.run(SEED);
+        assert_eq!(a.to_json(), b.to_json(), "{} is not deterministic", s.name);
+    }
+}

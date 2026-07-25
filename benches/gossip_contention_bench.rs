@@ -75,7 +75,10 @@ async fn main() {
         MEASURE_ITERS, WARMUP_ITERS
     );
 
+    // Distinct gossip port per case (not a loop counter — cases consume one
+    // port each and the loop below binds two managers per iteration)
     let mut port = 13100u16;
+    #[allow(clippy::explicit_counter_loop)]
     for &num_scopes in SCOPE_COUNTS {
         // Baseline: no gossip loop running
         let manager = build_manager(num_scopes).await;

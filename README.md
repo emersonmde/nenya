@@ -161,23 +161,34 @@ fn main() {
 }
 ```
 
-### Request Simulator
+### Cluster Simulator
 
-There's a visual simulator for testing PID behavior under different load patterns:
-
-```sh
-cargo run --example request_simulator_plot -- \
-    --target_tps 50.0 \
-    --base_tps 60.0 \
-    --amplitudes 30.0 \
-    --frequencies 0.1
-```
-
-The example uses reasonable defaults (kp=0.8, ki=0.05, kd=0.04, output_limit=0.05×target). To experiment with different parameters:
+A deterministic multi-node simulator (feature `sim`) is the primary tool for
+testing cluster dynamics: N in-process nodes with real rate limiters, a
+message-bus gossip model (propagation delay, jitter, loss, partitions),
+seeded workloads, and a virtual clock. A 60-second scenario runs in
+milliseconds, and the same seed always produces byte-identical artifacts.
 
 ```sh
-cargo run --example request_simulator_plot -- --help
+# List scenarios (steady state, step, ramp, burst, join/leave,
+# partition + heal, skewed load, scale sweep, sinusoidal)
+cargo run --features sim --example cluster_sim -- --list
+
+# Run one scenario; writes CSV + JSON time series and an SVG chart
+cargo run --features sim --example cluster_sim -- \
+    --scenario partition --seed 42 --plot
+
+# Run the full scenario matrix and print a comparison table (markdown).
+# This is the benchmark harness for judging control-engine changes —
+# gains and the anti-windup clamp can be overridden per run for A/B
+# comparisons (--kp/--ki/--kd/--error-limit-frac).
+cargo run --features sim --example cluster_sim -- --matrix --seed 42
 ```
+
+Artifacts land in `target/sim/` by default (`--out` to change). The
+simulation test suite (`tests/simulation.rs`) asserts the roadmap's
+acceptance thresholds — convergence within the ±5% band, bounded partition
+overshoot, post-heal recovery — against these same scenarios in CI.
 
 ## Development
 

@@ -35,6 +35,10 @@ pub struct ScopePattern {
     /// PID derivative gain
     pub kd: Option<f64>,
 
+    /// Integral anti-windup clamp as a fraction of target_rate
+    /// (defaults to 0.2)
+    pub error_limit_frac: Option<f64>,
+
     /// Whether this is a distributed rate limit (cluster-wide target)
     pub distributed: bool,
 }
@@ -51,6 +55,7 @@ impl ScopePattern {
             kp: None,
             ki: None,
             kd: None,
+            error_limit_frac: None,
             distributed: false,
         }
     }
@@ -94,6 +99,21 @@ impl ScopePattern {
     /// Get PID Kd (defaults to 0.04)
     pub fn get_kd(&self) -> f64 {
         self.kd.unwrap_or(0.04)
+    }
+
+    /// Get the integral anti-windup clamp (defaults to 0.2 × target_rate).
+    ///
+    /// Without a clamp, any sustained gap between setpoint and achievable
+    /// rate (e.g. a partitioned minority whose fair share exceeds its
+    /// offered load) winds the integral term up without bound, and the node
+    /// overshoots its share for tens of seconds after conditions change.
+    /// The 0.2 fraction is simulator-derived: in the Milestone 4 scenario
+    /// matrix, 0.1/0.2/0.5 all bound windup with marginal trade-offs
+    /// (smaller = less overshoot, larger = less undershoot); 0.2 is the
+    /// midpoint and cut post-heal re-convergence in the partition scenario
+    /// from ~60s to ~5s versus no clamp.
+    pub fn get_error_limit(&self) -> f64 {
+        self.error_limit_frac.unwrap_or(0.2) * self.target_rate
     }
 }
 
@@ -243,6 +263,7 @@ impl RateLimitManager {
             .kp(pattern.get_kp())
             .ki(pattern.get_ki())
             .kd(pattern.get_kd())
+            .error_limit(pattern.get_error_limit())
             .build();
 
         let mut builder = RateLimiterBuilder::new(pattern.target_rate)
@@ -366,6 +387,7 @@ mod tests {
             kp: None,
             ki: None,
             kd: None,
+            error_limit_frac: None,
             distributed: false,
         };
 
@@ -385,6 +407,7 @@ mod tests {
             kp: None,
             ki: None,
             kd: None,
+            error_limit_frac: None,
             distributed: false,
         };
 
@@ -444,6 +467,7 @@ mod tests {
             kp: None,
             ki: None,
             kd: None,
+            error_limit_frac: None,
             distributed: false,
         });
 
@@ -455,6 +479,7 @@ mod tests {
             kp: None,
             ki: None,
             kd: None,
+            error_limit_frac: None,
             distributed: false,
         });
 
@@ -487,6 +512,7 @@ mod tests {
             kp: None,
             ki: None,
             kd: None,
+            error_limit_frac: None,
             distributed: false,
         });
 
@@ -498,6 +524,7 @@ mod tests {
             kp: None,
             ki: None,
             kd: None,
+            error_limit_frac: None,
             distributed: false,
         });
 

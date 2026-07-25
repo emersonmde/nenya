@@ -28,11 +28,12 @@ no coordinator.
 2. **[`docs/architecture.md`](docs/architecture.md)** — design details; each section is marked Implemented or Planned
 3. This file — commands, structure, conventions
 
-**Current milestone: 4 — Simulation & Testing Architecture.** Build the
-deterministic multi-node simulator (virtual clock, message-bus gossip model,
-seeded workloads, scenario library, metrics + chart artifacts). It must reuse
-the real aggregation/decay logic from `src/gossip/aggregate.rs`, not a
-reimplementation. See the roadmap's Milestone 4 section for the task list.
+**Current milestone: 5 — Pluggable Control Engine & Bayesian Estimation.**
+Extract the `RateController` trait (per-peer `(rate, age)` observations, not
+a pre-aggregated sum), port the PID engine unchanged, implement the Kalman
+BayesianEngine and HybridEngine, and judge them with the Milestone 4
+benchmark harness (`cluster_sim --matrix`). See the roadmap's Milestone 5
+section for the task list.
 
 ## Milestone Overview
 
@@ -40,8 +41,8 @@ reimplementation. See the roadmap's Milestone 4 section for the task list.
 |-----------|--------|-------------|
 | 0-2 | ✅ Complete | Single-crate structure, HTTP rate limiter, gossip coordination |
 | 3 | ✅ Complete | Gossip correctness fixes (stale decay, locking) |
-| 4 | ⏳ Current | Deterministic multi-node simulator + scenario/benchmark suite |
-| 5 | 🔜 Future | Pluggable engines: PID vs Bayesian (Kalman), benchmarked |
+| 4 | ✅ Complete | Deterministic multi-node simulator + scenario/benchmark suite |
+| 5 | ⏳ Current | Pluggable engines: PID vs Bayesian (Kalman), benchmarked |
 | 6 | 🔜 Future | Two-tier coordination for per-user scale (millions of scopes) |
 | 7 | 🔜 Future | Client SDKs (Rust, Python, Node, Go) |
 | 8 | 🔜 Future | Platform deployment + discovery + AgentCore quota arbitration |
@@ -75,9 +76,13 @@ cargo audit
 # All pre-commit checks at once (or: git config core.hooksPath .git-hooks)
 ./.git-hooks/pre-commit
 
-# Single-node PID simulator with realtime plot
-# (retired in Milestone 4 — replaced by simulator CSV/JSON + chart artifacts)
-cargo run --example request_simulator_plot -- --help
+# Deterministic multi-node simulator (CSV/JSON artifacts + SVG charts)
+cargo run --features sim --example cluster_sim -- --list
+cargo run --features sim --example cluster_sim -- --scenario partition --seed 42 --plot
+cargo run --features sim --example cluster_sim -- --matrix --seed 42   # benchmark table
+
+# Full scenario matrix + 50-node sweep (slow subset)
+cargo test --all-features -- --ignored
 
 # Docs
 cargo doc --no-deps --open
@@ -104,10 +109,17 @@ src/
 ├── api/                # HTTP API: handlers, RateLimitManager, metrics, errors
 ├── config/             # Env-var config (Config::from_env) — TOML is planned, NOT yet implemented
 ├── gossip/             # Chitchat integration: manager, state schema, sync loop,
-│                       #   age-weighted staleness decay (aggregate.rs)
+│                       #   age-weighted staleness decay (aggregate.rs — also
+│                       #   compiled under `sim` so the simulator runs real code)
+├── sim/                # Deterministic multi-node simulator (feature `sim`):
+│                       #   virtual clock, message-bus gossip model, seeded
+│                       #   workloads, scenario library, metrics/artifacts
 └── discovery/          # Placeholder only (Milestone 8)
-examples/               # request_simulator_plot (egui GUI — retired in M4 for simulator artifacts)
-tests/                  # Integration tests (HTTP API, multi-node gossip)
+examples/               # cluster_sim (simulator CLI + SVG charts, feature `sim`),
+                        #   request_simulator (terminal demo), cluster_load_generator
+tests/                  # Integration tests (HTTP API, multi-node gossip),
+                        #   simulation.rs (scenario acceptance thresholds),
+                        #   model_checking.rs (stateright), property_sim.rs
 nenya-sentinel/         # Deprecation stub only — the binary is now `nenya` itself
 ```
 

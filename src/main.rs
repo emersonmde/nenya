@@ -60,6 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             kp: Some(config.default_kp),
             ki: Some(config.default_ki),
             kd: Some(config.default_kd),
+            error_limit_frac: None, // simulator-derived default (0.2)
             distributed: true,
         };
 

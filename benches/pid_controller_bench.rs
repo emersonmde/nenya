@@ -273,9 +273,9 @@ fn numeric_type_comparison(c: &mut Criterion) {
     group.bench_function("f32", |b| {
         let mut pid: nenya::pid_controller::PIDController<f32> =
             PIDControllerBuilder::new(100.0f32)
-                .kp(0.8)
-                .ki(0.05)
-                .kd(0.04)
+                .kp(0.8_f32)
+                .ki(0.05_f32)
+                .kd(0.04_f32)
                 .build();
 
         b.iter(|| black_box(pid.compute_correction(black_box(85.0f32))))
