@@ -200,6 +200,44 @@ propagation + control interval); the stateright model
 (`model_check_tier_state_machine`) proves the hysteresis and
 no-flap-under-constant-input properties over all interleavings.
 
+**Tail burst depth + sparse-share floor** (large-cluster follow-up):
+splitting a small per-user limit across a large cluster surfaced two
+defects and one product tradeoff. Defects (both fixed): with per-node
+capacity `share × 1s`, any cluster larger than the per-user rps limit
+gave sub-token buckets that could **never admit anything** (and never
+promote, since the estimator counts accepts) — and even after promotion,
+a one-token adaptive bucket lost ~40% of a Poisson stream to clumping.
+The adaptive capacity now floors at 4 tokens (swept 1/2/4/8 → served
+0.62/0.84/0.94/0.97 for an 8 rps user on 25 nodes; service-scale
+scenarios unchanged; 4 is the knee).
+
+The tradeoff — concentrated-burst tolerance vs. cold-bucket spike — is
+the `tail_burst_fraction` knob (per-node tail capacity
+`max(share, frac × limit) × 1s`). Depth changes neither long-run
+admission (refill stays at the fair share) nor steady per-user overage
+(flat at every fraction); it trades how much of a client burst one node
+absorbs against the `n × frac × limit` worst-case spike for a
+synchronized spread burst:
+
+| frac | 20-req burst via 1 node (limit 10, 10 nodes) | autoscale join overshoot (service L=300, budget <4000) |
+|------|------|------|
+| 0.0 (share only) | 1/20 | 2452 |
+| 0.25 | 2/20 | 2452 |
+| **0.5** | **5/20** | **2698** |
+| 1.0 | 10/20 | 2793 |
+
+Shipped default 0.5: aligned with the promotion threshold (one node
+absorbs bursts up to the utilization level where coordination takes
+over; a burst that trips promotion carries its remaining tail tokens
+into the promoted limiter rather than being truncated). The direction of
+the trade is deliberately toward usability — premature throttling of
+legitimate bursts is a chronic, per-customer cost, while the spread-burst
+spike is bounded, once-per-refill-period, and the sustained many-scope
+flood it hints at is unwinnable by per-user limits regardless (that is
+the service-level cap's job). Per-user-focused deployments can set
+`NENYA_TAIL_BURST_FRACTION=1.0` for Redis-style full-limit burst
+semantics; DDoS-sensitive ones can lower it toward 0.
+
 **Routing strategies — measured, only stickiness matters**: the promotion
 estimate assumes uniform routing, so four load-balancer policies were
 compared on the same Zipf population (`test_routing_strategies_preserve_two_tier_invariants`,

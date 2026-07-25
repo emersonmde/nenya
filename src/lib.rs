@@ -85,6 +85,27 @@ pub mod sim;
 /// swept optimum.
 const DEFAULT_MIN_WINDOW_SAMPLES: usize = 20;
 
+/// Floor on the adaptive bucket capacity, in tokens.
+///
+/// Two failure modes at sparse fair shares (a small per-user limit split
+/// across a large cluster) motivate it, both found in the Milestone 6
+/// large-cluster review:
+/// 1. **Starvation**: with `capacity = refill × 1s` alone, a share below
+///    1 rps yields a sub-token capacity — the bucket can never accumulate
+///    a whole token and admits nothing, ever.
+/// 2. **Poisson clump loss**: at exactly one token, an arrival is only
+///    admitted if a full `1/refill` gap preceded it, so a Poisson stream
+///    below the share still loses heavily to clumping.
+///
+/// Simulator-derived (tier_threshold_sweep axis 4, seed 42: an 8 rps user
+/// on 25 nodes against a 10 rps limit, offered *below* its fair share):
+/// served fraction 0.62 / 0.84 / 0.94 / 0.97 at floors 1 / 2 / 4 / 8
+/// tokens; service-scale scenarios (autoscale join overshoot, steady
+/// overage) are unchanged at every value because their capacities are
+/// hundreds of tokens. 4 is the knee. Cost: a cold bucket can burst up to
+/// `max(floor − refill × 1s, 0)` extra tokens per node.
+const CAPACITY_FLOOR_TOKENS: f64 = 4.0;
+
 /// Token bucket rate limiter with sliding window measurement and PID controller for adaptive coordination.
 ///
 /// This hybrid architecture uses:
@@ -340,9 +361,13 @@ impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 
         }
 
         // Adaptive burst allowance: capacity follows the engine's rate, so
-        // a node's burst headroom is proportional to its current share
+        // a node's burst headroom is proportional to its current share.
+        // Floored at a few tokens so sparse shares (small per-user limit,
+        // large cluster) neither starve outright nor bleed admissions to
+        // Poisson clumping — see CAPACITY_FLOOR_TOKENS for the sweep.
         if let Some(burst_seconds) = self.bucket_burst_seconds {
-            self.bucket_capacity = self.refill_rate * burst_seconds;
+            self.bucket_capacity =
+                (self.refill_rate * burst_seconds).max(T::from_f64(CAPACITY_FLOOR_TOKENS).unwrap());
             self.tokens = self.tokens.min(self.bucket_capacity);
         }
 
@@ -503,6 +528,7 @@ pub struct RateLimiterBuilder<T> {
     initial_tokens_frac: Option<T>,
     bucket_burst_seconds: Option<T>,
     initial_refill_rate: Option<T>,
+    initial_capacity: Option<T>,
 }
 
 impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 'static>
@@ -528,7 +554,19 @@ impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 
             initial_tokens_frac: None,
             bucket_burst_seconds: None,
             initial_refill_rate: None,
+            initial_capacity: None,
         }
+    }
+
+    /// Sets the *starting* bucket capacity without pinning it static:
+    /// unlike [`bucket_capacity`](Self::bucket_capacity), the adaptive
+    /// burst allowance stays enabled and the capacity converges to
+    /// `refill × burst_seconds` at the first control update. Used when a
+    /// tail scope promotes mid-burst: the tail bucket's depth carries
+    /// over so promotion doesn't truncate an in-flight burst.
+    pub fn initial_capacity(mut self, capacity: T) -> Self {
+        self.initial_capacity = Some(capacity);
+        self
     }
 
     /// Sets the initial token refill rate (default: `target_rate`).
@@ -693,16 +731,19 @@ impl<T: Float + Signed + FromPrimitive + Copy + Send + Sync + std::fmt::Debug + 
     pub fn build(self) -> RateLimiter<T> {
         let now = self.initial_timestamp.unwrap_or_else(Instant::now);
         let initial_refill = self.initial_refill_rate.unwrap_or(self.target_rate);
-        // An explicit initial refill also scales the initial burst
-        // allowance (capacity tracks refill × 1s from the first control
-        // update anyway; starting there avoids a one-interval burst window)
-        let bucket_capacity =
-            self.bucket_capacity
+        // Starting capacity precedence: explicit static capacity >
+        // explicit initial (adaptive) capacity > the initial refill (an
+        // explicit refill also scales the initial burst allowance —
+        // capacity tracks refill × 1s from the first control update
+        // anyway) > the target
+        let bucket_capacity = self.bucket_capacity.unwrap_or_else(|| {
+            self.initial_capacity
                 .unwrap_or(if self.initial_refill_rate.is_some() {
                     initial_refill
                 } else {
                     self.target_rate
-                });
+                })
+        });
         let initial_tokens = match self.initial_tokens_frac {
             Some(frac) => bucket_capacity * frac,
             None => bucket_capacity,

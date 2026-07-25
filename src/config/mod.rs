@@ -27,6 +27,8 @@
 //! - `NENYA_DEMOTE_HOLD_SECS`: Demotion hysteresis hold in seconds
 //! - `NENYA_GOSSIP_BUDGET`: Per-node hard cap on gossiped (hot-tier) scopes
 //! - `NENYA_SCOPE_TTL_SECS`: Idle-scope TTL in seconds (default 60)
+//! - `NENYA_TAIL_BURST_FRACTION`: Tail burst depth as a fraction of the
+//!   limit (default: sweep-derived, see `gossip::tier`)
 
 use std::env;
 use std::net::SocketAddr;
@@ -135,6 +137,10 @@ pub struct Config {
 
     /// Idle-scope TTL (no accepted request within this window → evicted)
     pub scope_ttl: Duration,
+
+    /// Tail burst depth override (fraction of the limit; `None` =
+    /// sweep-derived default)
+    pub tail_burst_fraction: Option<f64>,
 }
 
 #[cfg(feature = "server")]
@@ -308,6 +314,7 @@ impl Config {
         };
 
         let promote_utilization = parse_positive("NENYA_PROMOTE_UTILIZATION")?;
+        let tail_burst_fraction = parse_positive("NENYA_TAIL_BURST_FRACTION")?;
         let demote_utilization = parse_positive("NENYA_DEMOTE_UTILIZATION")?;
         let demote_hold_secs = parse_positive("NENYA_DEMOTE_HOLD_SECS")?;
 
@@ -337,6 +344,7 @@ impl Config {
                     .unwrap_or(defaults.demote_hold),
                 gossip_budget,
                 estimator_window: defaults.estimator_window,
+                tail_burst_fraction: tail_burst_fraction.unwrap_or(defaults.tail_burst_fraction),
             };
             tier.validate().map_err(|e| {
                 ConfigError::InvalidValue("NENYA_PROMOTE/DEMOTE_UTILIZATION".to_string(), e)
@@ -367,6 +375,7 @@ impl Config {
             demote_hold_secs,
             gossip_budget,
             scope_ttl,
+            tail_burst_fraction,
         })
     }
 
@@ -401,6 +410,7 @@ impl Config {
             demote_hold_secs: None,
             gossip_budget: crate::gossip::tier::DEFAULT_GOSSIP_BUDGET,
             scope_ttl: crate::gossip::tier::DEFAULT_SCOPE_TTL,
+            tail_burst_fraction: None,
         }
     }
 }
@@ -435,6 +445,7 @@ mod tests {
         env::remove_var("NENYA_DEMOTE_HOLD_SECS");
         env::remove_var("NENYA_GOSSIP_BUDGET");
         env::remove_var("NENYA_SCOPE_TTL_SECS");
+        env::remove_var("NENYA_TAIL_BURST_FRACTION");
     }
 
     #[test]

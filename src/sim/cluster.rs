@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 use crate::engine::{BayesianEngine, EngineKind, HybridEngine, PeerRate, PidEngine};
 use crate::gossip::aggregate::{aggregate_peer_rates, PeerObservation};
 use crate::gossip::tier::{
-    budget_evictions, should_promote, DemotionTracker, RateWindow, TailScope, TierConfig,
+    budget_evictions, should_promote, tail_capacity, DemotionTracker, RateWindow, TailScope,
+    TierConfig,
 };
 use crate::pid_controller::PIDControllerBuilder;
 use crate::{RateLimiter, RateLimiterBuilder};
@@ -906,10 +907,11 @@ fn admit_one(cfg: &SimConfig, node: &mut SimNode, scope: &str, now: Instant) -> 
     let share = limit / num_nodes as f64;
 
     if !node.scopes.contains_key(scope) {
+        let capacity = tail_capacity(share, limit, &cfg.tier);
         node.scopes.insert(
             scope.to_string(),
             SimScope::Tail {
-                tail: TailScope::new(now, share, cfg.tier.estimator_window),
+                tail: TailScope::new(now, capacity, cfg.tier.estimator_window),
             },
         );
     }
@@ -944,7 +946,8 @@ fn admit_one(cfg: &SimConfig, node: &mut SimNode, scope: &str, now: Instant) -> 
     let promoted = promote_tokens.is_some();
     let admitted = match node.scopes.get_mut(scope).expect("entry exists") {
         SimScope::Tail { tail } => {
-            let admitted = tail.try_admit(now, share);
+            let capacity = tail_capacity(share, limit, &cfg.tier);
+            let admitted = tail.try_admit(now, share, capacity);
             if admitted {
                 node.tail_window.record(now);
             }
@@ -1004,13 +1007,18 @@ fn make_hot_limiter(
         ..cfg.estimator.unwrap_or(engine_default)
     };
 
+    // Mirror RateLimitManager::create_promoted_limiter: carry the tail
+    // bucket's depth (floored at one token) so promotion mid-burst
+    // doesn't truncate the burst
+    let carried_capacity = tail_tokens.max(share).max(1.0);
     let mut builder = RateLimiterBuilder::new(cfg.cluster_target)
         .cluster_target(cfg.cluster_target)
         .min_rate(cfg.min_rate)
         .max_rate(cfg.max_rate)
         .update_interval(cfg.pid_update_interval)
         .initial_timestamp(now)
-        .initial_refill_rate(share);
+        .initial_refill_rate(share)
+        .initial_capacity(carried_capacity);
     if let Some(k) = cfg.min_window_samples {
         builder = builder.min_window_samples(k);
     }
@@ -1020,12 +1028,11 @@ fn make_hot_limiter(
     if let Some(secs) = cfg.bucket_burst_seconds {
         builder = builder.bucket_burst_seconds(secs);
     }
-    // Carry the tail bucket's balance unless the scenario pins an explicit
-    // initial fill (config override wins, as elsewhere)
+    // Config override wins, as elsewhere
     let frac = match cfg.initial_tokens_frac {
         Some(f) => Some(f),
         None => {
-            let capacity = cfg.bucket_capacity.unwrap_or(share);
+            let capacity = cfg.bucket_capacity.unwrap_or(carried_capacity);
             if capacity > 0.0 {
                 Some((tail_tokens / capacity).clamp(0.0, 1.0))
             } else {

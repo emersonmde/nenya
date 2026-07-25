@@ -94,6 +94,30 @@ pub const DEFAULT_SCOPE_TTL: Duration = Duration::from_secs(60);
 /// of lag.
 pub const DEFAULT_TAIL_ESTIMATOR_WINDOW: Duration = Duration::from_secs(8);
 
+/// Default tail burst depth as a fraction of the limit (per-node bucket
+/// capacity = `max(share, tail_burst_fraction × limit) × 1 s`, floored at
+/// one token — the floor removes the sub-token starvation edge on
+/// clusters larger than the per-user rps limit).
+///
+/// Simulator-derived (`tier_threshold_sweep` axis 4, seed 42; tables in
+/// docs/capacity-model.md). Depth doesn't change long-run admission
+/// (refill stays at the fair share; deeper buckets refill proportionally
+/// slower) or steady per-user overage (flat at every fraction) — it
+/// trades how much of a *concentrated* burst one node absorbs
+/// (`fraction × limit`) against the worst-case cold-bucket spike for a
+/// synchronized, perfectly spread burst (`n × fraction × limit` per
+/// scope, at most once per bucket-refill period). 0.5 admits half a
+/// page-load-style burst through one node, keeps the service-pattern
+/// join burst inside the Milestone 5 budget (autoscale 2698 vs the 4000
+/// ceiling; 1.0 measures 2793), and matches the promotion threshold —
+/// one node absorbs bursts up to the utilization level at which
+/// coordination takes over, and a burst big enough to trip promotion
+/// carries its remaining tail tokens into the promoted limiter instead
+/// of being truncated. Per-user-focused deployments can raise it to 1.0
+/// for full Redis-style per-user burst semantics; DDoS-sensitive ones
+/// can lower it toward 0.
+pub const DEFAULT_TAIL_BURST_FRACTION: f64 = 0.5;
+
 /// Default per-node cap on gossiped scopes. Bounds the per-link gossip
 /// payload at `K × bytes_per_scope × 2/s` regardless of user count (see
 /// docs/capacity-model.md for the wire math the cap is derived from).
@@ -125,6 +149,16 @@ pub struct TierConfig {
     /// reads two clumped arrivals as 2 rps and spuriously promotes users
     /// far below their limit). Sweep-derived default.
     pub estimator_window: Duration,
+
+    /// Tail burst depth as a fraction of the limit: per-node bucket
+    /// capacity is `max(share, tail_burst_fraction × limit) × 1 s`,
+    /// floored at one token. Refill stays at the fair share, so this
+    /// trades *concentrated*-burst tolerance (a client bursting through
+    /// one node) against the worst-case cold-bucket spike
+    /// (`n × capacity` for a perfectly spread synchronized burst); the
+    /// long-run admission volume is depth-independent. Sweep-derived
+    /// default.
+    pub tail_burst_fraction: f64,
 }
 
 impl Default for TierConfig {
@@ -135,6 +169,7 @@ impl Default for TierConfig {
             demote_hold: DEFAULT_DEMOTE_HOLD,
             gossip_budget: DEFAULT_GOSSIP_BUDGET,
             estimator_window: DEFAULT_TAIL_ESTIMATOR_WINDOW,
+            tail_burst_fraction: DEFAULT_TAIL_BURST_FRACTION,
         }
     }
 }
@@ -162,6 +197,12 @@ impl TierConfig {
         }
         if self.estimator_window.is_zero() {
             return Err("estimator_window must be positive".to_string());
+        }
+        if !(0.0..=1.0).contains(&self.tail_burst_fraction) {
+            return Err(format!(
+                "tail_burst_fraction must be in [0, 1], got {}",
+                self.tail_burst_fraction
+            ));
         }
         Ok(())
     }
@@ -262,13 +303,12 @@ pub struct TailScope {
 }
 
 impl TailScope {
-    /// Create a tail scope with a full 1-second burst at the given share
-    /// (mirroring the library's adaptive `capacity = refill × 1 s`
-    /// default). `estimator_window` is the promotion-estimator length
-    /// (`TierConfig::estimator_window`).
-    pub fn new(now: Instant, share: f64, estimator_window: Duration) -> Self {
+    /// Create a tail scope with a full bucket at the given capacity (see
+    /// [`tail_capacity`]). `estimator_window` is the promotion-estimator
+    /// length (`TierConfig::estimator_window`).
+    pub fn new(now: Instant, capacity: f64, estimator_window: Duration) -> Self {
         TailScope {
-            tokens: share.max(0.0) * TAIL_WINDOW.as_secs_f64(),
+            tokens: capacity.max(0.0),
             last_refill: now,
             window: RateWindow::with_len(now, estimator_window),
         }
@@ -297,12 +337,12 @@ impl TailScope {
     }
 
     /// Try to admit one request at `now`, refilling at `share` tokens/sec
-    /// with a 1-second burst allowance. Returns `true` if admitted.
-    pub fn try_admit(&mut self, now: Instant, share: f64) -> bool {
+    /// up to `capacity` tokens (see [`tail_capacity`]). Returns `true` if
+    /// admitted.
+    pub fn try_admit(&mut self, now: Instant, share: f64, capacity: f64) -> bool {
         let share = share.max(0.0);
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        let capacity = share * TAIL_WINDOW.as_secs_f64();
-        self.tokens = (self.tokens + elapsed * share).min(capacity);
+        self.tokens = (self.tokens + elapsed * share).min(capacity.max(0.0));
         self.last_refill = now;
 
         if self.tokens >= 1.0 {
@@ -323,6 +363,15 @@ impl TailScope {
     pub fn last_activity(&self) -> Instant {
         self.last_refill
     }
+}
+
+/// Per-node tail bucket capacity in tokens: one second of the greater of
+/// the fair share and the configured burst fraction of the limit, floored
+/// at one token so a bucket can always eventually admit (see
+/// [`DEFAULT_TAIL_BURST_FRACTION`] for the starvation edge this floor
+/// removes).
+pub fn tail_capacity(share: f64, limit: f64, cfg: &TierConfig) -> f64 {
+    (share.max(cfg.tail_burst_fraction * limit) * TAIL_WINDOW.as_secs_f64()).max(1.0)
 }
 
 /// Should a tail scope be promoted into gossip coordination?
@@ -413,20 +462,20 @@ mod tests {
     fn test_tail_bucket_enforces_share() {
         let start = Instant::now();
         let mut tail = TailScope::new(start, 10.0, TAIL_WINDOW);
-        // Full 1s burst at share 10 → 10 tokens
+        // Full bucket at capacity 10 → 10 tokens
         let mut admitted = 0;
         for _ in 0..20 {
-            if tail.try_admit(start, 10.0) {
+            if tail.try_admit(start, 10.0, 10.0) {
                 admitted += 1;
             }
         }
-        assert_eq!(admitted, 10, "burst capped at share × 1s");
+        assert_eq!(admitted, 10, "burst capped at capacity");
 
         // One second later the bucket has earned exactly `share` tokens
         let later = start + Duration::from_secs(1);
         let mut refilled = 0;
         for _ in 0..20 {
-            if tail.try_admit(later, 10.0) {
+            if tail.try_admit(later, 10.0, 10.0) {
                 refilled += 1;
             }
         }
@@ -440,7 +489,7 @@ mod tests {
         // 50 rps for 3 seconds
         for i in 0..150 {
             let t = start + Duration::from_millis(i * 20);
-            assert!(tail.try_admit(t, 1000.0));
+            assert!(tail.try_admit(t, 1000.0, 1000.0));
         }
         let rate = tail.local_rate(start + Duration::from_secs(3));
         assert!(
@@ -455,11 +504,44 @@ mod tests {
         let start = Instant::now();
         let mut tail = TailScope::new(start, 100.0, TAIL_WINDOW);
         for i in 0..100 {
-            tail.try_admit(start + Duration::from_millis(i * 10), 100.0);
+            tail.try_admit(start + Duration::from_millis(i * 10), 100.0, 100.0);
         }
         // Two full idle windows later the estimate reads zero
         let rate = tail.local_rate(start + Duration::from_secs(4));
         assert_eq!(rate, 0.0);
+    }
+
+    #[test]
+    fn test_tail_capacity_floor_prevents_starvation() {
+        // Sub-token shares (cluster larger than the per-user limit) must
+        // still be admissible: capacity floors at one token
+        let cfg = TierConfig {
+            tail_burst_fraction: 0.0,
+            ..TierConfig::default()
+        };
+        let share = 0.2; // limit 10, 50 nodes
+        let capacity = tail_capacity(share, 10.0, &cfg);
+        assert!(capacity >= 1.0, "capacity {} below one token", capacity);
+
+        let start = Instant::now();
+        let mut tail = TailScope::new(start, capacity, TAIL_WINDOW);
+        assert!(
+            tail.try_admit(start, share, capacity),
+            "a fresh sub-token-share bucket must admit its first request"
+        );
+        // And keeps admitting at the share rate: one token every 5s
+        assert!(!tail.try_admit(start + Duration::from_secs(1), share, capacity));
+        assert!(tail.try_admit(start + Duration::from_secs(6), share, capacity));
+    }
+
+    #[test]
+    fn test_tail_capacity_burst_fraction() {
+        let cfg = TierConfig::default(); // tail_burst_fraction 0.5
+                                         // Large cluster: fraction of the limit dominates the share
+        assert_eq!(tail_capacity(0.4, 10.0, &cfg), 5.0);
+        // Small cluster: the share dominates
+        assert_eq!(tail_capacity(100.0, 300.0, &cfg), 150.0);
+        assert_eq!(tail_capacity(200.0, 300.0, &cfg), 200.0);
     }
 
     #[test]

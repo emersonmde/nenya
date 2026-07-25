@@ -235,7 +235,12 @@ simulator, the stateright model, and production run the same code.
 - **Tail tier (default for distributed patterns)**: local-only enforcement
   of the equal share `limit / (1 + live_peers)`; compact state (`TailScope`:
   token bucket + a two-bucket sliding-window rate estimator, 48 bytes, no
-  engine), no gossip. Measured ~360 B/scope all-in at 1M scopes. Idle
+  engine), no gossip. Bucket depth is `max(share, tail_burst_fraction ×
+  limit) × 1s` (default fraction 0.5, per-pattern config, floored at one
+  token) so a concentrated burst through one node gets a meaningful slice
+  of the limit even on large clusters, and sub-token fair shares cannot
+  starve; the promoted limiter's adaptive capacity is likewise floored at
+  4 tokens (sweep data in capacity-model.md). Measured ~360 B/scope all-in at 1M scopes. Idle
   scopes are TTL-evicted (default 60 s — behaviorally lossless once idle
   past the estimator window, so the knob only trades recreation churn
   against idle-set memory).

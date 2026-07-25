@@ -77,6 +77,12 @@ pub struct ScopePattern {
     /// `tier::DEFAULT_DEMOTE_HOLD`.
     #[serde(default)]
     pub demote_hold_secs: Option<f64>,
+
+    /// Tail burst depth as a fraction of the limit (per-node bucket
+    /// capacity = `max(share, fraction × target_rate) × 1 s`, floored at
+    /// one token). Defaults to `tier::DEFAULT_TAIL_BURST_FRACTION`.
+    #[serde(default)]
+    pub tail_burst_fraction: Option<f64>,
 }
 
 #[cfg(feature = "server")]
@@ -100,6 +106,7 @@ impl ScopePattern {
             promote_utilization: None,
             demote_utilization: None,
             demote_hold_secs: None,
+            tail_burst_fraction: None,
         }
     }
 
@@ -122,6 +129,9 @@ impl ScopePattern {
                 .unwrap_or(defaults.demote_hold),
             gossip_budget,
             estimator_window: defaults.estimator_window,
+            tail_burst_fraction: self
+                .tail_burst_fraction
+                .unwrap_or(defaults.tail_burst_fraction),
         }
     }
 
@@ -513,14 +523,17 @@ impl RateLimitManager {
         tail_tokens: f64,
         now: Instant,
     ) -> RateLimiter<f64> {
-        let mut builder = self
-            .limiter_builder(pattern)
+        // Carry the tail bucket's depth through the tier switch (floored
+        // at one token like the adaptive allowance): promotion often
+        // fires mid-burst, and a share-sized fresh bucket would truncate
+        // the burst the tail tier had already granted
+        let capacity = tail_tokens.max(share).max(1.0);
+        self.limiter_builder(pattern)
             .initial_timestamp(now)
-            .initial_refill_rate(share);
-        if share > 0.0 {
-            builder = builder.initial_tokens_frac((tail_tokens / share).clamp(0.0, 1.0));
-        }
-        builder.build()
+            .initial_refill_rate(share)
+            .initial_capacity(capacity)
+            .initial_tokens_frac((tail_tokens / capacity).clamp(0.0, 1.0))
+            .build()
     }
 
     /// Create the initial entry for a scope: distributed patterns start in
@@ -530,9 +543,11 @@ impl RateLimitManager {
         let pattern = &self.patterns[pattern_idx];
         if pattern.distributed {
             let share = pattern.target_rate / (1 + self.live_peers) as f64;
-            let est_window = pattern.tier_config(self.gossip_budget).estimator_window;
+            let tier_cfg = pattern.tier_config(self.gossip_budget);
+            let capacity =
+                crate::gossip::tier::tail_capacity(share, pattern.target_rate, &tier_cfg);
             ScopeEntry::Tail {
-                tail: TailScope::new(now, share, est_window),
+                tail: TailScope::new(now, capacity, tier_cfg.estimator_window),
                 pattern_idx,
             }
         } else {
@@ -605,7 +620,8 @@ impl RateLimitManager {
                 let Some(ScopeEntry::Tail { tail, .. }) = self.scopes.get_mut(scope) else {
                     unreachable!("checked above");
                 };
-                let admitted = tail.try_admit(now, share);
+                let capacity = crate::gossip::tier::tail_capacity(share, limit, &tier_cfg);
+                let admitted = tail.try_admit(now, share, capacity);
                 let local_accepted_rate = tail.local_rate(now);
                 if admitted {
                     // Maintain the per-pattern tail aggregate incrementally
@@ -1036,6 +1052,7 @@ mod tests {
             promote_utilization: None,
             demote_utilization: None,
             demote_hold_secs: None,
+            tail_burst_fraction: None,
         };
 
         assert_eq!(pattern.matches("api#premium"), PatternMatch::Exact);
@@ -1063,6 +1080,7 @@ mod tests {
             promote_utilization: None,
             demote_utilization: None,
             demote_hold_secs: None,
+            tail_burst_fraction: None,
         };
 
         assert_eq!(pattern.matches("api#premium"), PatternMatch::Wildcard);
@@ -1130,6 +1148,7 @@ mod tests {
             promote_utilization: None,
             demote_utilization: None,
             demote_hold_secs: None,
+            tail_burst_fraction: None,
         });
 
         manager.add_pattern(ScopePattern {
@@ -1149,6 +1168,7 @@ mod tests {
             promote_utilization: None,
             demote_utilization: None,
             demote_hold_secs: None,
+            tail_burst_fraction: None,
         });
 
         // Exact match should take priority
@@ -1189,6 +1209,7 @@ mod tests {
             promote_utilization: None,
             demote_utilization: None,
             demote_hold_secs: None,
+            tail_burst_fraction: None,
         });
 
         manager.add_pattern(ScopePattern {
@@ -1208,6 +1229,7 @@ mod tests {
             promote_utilization: None,
             demote_utilization: None,
             demote_hold_secs: None,
+            tail_burst_fraction: None,
         });
 
         // Most specific wildcard should match

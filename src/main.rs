@@ -72,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             promote_utilization: config.promote_utilization,
             demote_utilization: config.demote_utilization,
             demote_hold_secs: config.demote_hold_secs,
+            tail_burst_fraction: config.tail_burst_fraction,
         };
 
         manager.set_default_pattern(distributed_pattern);

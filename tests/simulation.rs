@@ -568,6 +568,83 @@ fn test_user_ramp_tail_hot_tail_journey() {
     );
 }
 
+/// Large-cluster sparse-share regression (Milestone 6 follow-up): a
+/// cluster larger than the per-user rps limit gives every scope a
+/// sub-1-rps fair share. Before the capacity floor, tail buckets could
+/// never accumulate a whole token (permanent starvation, and — since the
+/// promotion estimator counts accepts — no escape via promotion), and
+/// even after promotion the one-token adaptive bucket lost ~40% of a
+/// Poisson stream to clumping. With the 4-token floor the user is served
+/// ~0.94 of offered (seed 42).
+#[test]
+fn test_sparse_share_large_cluster_not_starved() {
+    use nenya::sim::{LoadPattern, Scenario, SimConfig, Workload};
+
+    let mut cfg = SimConfig::default().with_cluster_target(10.0);
+    cfg.num_nodes = 25; // share = 0.4 rps < 1 token/s
+    let s = Scenario::new(
+        "starved",
+        cfg,
+        vec![Workload::new(
+            "user:sustained",
+            LoadPattern::Constant { rate: 8.0 },
+        )],
+    )
+    .duration(Duration::from_secs(60));
+    let cluster = run_cluster(&s, SEED);
+    let (offered, accepted) = cluster.scope_counts("user:sustained");
+    let served = accepted as f64 / offered.max(1) as f64;
+    assert!(
+        served >= 0.85,
+        "8 rps user under a 10 rps limit on 25 nodes served only {:.2} of offered",
+        served
+    );
+}
+
+/// Concentrated-burst allowance (Milestone 6 follow-up): a burst through
+/// one node must get `tail_burst_fraction × limit` admitted, and a burst
+/// big enough to trip promotion must carry its remaining tail tokens into
+/// the promoted limiter instead of being truncated.
+#[test]
+fn test_concentrated_burst_gets_fractional_limit() {
+    use nenya::sim::{ArrivalProcess, LoadPattern, Scenario, SimConfig, Workload};
+
+    for (frac, expect) in [(0.5, 5), (1.0, 10)] {
+        let mut cfg = SimConfig::default().with_cluster_target(10.0);
+        cfg.num_nodes = 10;
+        cfg.tier.tail_burst_fraction = frac;
+        let mut weights = vec![0.0; 10];
+        weights[0] = 1.0;
+        let s = Scenario::new(
+            "burst_ux",
+            cfg,
+            vec![Workload::new(
+                "user:bursty",
+                LoadPattern::Piecewise {
+                    steps: vec![
+                        (Duration::ZERO, 0.0),
+                        (Duration::from_secs(10), 2000.0),
+                        (Duration::from_millis(10_010), 0.0),
+                    ],
+                },
+            )
+            .arrival(ArrivalProcess::Deterministic)
+            .node_weights(weights)],
+        )
+        .duration(Duration::from_secs(12));
+        let cluster = run_cluster(&s, SEED);
+        let (offered, accepted) = cluster.scope_counts("user:bursty");
+        assert_eq!(offered, 20);
+        assert!(
+            accepted >= expect,
+            "frac {}: 20-request burst through one node admitted {} (expected ≥ {})",
+            frac,
+            accepted,
+            expect
+        );
+    }
+}
+
 /// Routing-strategy robustness (Milestone 6 follow-up): the two-tier
 /// invariants must hold under every load-balancing policy, not just the
 /// uniform-random one the promotion estimate assumes. Round-robin is
@@ -748,6 +825,78 @@ fn tier_threshold_sweep() {
         println!(
             "| {:.1} | {} | {:.2} | {:.2} | {:.2} | {:.0} |",
             promote, promoted, worst_unpromoted, worst_promoted, worst_ratio, max_1s
+        );
+    }
+
+    // --- Axis 4: tail burst depth (concentrated-burst UX vs cold-bucket
+    // spike vs service-pattern join burst) ---
+    println!("\n### tail_burst_fraction sweep\n");
+    println!("| frac | starved regime served (8 rps user, 25 nodes, limit 10) | 20-req burst via 1 node admitted (limit 10, 10 nodes) | autoscale overshoot (service L=300, budget <4000) | pareto worst unpromoted rps |");
+    println!("|------|------|------|------|------|");
+    for frac in [0.0, 0.25, 0.5, 1.0] {
+        // (a) Starved regime: cluster larger than the per-user limit
+        let mut cfg = SimConfig::default().with_cluster_target(10.0);
+        cfg.num_nodes = 25;
+        cfg.tier.tail_burst_fraction = frac;
+        let s = Scenario::new(
+            "sweep_starved",
+            cfg,
+            vec![Workload::new(
+                "user:sustained",
+                LoadPattern::Constant { rate: 8.0 },
+            )],
+        )
+        .duration(Duration::from_secs(60));
+        let cluster = run_cluster(&s, SEED);
+        let (offered, accepted) = cluster.scope_counts("user:sustained");
+        let served = accepted as f64 / offered.max(1) as f64;
+
+        // (b) Concentrated burst: 20 requests in one tick through one node
+        let mut cfg = SimConfig::default().with_cluster_target(10.0);
+        cfg.num_nodes = 10;
+        cfg.tier.tail_burst_fraction = frac;
+        let s2 = Scenario::new(
+            "sweep_burst",
+            cfg,
+            vec![Workload::new(
+                "user:bursty",
+                LoadPattern::Piecewise {
+                    steps: vec![
+                        (Duration::ZERO, 0.0),
+                        (Duration::from_secs(10), 2000.0),
+                        (Duration::from_millis(10_010), 0.0),
+                    ],
+                },
+            )
+            .arrival(nenya::sim::ArrivalProcess::Deterministic)
+            .node_weights(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])],
+        )
+        .duration(Duration::from_secs(12));
+        let cluster = run_cluster(&s2, SEED);
+        let (b_offered, b_accepted) = cluster.scope_counts("user:bursty");
+
+        // (c) Service-pattern join burst: the autoscale scenario with this
+        // fraction (fresh nodes create tail scopes with frac × 300 tokens)
+        let mut auto = scenario::autoscale();
+        auto.cfg.tier.tail_burst_fraction = frac;
+        let r = auto.run(SEED);
+        let auto_overshoot = r.summary.integrated_overshoot;
+
+        // (d) Per-user overage: pareto with this fraction
+        let mut cfg = SimConfig::default().with_cluster_target(10.0);
+        cfg.tier.tail_burst_fraction = frac;
+        let s3 = Scenario::new("sweep_pareto", cfg, Vec::new()).population(population());
+        let cluster = run_cluster(&s3, SEED);
+        let mut worst_unpromoted: f64 = 0.0;
+        for (scope, _, accepted) in cluster.all_scope_counts() {
+            if !cluster.was_ever_hot(scope) {
+                worst_unpromoted = worst_unpromoted.max(accepted as f64 / 60.0);
+            }
+        }
+
+        println!(
+            "| {:.2} | {:.2} | {}/{} | {:.0} | {:.2} |",
+            frac, served, b_accepted, b_offered, auto_overshoot, worst_unpromoted
         );
     }
 
