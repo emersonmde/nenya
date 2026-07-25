@@ -526,7 +526,8 @@ cargo fmt -- --check && cargo clippy --all-targets --all-features -- -D warnings
 
 ## Milestone 6: Per-User Scale — Two-Tier Coordination
 
-- [x] **MILESTONE COMPLETE**
+- [x] **MILESTONE COMPLETE** (commits e025c04 → 0078c3e → 7263456 →
+  b344593 → 36e3fc5 → 9462075)
 
 **Goal**: Support millions of per-user scopes per cluster. Per-user distributed
 throttling is the core value proposition — per-client/service limits can often
