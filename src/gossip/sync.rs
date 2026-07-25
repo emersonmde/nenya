@@ -133,10 +133,10 @@ mod tests {
         pattern.distributed = true;
         mgr.set_default_pattern(pattern);
 
-        // Drive enough accepted traffic inside one estimator window to
-        // cross the promotion threshold (0.5 × 100 rps with no peers)
+        // Drive enough accepted traffic inside one estimator window (8s)
+        // to cross the promotion threshold (0.5 × 100 rps with no peers)
         let start = std::time::Instant::now();
-        for i in 0..80 {
+        for i in 0..600 {
             mgr.should_throttle_at("test-scope", start + Duration::from_millis(i * 10));
         }
         assert_eq!(mgr.scope_tier("test-scope"), Some("hot"));

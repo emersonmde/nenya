@@ -175,6 +175,224 @@ impl Model for AggregationModel {
     }
 }
 
+// ===== Two-tier promotion/demotion state machine (Milestone 6.4) =====
+//
+// Exhaustively explores every interleaving of rate changes, clock ticks,
+// and sync passes for one scope on one node, driving the **real**
+// `gossip::tier` decision code (`should_promote` + `DemotionTracker`) in
+// every reachable state. Invariants: demotion honors the hysteresis hold
+// (never fires within `hold` of an above-threshold observation), and the
+// machine cannot flap — the number of tier transitions is bounded by the
+// number of input rate changes plus one.
+//
+// Estimation noise is deliberately out of scope here (the simulator sweep
+// quantifies it); the model checks the discrete state machine.
+
+use nenya::gossip::tier::{should_promote, DemotionTracker, TierConfig};
+
+const LIMIT: f64 = 10.0;
+const NUM_NODES: usize = 3;
+const HOLD_TICKS: u8 = 3;
+const TIER_HORIZON: u8 = 8;
+
+/// Input rate levels: below the demotion threshold, between the two
+/// thresholds, and at/above the promotion threshold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum RateLevel {
+    Low,
+    Mid,
+    High,
+}
+
+impl RateLevel {
+    /// Observed cluster rate for the level (local × n for the promotion
+    /// test uses the same value: the model's rates are exact, noise-free)
+    fn cluster_rate(self, cfg: &TierConfig) -> f64 {
+        match self {
+            RateLevel::Low => cfg.demote_utilization * LIMIT * 0.5,
+            RateLevel::Mid => (cfg.demote_utilization + cfg.promote_utilization) / 2.0 * LIMIT,
+            RateLevel::High => cfg.promote_utilization * LIMIT * 1.2,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TierState {
+    time: u8,
+    rate: RateLevel,
+    hot: bool,
+    /// Mirror of `DemotionTracker::below_since` (tick granularity); the
+    /// real tracker is reconstructed from this and driven through its real
+    /// `observe` on every sync
+    below_since: Option<u8>,
+    /// Last sync tick that observed a rate at/above the demote threshold
+    last_high_sync: Option<u8>,
+    /// Tier transitions so far (saturating)
+    transitions: u8,
+    /// Input rate changes so far (saturating)
+    rate_changes: u8,
+    /// Set if a demotion ever fired within `hold` of an above-threshold
+    /// sync observation (must be unreachable)
+    hysteresis_violated: bool,
+    synced_this_tick: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum TierAction {
+    Tick,
+    SetRate(RateLevel),
+    Sync,
+}
+
+struct TierModel {
+    cfg: TierConfig,
+    base: std::time::Instant,
+}
+
+impl TierModel {
+    fn at(&self, tick: u8) -> std::time::Instant {
+        self.base + Duration::from_secs(tick as u64)
+    }
+
+    /// Run the real demotion decision: rebuild a `DemotionTracker` from the
+    /// recorded `below_since` (one seeding observe at that tick — exactly
+    /// what the real tracker would hold) and feed it the current
+    /// observation.
+    fn demote_decision(&self, state: &TierState, rate: f64) -> bool {
+        let mut tracker = DemotionTracker::default();
+        if let Some(t0) = state.below_since {
+            let seeded = tracker.observe(0.0, LIMIT, self.at(t0), &self.cfg);
+            debug_assert!(!seeded || t0 == 0);
+        }
+        tracker.observe(rate, LIMIT, self.at(state.time), &self.cfg)
+    }
+}
+
+impl Model for TierModel {
+    type State = TierState;
+    type Action = TierAction;
+
+    fn init_states(&self) -> Vec<Self::State> {
+        vec![TierState {
+            time: 0,
+            rate: RateLevel::Low,
+            hot: false,
+            below_since: None,
+            last_high_sync: None,
+            transitions: 0,
+            rate_changes: 0,
+            hysteresis_violated: false,
+            synced_this_tick: false,
+        }]
+    }
+
+    fn actions(&self, state: &Self::State, actions: &mut Vec<Self::Action>) {
+        if state.time < TIER_HORIZON {
+            actions.push(TierAction::Tick);
+        }
+        for level in [RateLevel::Low, RateLevel::Mid, RateLevel::High] {
+            if level != state.rate {
+                actions.push(TierAction::SetRate(level));
+            }
+        }
+        if !state.synced_this_tick {
+            actions.push(TierAction::Sync);
+        }
+    }
+
+    fn next_state(&self, last: &Self::State, action: Self::Action) -> Option<Self::State> {
+        let mut next = last.clone();
+        match action {
+            TierAction::Tick => {
+                next.time += 1;
+                next.synced_this_tick = false;
+            }
+            TierAction::SetRate(level) => {
+                next.rate = level;
+                next.rate_changes = next.rate_changes.saturating_add(1);
+            }
+            TierAction::Sync => {
+                next.synced_this_tick = true;
+                let rate = last.rate.cluster_rate(&self.cfg);
+                if last.hot {
+                    // Demotion path: real DemotionTracker
+                    let demote = self.demote_decision(last, rate);
+                    let below = rate < self.cfg.demote_utilization * LIMIT;
+                    if below {
+                        next.below_since.get_or_insert(last.time);
+                    } else {
+                        next.below_since = None;
+                        next.last_high_sync = Some(last.time);
+                    }
+                    if demote {
+                        // Hysteresis check: an above-threshold observation
+                        // within the hold window forbids demotion
+                        if let Some(high_at) = last.last_high_sync {
+                            if last.time.saturating_sub(high_at) < HOLD_TICKS {
+                                next.hysteresis_violated = true;
+                            }
+                        }
+                        next.hot = false;
+                        next.below_since = None;
+                        next.transitions = next.transitions.saturating_add(1);
+                    }
+                } else {
+                    // Promotion path: real threshold test (local × n with
+                    // local = cluster / n — exact rates, uniform routing)
+                    if should_promote(rate / NUM_NODES as f64, NUM_NODES, LIMIT, &self.cfg) {
+                        next.hot = true;
+                        next.below_since = None;
+                        next.transitions = next.transitions.saturating_add(1);
+                    }
+                    if rate >= self.cfg.demote_utilization * LIMIT {
+                        next.last_high_sync = Some(last.time);
+                    }
+                }
+            }
+        }
+        Some(next)
+    }
+
+    fn properties(&self) -> Vec<Property<Self>> {
+        vec![
+            // Demotion never fires within the hold window of an observation
+            // at/above the demote threshold
+            Property::<Self>::always("hysteresis hold respected", |_, state| {
+                !state.hysteresis_violated
+            }),
+            // No flapping: each tier transition needs an input change —
+            // constant input yields at most one transition
+            Property::<Self>::always("transitions bounded by input changes", |_, state| {
+                state.transitions <= state.rate_changes.saturating_add(1)
+            }),
+            // A hot scope with a recorded below_since is genuinely below
+            // the demote threshold at that recording (structural sanity of
+            // the mirror)
+            Property::<Self>::always("below_since only while hot", |_, state| {
+                state.hot || state.below_since.is_none()
+            }),
+        ]
+    }
+}
+
+#[test]
+fn model_check_tier_state_machine() {
+    let model = TierModel {
+        cfg: TierConfig {
+            demote_hold: Duration::from_secs(HOLD_TICKS as u64),
+            ..TierConfig::default()
+        },
+        base: std::time::Instant::now(),
+    };
+    let checker = model.checker().spawn_bfs().join();
+    checker.assert_properties();
+    assert!(
+        checker.unique_state_count() > 10_000,
+        "state space unexpectedly small: {}",
+        checker.unique_state_count()
+    );
+}
+
 #[test]
 fn model_check_aggregation_invariants() {
     let checker = AggregationModel.checker().spawn_bfs().join();

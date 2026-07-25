@@ -54,6 +54,11 @@ pub enum LoadPattern {
         base: f64,
         components: Vec<SineComponent>,
     },
+
+    /// Piecewise-constant: the rate of the last `(at, rate)` step whose
+    /// time is ≤ t (0.0 before the first step). Steps must be sorted by
+    /// time. Used for multi-phase journeys like tail → hot → tail.
+    Piecewise { steps: Vec<(Duration, f64)> },
 }
 
 impl LoadPattern {
@@ -105,6 +110,12 @@ impl LoadPattern {
                 }
                 rate
             }
+            LoadPattern::Piecewise { steps } => steps
+                .iter()
+                .take_while(|(at, _)| *at <= t)
+                .last()
+                .map(|(_, rate)| *rate)
+                .unwrap_or(0.0),
         };
         rate.max(0.0)
     }
@@ -140,6 +151,60 @@ pub struct Workload {
     /// down node's share is redistributed proportionally — matching a load
     /// balancer that stops routing to a dead instance.
     pub node_weights: Option<Vec<f64>>,
+}
+
+/// How a population's per-user traffic maps onto nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Routing {
+    /// Each arrival lands on a uniformly random up node — the
+    /// load-balancer assumption behind the `local_rate × num_nodes`
+    /// promotion estimate
+    Uniform,
+
+    /// Session affinity: all of a user's traffic lands on one node
+    /// (`user_rank % num_nodes`, skipping down nodes) — the worst case for
+    /// the uniform-routing estimate
+    Sticky,
+}
+
+/// A heavy-tailed population of per-user scopes (Milestone 6): `users`
+/// distinct scopes named `{prefix}{rank}` sharing one total offered-rate
+/// curve, split across users by a Zipf rank-frequency law
+/// (`weight(rank) ∝ 1 / (rank + 1)^zipf_s`) — the discrete analog of
+/// Pareto-distributed API usage. Arrivals are always Poisson.
+#[derive(Debug, Clone)]
+pub struct PopulationWorkload {
+    /// Scope-name prefix (scope = `{prefix}{rank}`)
+    pub prefix: String,
+
+    /// Number of distinct users
+    pub users: usize,
+
+    /// Zipf exponent (1.0 ≈ classic rank-frequency; larger = heavier head)
+    pub zipf_s: f64,
+
+    /// Total offered rate over time (whole population, cluster-wide)
+    pub pattern: LoadPattern,
+
+    /// Per-arrival node routing
+    pub routing: Routing,
+}
+
+impl PopulationWorkload {
+    pub fn new(prefix: impl Into<String>, users: usize, zipf_s: f64, pattern: LoadPattern) -> Self {
+        PopulationWorkload {
+            prefix: prefix.into(),
+            users,
+            zipf_s,
+            pattern,
+            routing: Routing::Uniform,
+        }
+    }
+
+    pub fn routing(mut self, routing: Routing) -> Self {
+        self.routing = routing;
+        self
+    }
 }
 
 impl Workload {

@@ -27,7 +27,8 @@ use crate::{RateLimiter, RateLimiterBuilder};
 pub use crate::engine::BayesianParams;
 
 use super::rng::SplitMix64;
-use super::workload::{ArrivalProcess, Workload};
+use super::workload::{ArrivalProcess, PopulationWorkload, Routing, Workload};
+use std::collections::HashSet;
 
 /// Message-bus gossip model parameters.
 #[derive(Debug, Clone)]
@@ -264,10 +265,52 @@ pub struct TickCounts {
     pub per_node_accepted: Vec<u64>,
 }
 
+/// Runtime state of one heavy-tailed user population: the workload, its
+/// precomputed Zipf CDF, and a dedicated arrival RNG.
+struct PopState {
+    wl: PopulationWorkload,
+    /// Cumulative rank-frequency distribution (`cdf[r]` = P(rank ≤ r))
+    cdf: Vec<f64>,
+    rng: SplitMix64,
+}
+
+impl PopState {
+    fn new(wl: PopulationWorkload, rng: SplitMix64) -> Self {
+        let mut cdf = Vec::with_capacity(wl.users);
+        let mut total = 0.0;
+        for rank in 0..wl.users {
+            total += 1.0 / ((rank + 1) as f64).powf(wl.zipf_s);
+            cdf.push(total);
+        }
+        for c in cdf.iter_mut() {
+            *c /= total;
+        }
+        PopState { wl, cdf, rng }
+    }
+
+    /// Sample a user rank from the Zipf CDF (binary search).
+    fn sample_user(&mut self) -> usize {
+        let u = self.rng.next_f64();
+        self.cdf.partition_point(|&c| c < u).min(self.wl.users - 1)
+    }
+}
+
 pub struct SimCluster {
     cfg: SimConfig,
     workloads: Vec<Workload>,
+    populations: Vec<PopState>,
     nodes: Vec<SimNode>,
+    /// Cluster-wide per-scope request counters (offered, accepted) —
+    /// per-user assertions in the Milestone 6 scenarios read these
+    scope_offered: HashMap<String, u64>,
+    scope_accepted: HashMap<String, u64>,
+    /// Scopes that were ever promoted to the hot tier on any node
+    ever_hot: HashSet<String>,
+    /// Promotion events per scope across all nodes (local + peer-triggered)
+    /// — the flap metric for the demotion-hysteresis sweep
+    promotion_count: HashMap<String, u32>,
+    /// High-water mark of each node's hot-tier size (gossip payload bound)
+    max_hot: Vec<usize>,
     /// Partition group per node; same group = connected
     group: Vec<usize>,
     /// Messages in flight, keyed by delivery tick
@@ -283,6 +326,15 @@ pub struct SimCluster {
 
 impl SimCluster {
     pub fn new(cfg: SimConfig, workloads: Vec<Workload>, seed: u64) -> Self {
+        Self::with_populations(cfg, workloads, Vec::new(), seed)
+    }
+
+    pub fn with_populations(
+        cfg: SimConfig,
+        workloads: Vec<Workload>,
+        populations: Vec<PopulationWorkload>,
+        seed: u64,
+    ) -> Self {
         assert!(cfg.num_nodes > 0, "cluster needs at least one node");
         assert!(!cfg.tick.is_zero(), "tick must be positive");
 
@@ -317,10 +369,21 @@ impl SimCluster {
             .map(|i| i * sync_ticks / cfg.num_nodes as u64)
             .collect();
 
+        let populations: Vec<PopState> = populations
+            .into_iter()
+            .map(|wl| PopState::new(wl, root_rng.fork()))
+            .collect();
+
         SimCluster {
             group: vec![0; cfg.num_nodes],
+            max_hot: vec![0; cfg.num_nodes],
             nodes,
             workloads,
+            populations,
+            scope_offered: HashMap::new(),
+            scope_accepted: HashMap::new(),
+            ever_hot: HashSet::new(),
+            promotion_count: HashMap::new(),
             inbox: BTreeMap::new(),
             start,
             tick_index: 0,
@@ -344,9 +407,54 @@ impl SimCluster {
         self.start + self.sim_time()
     }
 
-    /// Total offered rate across workloads at simulated time `t`.
+    /// Total offered rate across workloads and populations at simulated
+    /// time `t`.
     pub fn offered_rate_at(&self, t: Duration) -> f64 {
-        self.workloads.iter().map(|w| w.pattern.rate_at(t)).sum()
+        self.workloads
+            .iter()
+            .map(|w| w.pattern.rate_at(t))
+            .chain(self.populations.iter().map(|p| p.wl.pattern.rate_at(t)))
+            .sum()
+    }
+
+    /// Cluster-wide (offered, accepted) request totals for a scope.
+    pub fn scope_counts(&self, scope: &str) -> (u64, u64) {
+        (
+            self.scope_offered.get(scope).copied().unwrap_or(0),
+            self.scope_accepted.get(scope).copied().unwrap_or(0),
+        )
+    }
+
+    /// All scopes with their cluster-wide (offered, accepted) totals.
+    pub fn all_scope_counts(&self) -> impl Iterator<Item = (&String, u64, u64)> {
+        self.scope_offered.iter().map(|(scope, &offered)| {
+            (
+                scope,
+                offered,
+                self.scope_accepted.get(scope).copied().unwrap_or(0),
+            )
+        })
+    }
+
+    /// Was this scope ever promoted to the hot tier on any node?
+    pub fn was_ever_hot(&self, scope: &str) -> bool {
+        self.ever_hot.contains(scope)
+    }
+
+    /// Number of scopes ever promoted on any node.
+    pub fn num_ever_hot(&self) -> usize {
+        self.ever_hot.len()
+    }
+
+    /// Promotion events for a scope across all nodes (re-promotions count).
+    pub fn promotions_of(&self, scope: &str) -> u32 {
+        self.promotion_count.get(scope).copied().unwrap_or(0)
+    }
+
+    /// High-water mark of a node's hot-tier size (bounds its gossip
+    /// payload: at most this many scope keys were ever published).
+    pub fn max_hot_scopes(&self, node: usize) -> usize {
+        self.max_hot[node]
     }
 
     pub fn node_is_up(&self, i: usize) -> bool {
@@ -493,12 +601,73 @@ impl SimCluster {
                 }
                 for _ in 0..n_arrivals {
                     counts.offered += 1;
-                    if admit_one(&self.cfg, node, &scope, now) {
+                    *self.scope_offered.entry(scope.clone()).or_default() += 1;
+                    let outcome = admit_one(&self.cfg, node, &scope, now);
+                    if outcome.promoted {
+                        self.ever_hot.insert(scope.clone());
+                        *self.promotion_count.entry(scope.clone()).or_default() += 1;
+                    }
+                    if outcome.admitted {
                         counts.accepted += 1;
                         counts.per_node_accepted[i] += 1;
+                        *self.scope_accepted.entry(scope.clone()).or_default() += 1;
                     }
                 }
             }
+        }
+
+        // 4. Population arrivals (heavy-tailed per-user traffic): draw the
+        // total Poisson arrival count from the offered curve, then assign
+        // each arrival a user by the Zipf law and a node by the routing
+        // policy
+        let up_nodes: Vec<usize> = (0..self.cfg.num_nodes)
+            .filter(|&i| self.nodes[i].up)
+            .collect();
+        if !up_nodes.is_empty() {
+            for p in 0..self.populations.len() {
+                let lambda = self.populations[p].wl.pattern.rate_at(t) * dt;
+                if lambda <= 0.0 {
+                    continue;
+                }
+                let n_arrivals = self.populations[p].rng.poisson(lambda);
+                for _ in 0..n_arrivals {
+                    let pop = &mut self.populations[p];
+                    let user = pop.sample_user();
+                    let scope = format!("{}{}", pop.wl.prefix, user);
+                    let node_idx = match pop.wl.routing {
+                        Routing::Uniform => {
+                            up_nodes[(pop.rng.next_u64() % up_nodes.len() as u64) as usize]
+                        }
+                        Routing::Sticky => {
+                            // Preferred node by user identity; fall forward
+                            // to the next up node when it's down
+                            let preferred = user % self.cfg.num_nodes;
+                            (0..self.cfg.num_nodes)
+                                .map(|k| (preferred + k) % self.cfg.num_nodes)
+                                .find(|&i| self.nodes[i].up)
+                                .expect("at least one up node")
+                        }
+                    };
+                    counts.offered += 1;
+                    *self.scope_offered.entry(scope.clone()).or_default() += 1;
+                    let node = &mut self.nodes[node_idx];
+                    let outcome = admit_one(&self.cfg, node, &scope, now);
+                    if outcome.promoted {
+                        self.ever_hot.insert(scope.clone());
+                        *self.promotion_count.entry(scope.clone()).or_default() += 1;
+                    }
+                    if outcome.admitted {
+                        counts.accepted += 1;
+                        counts.per_node_accepted[node_idx] += 1;
+                        *self.scope_accepted.entry(scope).or_default() += 1;
+                    }
+                }
+            }
+        }
+
+        // High-water mark of per-node hot-tier size (gossip payload bound)
+        for i in 0..self.cfg.num_nodes {
+            self.max_hot[i] = self.max_hot[i].max(self.nodes[i].hot_count);
         }
 
         self.tick_index += 1;
@@ -540,6 +709,13 @@ impl SimCluster {
             // must join the coordination round
             for scope in aggregated.scope_rates.keys() {
                 if let Some(SimScope::Tail { tail }) = node.scopes.get_mut(scope) {
+                    // Gate on the demotion threshold (mirrors the server):
+                    // a dying scope's not-yet-removed peer key must not
+                    // re-promote it during staggered demotion
+                    let peer_rate = aggregated.scope_rates.get(scope).copied().unwrap_or(0.0);
+                    if peer_rate + tail.local_rate_at(now) < tier_cfg.demote_utilization * limit {
+                        continue;
+                    }
                     let tokens = tail.tokens();
                     let limiter = make_hot_limiter(&self.cfg, now, share, tokens);
                     node.scopes.insert(
@@ -550,6 +726,8 @@ impl SimCluster {
                         },
                     );
                     node.hot_count += 1;
+                    self.ever_hot.insert(scope.clone());
+                    *self.promotion_count.entry(scope.clone()).or_default() += 1;
                 }
             }
 
@@ -585,7 +763,7 @@ impl SimCluster {
                 }
             }
             for scope in &demote {
-                demote_sim_scope(node, scope, share, now);
+                demote_sim_scope(node, scope, share, now, tier_cfg.estimator_window);
             }
 
             // Step 4: gossip budget — evict lowest-utilization hot scopes
@@ -594,7 +772,7 @@ impl SimCluster {
                 let evicted: std::collections::HashSet<&String> = evictions.iter().collect();
                 utilizations.retain(|(name, _)| !evicted.contains(name));
                 for scope in &evictions {
-                    demote_sim_scope(node, scope, share, now);
+                    demote_sim_scope(node, scope, share, now, tier_cfg.estimator_window);
                 }
             }
             node.promotion_floor = if node.hot_count >= tier_cfg.gossip_budget {
@@ -685,10 +863,17 @@ impl SimCluster {
     }
 }
 
+/// Outcome of one admission attempt.
+struct AdmitOutcome {
+    admitted: bool,
+    /// The scope was promoted to the hot tier by this request
+    promoted: bool,
+}
+
 /// Admit one request on a node through its tiered scope entry,
 /// auto-creating the scope in the tail tier and running the promotion test
 /// exactly as the server's `RateLimitManager::should_throttle_at` does.
-fn admit_one(cfg: &SimConfig, node: &mut SimNode, scope: &str, now: Instant) -> bool {
+fn admit_one(cfg: &SimConfig, node: &mut SimNode, scope: &str, now: Instant) -> AdmitOutcome {
     let limit = cfg.cluster_target;
     let num_nodes = 1 + node.live_peers;
     let share = limit / num_nodes as f64;
@@ -697,7 +882,7 @@ fn admit_one(cfg: &SimConfig, node: &mut SimNode, scope: &str, now: Instant) -> 
         node.scopes.insert(
             scope.to_string(),
             SimScope::Tail {
-                tail: TailScope::new(now, share),
+                tail: TailScope::new(now, share, cfg.tier.estimator_window),
             },
         );
     }
@@ -729,7 +914,8 @@ fn admit_one(cfg: &SimConfig, node: &mut SimNode, scope: &str, now: Instant) -> 
         node.hot_count += 1;
     }
 
-    match node.scopes.get_mut(scope).expect("entry exists") {
+    let promoted = promote_tokens.is_some();
+    let admitted = match node.scopes.get_mut(scope).expect("entry exists") {
         SimScope::Tail { tail } => {
             let admitted = tail.try_admit(now, share);
             if admitted {
@@ -738,11 +924,18 @@ fn admit_one(cfg: &SimConfig, node: &mut SimNode, scope: &str, now: Instant) -> 
             admitted
         }
         SimScope::Hot { limiter, .. } => !limiter.should_throttle_at(now),
-    }
+    };
+    AdmitOutcome { admitted, promoted }
 }
 
 /// Demote a hot sim scope back to the tail tier, carrying its token balance
-fn demote_sim_scope(node: &mut SimNode, scope: &str, share: f64, now: Instant) {
+fn demote_sim_scope(
+    node: &mut SimNode,
+    scope: &str,
+    share: f64,
+    now: Instant,
+    estimator_window: Duration,
+) {
     let Some(SimScope::Hot { limiter, .. }) = node.scopes.get(scope) else {
         return;
     };
@@ -750,7 +943,7 @@ fn demote_sim_scope(node: &mut SimNode, scope: &str, share: f64, now: Instant) {
     node.scopes.insert(
         scope.to_string(),
         SimScope::Tail {
-            tail: TailScope::with_tokens(now, tokens),
+            tail: TailScope::with_tokens(now, tokens, estimator_window),
         },
     );
     node.hot_count -= 1;
@@ -911,7 +1104,8 @@ mod tests {
     fn test_dead_node_decays_from_peer_view() {
         let cfg = SimConfig::default();
         let mut cluster = SimCluster::new(cfg, constant_workload(600.0), 1);
-        for _ in 0..300 {
+        // Promotion needs one 8s estimator window of over-threshold rate
+        for _ in 0..900 {
             cluster.run_tick();
         }
         assert_eq!(hot_limiter(&cluster, 0, "test").num_peers(), 2);

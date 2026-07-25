@@ -121,6 +121,7 @@ impl ScopePattern {
                 .map(Duration::from_secs_f64)
                 .unwrap_or(defaults.demote_hold),
             gossip_budget,
+            estimator_window: defaults.estimator_window,
         }
     }
 
@@ -529,8 +530,9 @@ impl RateLimitManager {
         let pattern = &self.patterns[pattern_idx];
         if pattern.distributed {
             let share = pattern.target_rate / (1 + self.live_peers) as f64;
+            let est_window = pattern.tier_config(self.gossip_budget).estimator_window;
             ScopeEntry::Tail {
-                tail: TailScope::new(now, share),
+                tail: TailScope::new(now, share, est_window),
                 pattern_idx,
             }
         } else {
@@ -782,7 +784,10 @@ impl RateLimitManager {
 
         // 1. Peer-triggered promotion: a peer gossiping a scope we hold in
         // the tail tier means the scope is hot somewhere — promote so our
-        // local rate joins the coordination round.
+        // local rate joins the coordination round. Gated on the observed
+        // cluster rate clearing the *demotion* threshold: without the gate,
+        // staggered demotion flaps (node A demotes, node B's not-yet-
+        // removed key re-promotes A, and so on around the ring).
         let peer_scopes: Vec<String> = aggregated
             .scope_rates
             .keys()
@@ -793,6 +798,16 @@ impl RateLimitManager {
             let Some(&ScopeEntry::Tail { pattern_idx, .. }) = self.scopes.get(&scope) else {
                 continue;
             };
+            let pattern = &self.patterns[pattern_idx];
+            let tier_cfg = pattern.tier_config(self.gossip_budget);
+            let peer_rate = aggregated.scope_rates.get(&scope).copied().unwrap_or(0.0);
+            let local_rate = match self.scopes.get(&scope) {
+                Some(ScopeEntry::Tail { tail, .. }) => tail.local_rate_at(now),
+                _ => 0.0,
+            };
+            if peer_rate + local_rate < tier_cfg.demote_utilization * pattern.target_rate {
+                continue;
+            }
             let share = self.patterns[pattern_idx].target_rate / (1 + self.live_peers) as f64;
             let Some(ScopeEntry::Tail { tail, .. }) = self.scopes.get_mut(&scope) else {
                 continue;
@@ -928,12 +943,15 @@ impl RateLimitManager {
         };
         let pattern_idx = *pattern_idx;
         let share = self.patterns[pattern_idx].target_rate / (1 + self.live_peers) as f64;
+        let est_window = self.patterns[pattern_idx]
+            .tier_config(self.gossip_budget)
+            .estimator_window;
         let tokens = limiter.tokens().min(share);
         tracing::debug!(scope, reason, "demoting scope to tail tier");
         self.scopes.insert(
             scope.to_string(),
             ScopeEntry::Tail {
-                tail: TailScope::with_tokens(now, tokens),
+                tail: TailScope::with_tokens(now, tokens, est_window),
                 pattern_idx,
             },
         );

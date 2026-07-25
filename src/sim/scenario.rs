@@ -9,13 +9,17 @@ use std::time::Duration;
 
 use super::cluster::{GossipModel, SimCluster, SimConfig, SimEvent};
 use super::metrics::{summarize, RunResult, Sample};
-use super::workload::{ArrivalProcess, LoadPattern, SineComponent, Workload};
+use super::workload::{
+    ArrivalProcess, LoadPattern, PopulationWorkload, Routing, SineComponent, Workload,
+};
 
 #[derive(Debug, Clone)]
 pub struct Scenario {
     pub name: String,
     pub cfg: SimConfig,
     pub workloads: Vec<Workload>,
+    /// Heavy-tailed per-user populations (Milestone 6)
+    pub populations: Vec<PopulationWorkload>,
     /// Timeline events, applied when simulated time reaches them (must be
     /// sorted by time)
     pub events: Vec<(Duration, SimEvent)>,
@@ -30,10 +34,16 @@ impl Scenario {
             name: name.into(),
             cfg,
             workloads,
+            populations: Vec::new(),
             events: Vec::new(),
             duration: Duration::from_secs(60),
             sample_interval: Duration::from_millis(500),
         }
+    }
+
+    pub fn population(mut self, population: PopulationWorkload) -> Self {
+        self.populations.push(population);
+        self
     }
 
     pub fn event(mut self, at: Duration, event: SimEvent) -> Self {
@@ -59,7 +69,7 @@ impl Scenario {
     /// Run the scenario with the given seed. Same seed + same scenario =
     /// identical `RunResult`, byte for byte in CSV/JSON form.
     pub fn run(&self, seed: u64) -> RunResult {
-        let mut cluster = SimCluster::new(self.cfg.clone(), self.workloads.clone(), seed);
+        let mut cluster = self.build_cluster(seed);
 
         let tick = self.cfg.tick;
         let total_ticks = (self.duration.as_nanos() / tick.as_nanos()) as u64;
@@ -119,6 +129,17 @@ impl Scenario {
             events: applied_events,
             summary,
         }
+    }
+
+    /// Build the cluster this scenario runs (tests that need per-scope /
+    /// tier state drive the returned cluster tick by tick themselves).
+    pub fn build_cluster(&self, seed: u64) -> SimCluster {
+        SimCluster::with_populations(
+            self.cfg.clone(),
+            self.workloads.clone(),
+            self.populations.clone(),
+            seed,
+        )
     }
 }
 
@@ -419,6 +440,69 @@ pub fn scale(num_nodes: usize) -> Scenario {
     Scenario::new(format!("scale_{}", num_nodes), cfg, constant(rate))
 }
 
+// ===== Milestone 6 two-tier scenarios =====
+//
+// Per-user limiting: the cluster target is the *per-user* limit (each
+// scope gets the full pattern target), so these use a small target (10
+// rps/user) and a heavy-tailed population. Only the head of the Zipf
+// distribution should ever gossip.
+
+/// Zipf(1.0) population of 100k users, uniform load-balancer routing,
+/// 60× the per-user limit of total volume: the head few users must be
+/// capped at the limit via promotion; the tail must stay local.
+pub fn pareto_users() -> Scenario {
+    let cfg = SimConfig::default().with_cluster_target(10.0);
+    let total = 600.0; // top-rank user offered ≈ 50 rps ≫ the 10 rps limit
+    Scenario::new("pareto_users", cfg, Vec::new()).population(PopulationWorkload::new(
+        "user:",
+        100_000,
+        1.0,
+        LoadPattern::Constant { rate: total },
+    ))
+}
+
+/// Session-affinity variant of `pareto_users`: every user's traffic lands
+/// on one node, the worst case for the `local_rate × num_nodes` promotion
+/// estimate. Skew makes the hot node promote *earlier* (its local rate
+/// overestimates the cluster rate), so the failure mode is under-service
+/// of mid-band users, not overage — quantified in tests/simulation.rs.
+pub fn sticky_users() -> Scenario {
+    let cfg = SimConfig::default().with_cluster_target(10.0);
+    Scenario::new("sticky_users", cfg, Vec::new()).population(
+        PopulationWorkload::new("user:", 100_000, 1.0, LoadPattern::Constant { rate: 600.0 })
+            .routing(Routing::Sticky),
+    )
+}
+
+/// One user's journey tail → hot → tail on top of a light background
+/// population: 2 rps (tail) for 30s, 30 rps (3× the 10 rps limit) until
+/// t=60s, then back to 2 rps. Exercises promotion lag, coordinated capping
+/// at the limit, and demotion hysteresis.
+pub fn user_ramp() -> Scenario {
+    let cfg = SimConfig::default().with_cluster_target(10.0);
+    Scenario::new(
+        "user_ramp",
+        cfg,
+        vec![Workload::new(
+            "user:ramp",
+            LoadPattern::Piecewise {
+                steps: vec![
+                    (Duration::ZERO, 2.0),
+                    (Duration::from_secs(30), 30.0),
+                    (Duration::from_secs(60), 2.0),
+                ],
+            },
+        )],
+    )
+    .population(PopulationWorkload::new(
+        "user:",
+        10_000,
+        1.0,
+        LoadPattern::Constant { rate: 60.0 },
+    ))
+    .duration(Duration::from_secs(120))
+}
+
 /// All library scenarios (scale sweep at 2, 5, 10, 50 nodes).
 pub fn library() -> Vec<Scenario> {
     vec![
@@ -440,6 +524,9 @@ pub fn library() -> Vec<Scenario> {
         jittery(),
         laggy(),
         congestion(),
+        pareto_users(),
+        sticky_users(),
+        user_ramp(),
         scale(2),
         scale(5),
         scale(10),

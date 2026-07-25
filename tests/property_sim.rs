@@ -140,3 +140,44 @@ proptest! {
         }
     }
 }
+
+proptest! {
+    /// Gossip-budget eviction (Milestone 6): the kept hot set is exactly
+    /// capped at the budget, and every evicted scope has utilization no
+    /// higher than every kept scope (lowest-utilization eviction).
+    #[test]
+    fn budget_eviction_keeps_highest_utilization(
+        utils in proptest::collection::vec(0.0f64..2.0, 0..40),
+        budget in 1usize..20,
+    ) {
+        use nenya::gossip::tier::budget_evictions;
+        let hot: Vec<(String, f64)> = utils
+            .iter()
+            .enumerate()
+            .map(|(i, &u)| (format!("s{}", i), u))
+            .collect();
+        let evicted = budget_evictions(hot.clone(), budget);
+
+        // Size: exactly the overflow is evicted
+        prop_assert_eq!(evicted.len(), hot.len().saturating_sub(budget));
+
+        // Ordering: every evicted utilization ≤ every kept utilization
+        let evicted_set: std::collections::HashSet<&String> = evicted.iter().collect();
+        let max_evicted = hot
+            .iter()
+            .filter(|(name, _)| evicted_set.contains(name))
+            .map(|(_, u)| *u)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let min_kept = hot
+            .iter()
+            .filter(|(name, _)| !evicted_set.contains(name))
+            .map(|(_, u)| *u)
+            .fold(f64::INFINITY, f64::min);
+        prop_assert!(
+            evicted.is_empty() || max_evicted <= min_kept,
+            "evicted {} > kept {}",
+            max_evicted,
+            min_kept
+        );
+    }
+}

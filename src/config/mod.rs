@@ -336,6 +336,7 @@ impl Config {
                     .map(Duration::from_secs_f64)
                     .unwrap_or(defaults.demote_hold),
                 gossip_budget,
+                estimator_window: defaults.estimator_window,
             };
             tier.validate().map_err(|e| {
                 ConfigError::InvalidValue("NENYA_PROMOTE/DEMOTE_UTILIZATION".to_string(), e)

@@ -39,4 +39,6 @@ pub use cluster::{GossipModel, SimCluster, SimConfig, SimEvent, TickCounts};
 pub use metrics::{Convergence, RunResult, Sample, Summary};
 pub use rng::SplitMix64;
 pub use scenario::Scenario;
-pub use workload::{ArrivalProcess, LoadPattern, SineComponent, Workload};
+pub use workload::{
+    ArrivalProcess, LoadPattern, PopulationWorkload, Routing, SineComponent, Workload,
+};

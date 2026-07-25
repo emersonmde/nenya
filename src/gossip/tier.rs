@@ -41,14 +41,25 @@ pub const TAIL_WINDOW: Duration = Duration::from_secs(1);
 /// Default promotion threshold (fraction of estimated cluster utilization).
 ///
 /// Simulator-derived (Milestone 6.4 sweep, `--ignored` test
-/// `tier_threshold_sweep` in tests/simulation.rs; curve published in
-/// docs/capacity-model.md): swept over Pareto workloads; the value sits at
-/// the knee of the promoted-set-size vs. worst-case-overage curve.
+/// `tier_threshold_sweep` in tests/simulation.rs, seed 42; tables published
+/// in docs/capacity-model.md). Key finding: the expected promoted-set-size
+/// vs. worst-case-overage knee does not exist — per-user overage is
+/// structurally absent at every threshold in {0.3..0.8} (an unpromoted
+/// scope is capped at `limit / n` per node, so its cluster total cannot
+/// exceed the limit; skew triggers promotion on the hot node), and the
+/// ramp transient is flat (~1.6 × limit worst 1 s window) beyond 0.3. The
+/// threshold therefore only trades promoted-set size (35 → 7 scopes per
+/// 100k Zipf users across the sweep) against coordination headroom — how
+/// far below the limit a ramping user is already under engine control.
+/// 0.5 keeps 2× headroom at 17 promoted per 100k users; raising it toward
+/// 0.8 halves the hot set with no measured downside in these scenarios.
 pub const DEFAULT_PROMOTE_UTILIZATION: f64 = 0.5;
 
-/// Default demotion threshold. From the same sweep: wide enough below
-/// promotion that estimator noise at the promotion boundary cannot flap a
-/// scope across both thresholds within one hold period.
+/// Default demotion threshold. From the same sweep (flap axis): the
+/// highest value with zero measured flapping — a user parked exactly at
+/// the demotion boundary for 300 s produces 3 promotion events (exactly
+/// one per node) at 0.25, versus 12 at 0.35 and 23 at 0.45. Higher is
+/// better for hot-set shedding, so 0.25 is the knee.
 pub const DEFAULT_DEMOTE_UTILIZATION: f64 = 0.25;
 
 /// Default demotion hold (hysteresis). Must exceed the full round-trip of
@@ -70,6 +81,18 @@ pub const DEFAULT_DEMOTE_HOLD: Duration = Duration::from_secs(10);
 /// scopes are never TTL-evicted directly — an idle hot scope demotes
 /// through the hysteresis first and then ages out as a tail scope.
 pub const DEFAULT_SCOPE_TTL: Duration = Duration::from_secs(60);
+
+/// Default promotion-estimator window (see `TierConfig::estimator_window`).
+///
+/// Simulator-derived (Milestone 6.4 sweep, seed 42): at sparse rates the
+/// promotion threshold is only a handful of requests per window, so short
+/// windows read Poisson clumps as sustained rates — a 1 s window promotes
+/// 78 scopes per 100k Zipf users (~10 truly over threshold) and promotes a
+/// 2 rps user 29 s before it ever ramps. 8 s is the first window with no
+/// spurious promotion of the sub-threshold phase (17 promoted, 1.0 s
+/// promotion lag); 12/16 s shave only 2–4 more scopes while adding 1.5–2 s
+/// of lag.
+pub const DEFAULT_TAIL_ESTIMATOR_WINDOW: Duration = Duration::from_secs(8);
 
 /// Default per-node cap on gossiped scopes. Bounds the per-link gossip
 /// payload at `K × bytes_per_scope × 2/s` regardless of user count (see
@@ -95,6 +118,13 @@ pub struct TierConfig {
     /// Hard per-node cap on gossiped scopes; lowest-utilization hot scopes
     /// are evicted back to the tail on overflow (and logged).
     pub gossip_budget: usize,
+
+    /// Promotion-estimator window: the tail-scope rate estimate feeding
+    /// the promotion test spans this long. Longer = slower promotion
+    /// detection but less Poisson noise at sparse rates (a 1 s window
+    /// reads two clumped arrivals as 2 rps and spuriously promotes users
+    /// far below their limit). Sweep-derived default.
+    pub estimator_window: Duration,
 }
 
 impl Default for TierConfig {
@@ -104,6 +134,7 @@ impl Default for TierConfig {
             demote_utilization: DEFAULT_DEMOTE_UTILIZATION,
             demote_hold: DEFAULT_DEMOTE_HOLD,
             gossip_budget: DEFAULT_GOSSIP_BUDGET,
+            estimator_window: DEFAULT_TAIL_ESTIMATOR_WINDOW,
         }
     }
 }
@@ -129,6 +160,9 @@ impl TierConfig {
         if self.gossip_budget == 0 {
             return Err("gossip_budget must be at least 1".to_string());
         }
+        if self.estimator_window.is_zero() {
+            return Err("estimator_window must be positive".to_string());
+        }
         Ok(())
     }
 }
@@ -136,20 +170,29 @@ impl TierConfig {
 /// Interpolated two-bucket sliding-window rate estimator: `prev_count`
 /// events landed in the last completed window, `curr_count` in the window
 /// starting at `window_start`. The estimated trailing-window rate weighs
-/// the previous bucket by its remaining overlap. 16 bytes of counters —
-/// used per tail scope (promotion test) and per pattern (the gossiped tail
-/// aggregate).
+/// the previous bucket by its remaining overlap. ~32 bytes — used per tail
+/// scope (promotion test) and per pattern (the gossiped tail aggregate).
 #[derive(Debug, Clone)]
 pub struct RateWindow {
     window_start: Instant,
+    window_len: Duration,
     prev_count: u32,
     curr_count: u32,
 }
 
 impl RateWindow {
+    /// Estimator with the default [`TAIL_WINDOW`] length.
     pub fn new(now: Instant) -> Self {
+        Self::with_len(now, TAIL_WINDOW)
+    }
+
+    /// Estimator over an explicit window length. Longer windows trade
+    /// promotion-detection lag for lower Poisson noise at sparse rates —
+    /// see `TierConfig::estimator_window`.
+    pub fn with_len(now: Instant, window_len: Duration) -> Self {
         RateWindow {
             window_start: now,
+            window_len,
             prev_count: 0,
             curr_count: 0,
         }
@@ -158,13 +201,13 @@ impl RateWindow {
     /// Roll the windows forward to `now`.
     fn roll(&mut self, now: Instant) {
         let elapsed = now.duration_since(self.window_start);
-        if elapsed < TAIL_WINDOW {
+        if elapsed < self.window_len {
             return;
         }
-        let whole = (elapsed.as_nanos() / TAIL_WINDOW.as_nanos()) as u32;
+        let whole = (elapsed.as_nanos() / self.window_len.as_nanos()) as u32;
         self.prev_count = if whole == 1 { self.curr_count } else { 0 };
         self.curr_count = 0;
-        self.window_start += TAIL_WINDOW * whole;
+        self.window_start += self.window_len * whole;
     }
 
     /// Record one event at `now`.
@@ -176,27 +219,29 @@ impl RateWindow {
     /// Estimated trailing-window rate (events/sec), rolling forward first.
     pub fn rate(&mut self, now: Instant) -> f64 {
         self.roll(now);
-        let frac = now.duration_since(self.window_start).as_secs_f64() / TAIL_WINDOW.as_secs_f64();
-        (self.prev_count as f64 * (1.0 - frac) + self.curr_count as f64) / TAIL_WINDOW.as_secs_f64()
+        let frac =
+            now.duration_since(self.window_start).as_secs_f64() / self.window_len.as_secs_f64();
+        (self.prev_count as f64 * (1.0 - frac) + self.curr_count as f64)
+            / self.window_len.as_secs_f64()
     }
 
     /// Read-only variant of [`rate`](Self::rate) for stats paths that only
     /// hold a shared reference (same estimate, no roll).
     pub fn rate_at(&self, now: Instant) -> f64 {
         let elapsed = now.duration_since(self.window_start);
-        let (prev, curr, frac) = if elapsed < TAIL_WINDOW {
+        let (prev, curr, frac) = if elapsed < self.window_len {
             (
                 self.prev_count,
                 self.curr_count,
-                elapsed.as_secs_f64() / TAIL_WINDOW.as_secs_f64(),
+                elapsed.as_secs_f64() / self.window_len.as_secs_f64(),
             )
-        } else if elapsed < TAIL_WINDOW * 2 {
-            let frac = (elapsed - TAIL_WINDOW).as_secs_f64() / TAIL_WINDOW.as_secs_f64();
+        } else if elapsed < self.window_len * 2 {
+            let frac = (elapsed - self.window_len).as_secs_f64() / self.window_len.as_secs_f64();
             (self.curr_count, 0, frac)
         } else {
             (0, 0, 0.0)
         };
-        (prev as f64 * (1.0 - frac) + curr as f64) / TAIL_WINDOW.as_secs_f64()
+        (prev as f64 * (1.0 - frac) + curr as f64) / self.window_len.as_secs_f64()
     }
 }
 
@@ -218,23 +263,25 @@ pub struct TailScope {
 
 impl TailScope {
     /// Create a tail scope with a full 1-second burst at the given share
-    /// (mirroring the library's adaptive `capacity = refill × 1 s` default).
-    pub fn new(now: Instant, share: f64) -> Self {
+    /// (mirroring the library's adaptive `capacity = refill × 1 s`
+    /// default). `estimator_window` is the promotion-estimator length
+    /// (`TierConfig::estimator_window`).
+    pub fn new(now: Instant, share: f64, estimator_window: Duration) -> Self {
         TailScope {
             tokens: share.max(0.0) * TAIL_WINDOW.as_secs_f64(),
             last_refill: now,
-            window: RateWindow::new(now),
+            window: RateWindow::with_len(now, estimator_window),
         }
     }
 
     /// Create a tail scope carrying over an explicit token balance (used
     /// when a hot scope demotes: its remaining tokens transfer, clamped by
     /// `try_admit`'s share-sized capacity on the next request).
-    pub fn with_tokens(now: Instant, tokens: f64) -> Self {
+    pub fn with_tokens(now: Instant, tokens: f64, estimator_window: Duration) -> Self {
         TailScope {
             tokens: tokens.max(0.0),
             last_refill: now,
-            window: RateWindow::new(now),
+            window: RateWindow::with_len(now, estimator_window),
         }
     }
 
@@ -365,7 +412,7 @@ mod tests {
     #[test]
     fn test_tail_bucket_enforces_share() {
         let start = Instant::now();
-        let mut tail = TailScope::new(start, 10.0);
+        let mut tail = TailScope::new(start, 10.0, TAIL_WINDOW);
         // Full 1s burst at share 10 → 10 tokens
         let mut admitted = 0;
         for _ in 0..20 {
@@ -389,7 +436,7 @@ mod tests {
     #[test]
     fn test_tail_rate_estimate_converges() {
         let start = Instant::now();
-        let mut tail = TailScope::new(start, 1000.0);
+        let mut tail = TailScope::new(start, 1000.0, TAIL_WINDOW);
         // 50 rps for 3 seconds
         for i in 0..150 {
             let t = start + Duration::from_millis(i * 20);
@@ -406,7 +453,7 @@ mod tests {
     #[test]
     fn test_tail_rate_decays_when_idle() {
         let start = Instant::now();
-        let mut tail = TailScope::new(start, 100.0);
+        let mut tail = TailScope::new(start, 100.0, TAIL_WINDOW);
         for i in 0..100 {
             tail.try_admit(start + Duration::from_millis(i * 10), 100.0);
         }
